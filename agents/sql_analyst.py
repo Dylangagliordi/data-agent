@@ -190,7 +190,7 @@ def is_safe(state: SQLAnalystState) -> dict:
 
     Receives ONLY the generated SQL text — never the original or curated question.
     """
-    llm = pick_llm("medium").with_structured_output(JudgeSchema)
+    llm = pick_llm("cheap").with_structured_output(JudgeSchema)
     judgement: JudgeSchema = llm.invoke(
         [
             ("system", IS_SAFE_SYSTEM_PROMPT),
@@ -367,7 +367,7 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
             "messages": [AIMessage(content=final_answer)],
         }
 
-    llm = pick_llm("low")
+    llm = pick_llm("cheap")
     human_content = (
         f"Original question: {state.user_question}\n\n"
         f"The SQL query that was actually executed:\n{state.generated_sql_query}\n\n"
