@@ -26,6 +26,11 @@ class SQLAnalystState(BaseModel):
     sql_query_execution_result: str = ""
     final_answer: str = ""
 
+    # Not in the original field list from the spec, but required to implement the
+    # "cap at 5 total attempts across the whole generate->execute cycle" rule —
+    # there is no other way to count retries across graph steps without it.
+    sql_attempts: int = 0
+
 
 class JudgeSchema(BaseModel):
     """Structured output schema for the safety-judge node only.

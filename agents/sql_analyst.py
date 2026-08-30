@@ -176,3 +176,66 @@ def route_after_safety_check(state: SQLAnalystState) -> str:
     if state.is_safe == "yes":
         return "execute_sql"
     return "cancel_sql"
+
+
+MAX_SQL_ATTEMPTS = 5
+_SQL_ERROR_PREFIX = "SQL_EXECUTION_ERROR: "
+
+
+def execute_sql(state: SQLAnalystState) -> dict:
+    """Node 6: run generated_sql_query against Postgres using the app_reader role.
+
+    On a real database error (bad column, syntax error, etc.) it does not crash —
+    it captures the exact error message (prefixed with a sentinel so the routing
+    function can distinguish it deterministically from a real result string) and
+    increments the attempt counter so the conditional edge after this node can
+    route back to generate_sql with that error, capped at MAX_SQL_ATTEMPTS total
+    attempts across the whole cycle.
+    """
+    attempts = state.sql_attempts + 1
+    conn = get_app_reader_connection()
+    try:
+        with conn.cursor() as cur:
+            # generated_sql_query is model-authored SQL text, not a value to bind —
+            # there is no placeholder mechanism for "run this arbitrary statement";
+            # safety here is enforced upstream by the is_safe judge gate, not by
+            # parameterization (which doesn't apply to whole-statement execution).
+            cur.execute(state.generated_sql_query)
+            if cur.description is not None:
+                col_names = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                result_str = str([dict(zip(col_names, r)) for r in rows])
+            else:
+                result_str = "(query executed, no rows returned)"
+        conn.commit()
+        return {"sql_query_execution_result": result_str, "sql_attempts": attempts}
+    except Exception as e:
+        conn.rollback()
+        error_str = f"{_SQL_ERROR_PREFIX}{type(e).__name__}: {e}"
+        if attempts >= MAX_SQL_ATTEMPTS:
+            return {
+                "sql_query_execution_result": error_str,
+                "sql_attempts": attempts,
+                "final_answer": (
+                    f"The query could not be completed after {attempts} attempts. "
+                    f"The last real database error was: {type(e).__name__}: {e}"
+                ),
+            }
+        return {"sql_query_execution_result": error_str, "sql_attempts": attempts}
+    finally:
+        conn.close()
+
+
+def route_after_execute_sql(state: SQLAnalystState) -> str:
+    """Conditional edge function for after execute_sql.
+
+    Returns a plain string key: "represent_final_answer" on success or once
+    MAX_SQL_ATTEMPTS is reached (final_answer is already set with the error in
+    that case by execute_sql itself), otherwise "generate_sql" to retry.
+    """
+    if state.final_answer:
+        # execute_sql already gave up and wrote the final failure answer.
+        return "represent_final_answer"
+    if state.sql_query_execution_result.startswith(_SQL_ERROR_PREFIX):
+        return "generate_sql"
+    return "represent_final_answer"
