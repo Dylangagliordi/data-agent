@@ -2,12 +2,96 @@
 SQL analyst sub-agent: LangGraph node definitions.
 """
 
+import re
+
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 
 from models.schema import JudgeSchema, SQLAnalystState
 from utils.db import get_app_reader_connection
 from utils.llm_pick import pick_llm
+
+_ID_COLUMN_RE = re.compile(r"_id$")
+
+
+def _is_id_like_column(column_name: str) -> bool:
+    """True for column names that look like an entity identifier: exactly \"id\", \
+or anything ending in \"_id\" (order_id, customer_id, product_id, ...). This is a naming \
+convention, not a hardcoded list of table/column names, so it applies to any dataset that \
+follows the common `<entity>_id` convention — which is how Olist (and most relational \
+exports) name keys."""
+    return column_name == "id" or bool(_ID_COLUMN_RE.search(column_name))
+
+
+def _detect_fanout_warnings(conn, tables: dict) -> list:
+    """Live, deterministic fan-out check against whatever tables/columns actually exist.
+
+    For every id-like column in every table, ask Postgres directly (via a real
+    COUNT(*)/COUNT(DISTINCT ...) query) whether that column holds duplicate values within
+    that table. No table or column names are hardcoded anywhere in this function — every
+    table, column, and query target is re-derived from `tables` (itself built from
+    information_schema at call time), so this automatically re-runs correctly against
+    whatever new dataset gets loaded via utils/load_data.py in the future, with no manual
+    updates needed here.
+
+    Two-pass approach:
+      1. For every id-like column, check whether it's unique within its own table. An
+         id-like column that IS unique in its own table is a plausible primary key for
+         that table — record its name so pass 2 can recognize other tables' columns
+         sharing that name as candidate foreign keys ("matches another table's primary
+         key name").
+      2. Any column that looks like a foreign key — it ends in "_id" (or is named "id")
+         and isn't that table's own primary key, OR its name matches a primary-key name
+         found on another table — gets a real duplicate check. Duplicates found mean this
+         table has more than one row per that key: a genuine one-to-many/fan-out
+         relationship relative to whatever it references, which is exactly the risk
+         generate_sql's prompt warns about (payments per order, reviews per product, etc.).
+    """
+    uniqueness_cache: dict = {}
+
+    def total_and_distinct(table: str, column: str):
+        key = (table, column)
+        if key in uniqueness_cache:
+            return uniqueness_cache[key]
+        with conn.cursor() as cur:
+            # table/column here come straight out of information_schema, not user
+            # input — same rationale as the sample-rows query above: identifiers can't
+            # be bound as %s placeholders, so it's safe (not user-controlled) to
+            # interpolate them into identifier position, while the LIMIT-equivalent
+            # value (none needed here) would still go through a placeholder.
+            cur.execute(f'SELECT COUNT(*), COUNT(DISTINCT "{column}") FROM "{table}"')
+            result = cur.fetchone()
+        uniqueness_cache[key] = result
+        return result
+
+    own_pk_columns: dict = {}
+    pk_names: set = set()
+    for table, columns in tables.items():
+        own_pk_columns[table] = set()
+        for column, _dtype in columns:
+            if not _is_id_like_column(column):
+                continue
+            total, distinct = total_and_distinct(table, column)
+            if total == distinct:
+                own_pk_columns[table].add(column)
+                pk_names.add(column)
+
+    warnings = []
+    for table, columns in tables.items():
+        for column, _dtype in columns:
+            is_own_pk = column in own_pk_columns[table]
+            looks_like_fk = (not is_own_pk) and (
+                _is_id_like_column(column) or column in pk_names
+            )
+            if not looks_like_fk:
+                continue
+            total, distinct = total_and_distinct(table, column)
+            if total > distinct:
+                warnings.append(
+                    f"WARNING: {table} has multiple rows per {column} "
+                    "(fan-out risk — aggregate before joining)."
+                )
+    return warnings
 
 
 def _extract_text(content) -> str:
@@ -64,6 +148,12 @@ def add_context(state: SQLAnalystState) -> dict:
     plus 5 sample rows per table currently in the database, and build one context
     string. Table names are never hardcoded — this is fully driven by whatever
     tables actually exist in the public schema at call time.
+
+    Also runs a deterministic, dataset-agnostic fan-out check (see
+    _detect_fanout_warnings) and prepends any resulting WARNING lines to the context,
+    so generate_sql is told explicitly, every call, which tables in THIS dataset have
+    more than one row per some referenced key — rather than relying on the prompt's
+    general rule alone to be remembered.
     """
     conn = get_app_reader_connection()
     try:
@@ -83,6 +173,8 @@ def add_context(state: SQLAnalystState) -> dict:
         tables: dict[str, list[tuple[str, str]]] = {}
         for table_name, column_name, data_type in rows:
             tables.setdefault(table_name, []).append((column_name, data_type))
+
+        fanout_warnings = _detect_fanout_warnings(conn, tables)
 
         sections = []
         with conn.cursor() as cur:
@@ -104,6 +196,8 @@ def add_context(state: SQLAnalystState) -> dict:
                 )
 
         context = "\n\n".join(sections)
+        if fanout_warnings:
+            context = "\n".join(fanout_warnings) + "\n\n" + context
     finally:
         conn.close()
 
@@ -126,7 +220,18 @@ the most"), and leave it at that — do not invent columns representing an actio
 - Do not return unbounded full-table results when the question implies a small, specific \
 answer (e.g. "the top customer(s)", "which category", "how many") — use LIMIT, aggregation, \
 or WHERE clauses so the result set is reasonably sized. Only omit a LIMIT if the question \
-genuinely calls for every matching row."""
+genuinely calls for every matching row.
+- Fan-out / grain check: before writing an aggregation (SUM, AVG, COUNT, etc.) that spans \
+more than one table, consider whether any joined table could have more than one row per the \
+unit you are measuring (e.g. more than one row per order, per product, per customer). Joining \
+straight into such a table and aggregating over the joined result silently computes the wrong \
+granularity — it double-counts or averages over the wrong thing. If a joined table can have \
+multiple rows per the relevant key, first aggregate that table down to exactly one row per \
+that key (a subquery or CTE with GROUP BY), and only then join it to the rest of the query or \
+aggregate further. The database context below may include explicit "WARNING: ... fan-out \
+risk" notes identifying which tables actually have this issue for the currently loaded data — \
+treat those as confirmed, but apply this same reasoning even for tables not called out, since \
+the context only flags what could be checked mechanically."""
 
 
 def _strip_sql_formatting(text: str) -> str:
