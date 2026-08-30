@@ -3,6 +3,7 @@ SQL analyst sub-agent: LangGraph node definitions.
 """
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.graph import END, START, StateGraph
 
 from models.schema import JudgeSchema, SQLAnalystState
 from utils.db import get_app_reader_connection
@@ -295,3 +296,45 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
         "final_answer": final_answer,
         "messages": [AIMessage(content=final_answer)],
     }
+
+
+def build_sql_analyst_graph():
+    """Wire all nodes into a StateGraph using SQLAnalystState, and compile it.
+
+    Graph shape:
+        START -> curate_question -> add_context -> generate_sql -> is_safe
+        is_safe --(route_after_safety_check)--> execute_sql | cancel_sql
+        execute_sql --(route_after_execute_sql)--> generate_sql (retry) | represent_final_answer
+        cancel_sql -> END
+        represent_final_answer -> END
+    """
+    graph = StateGraph(SQLAnalystState)
+
+    graph.add_node("curate_question", curate_question)
+    graph.add_node("add_context", add_context)
+    graph.add_node("generate_sql", generate_sql)
+    graph.add_node("is_safe", is_safe)
+    graph.add_node("execute_sql", execute_sql)
+    graph.add_node("cancel_sql", cancel_sql)
+    graph.add_node("represent_final_answer", represent_final_answer)
+
+    graph.add_edge(START, "curate_question")
+    graph.add_edge("curate_question", "add_context")
+    graph.add_edge("add_context", "generate_sql")
+    graph.add_edge("generate_sql", "is_safe")
+
+    graph.add_conditional_edges(
+        "is_safe",
+        route_after_safety_check,
+        {"execute_sql": "execute_sql", "cancel_sql": "cancel_sql"},
+    )
+    graph.add_conditional_edges(
+        "execute_sql",
+        route_after_execute_sql,
+        {"generate_sql": "generate_sql", "represent_final_answer": "represent_final_answer"},
+    )
+
+    graph.add_edge("cancel_sql", END)
+    graph.add_edge("represent_final_answer", END)
+
+    return graph.compile()

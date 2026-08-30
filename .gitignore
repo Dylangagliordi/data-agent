@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .env
 *.png
+!sql_analyst_graph.png
