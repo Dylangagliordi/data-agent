@@ -11,6 +11,16 @@ Notes:
   different dataset can be loaded cleanly without old tables lingering.
 - This script is intentionally NOT part of the LangGraph graph — it's a manual,
   reusable utility you run whenever you want to (re)load a dataset folder.
+
+Cleaning (Path A from the ETL analyst spec): before loading anything, this now calls
+utils.data_cleaning.clean_dataset() on the folder. Files with nothing flagged load from
+their original location exactly as before. Files needing cleaning go through the
+approval-gated clone/generate/execute/retry process (same shared implementation used by
+clean_data.py and the ETL analyst's transform_load tool) and, once cleaning completes for
+that file, load from folder_path/cleaned/ instead. A file that was skipped (declined
+approval, or failed cleaning after exhausting retries) is reported clearly and excluded
+from the load — it is never loaded raw once the rubric has flagged it, and never loaded
+from a clone that didn't actually get cleaned.
 """
 
 import csv
@@ -20,6 +30,8 @@ from pathlib import Path
 
 import psycopg2
 from dotenv import load_dotenv
+
+from utils.data_cleaning import clean_dataset
 
 load_dotenv(os.path.expanduser("~/.hermes/profiles/data-agent/.env"))
 
@@ -128,7 +140,7 @@ def load_csv_to_table(conn, csv_path: Path, sample_rows_for_typing: int = 500):
     return table_name, row_count
 
 
-def main():
+def main() -> None:
     if len(sys.argv) != 2:
         print(
             "ERROR: you must specify a folder path to load, e.g.:\n"
@@ -147,11 +159,35 @@ def main():
         print(f"ERROR: no CSV files found in {folder}", file=sys.stderr)
         sys.exit(1)
 
+    print(f"Checking {folder} against the cleaning rubric before loading...")
+    cleaning_result = clean_dataset(folder)
+    print(cleaning_result.summary())
+
+    cleaned_names = {rec.file_name for rec in cleaning_result.cleaned_files}
+    skipped_names = {rec.file_name for rec in cleaning_result.skipped_files}
+
+    load_plan = []  # list[(csv_path_to_actually_load, original_name)]
+    for csv_path in csv_files:
+        if csv_path.name in skipped_names:
+            continue
+        if csv_path.name in cleaned_names:
+            load_plan.append((Path(cleaning_result.cleaned_dir) / csv_path.name, csv_path.name))
+        else:
+            load_plan.append((csv_path, csv_path.name))
+
+    if skipped_names:
+        print(
+            f"\nSkipping load for {len(skipped_names)} file(s) that were not successfully "
+            f"cleaned: {', '.join(sorted(skipped_names))}"
+        )
+
+    print(f"\nLoading {len(load_plan)} file(s) into Postgres...")
     conn = get_admin_connection()
     try:
-        for csv_path in csv_files:
-            table_name, row_count = load_csv_to_table(conn, csv_path)
-            print(f"Loaded {csv_path.name} -> table '{table_name}' ({row_count} rows)")
+        for load_path, original_name in load_plan:
+            table_name, row_count = load_csv_to_table(conn, load_path)
+            source_note = " (cleaned)" if original_name in cleaned_names else ""
+            print(f"Loaded {original_name}{source_note} -> table '{table_name}' ({row_count} rows)")
     finally:
         conn.close()
 
