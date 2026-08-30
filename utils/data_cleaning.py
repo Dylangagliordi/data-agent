@@ -26,6 +26,9 @@ implementation since there's no foreign-key structure to check against pre-load.
 """
 
 import csv
+import shutil
+import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
@@ -297,3 +300,256 @@ def check_rubric(file_path) -> list:
     issues += _check_impossible_values(df)
 
     return issues
+
+
+# ---------------------------------------------------------------------------
+# Piece 2: LLM-generated cleaning code, human approval gate, execution with
+# retry-on-real-error, and the clean_dataset() orchestrator that ties it all
+# together. This is the part clean_data.py, the enhanced load_data.py, and the
+# ETL analyst's transform_load tool all call into — one implementation.
+# ---------------------------------------------------------------------------
+
+MAX_CLEAN_ATTEMPTS = 3
+
+
+@dataclass
+class FileCleaningRecord:
+    """One file's outcome from clean_dataset(): either cleaned, or skipped."""
+
+    file_name: str
+    issues: list = field(default_factory=list)
+    status: str = ""  # "cleaned" | "skipped_declined" | "skipped_failed"
+    attempts: int = 0
+    error: str = ""
+
+
+@dataclass
+class CleaningResult:
+    """Summary of a whole clean_dataset() run across every file in a folder."""
+
+    folder_path: str
+    cleaned_dir: str
+    untouched_files: list = field(default_factory=list)  # filenames needing no cleaning
+    cleaned_files: list = field(default_factory=list)  # list[FileCleaningRecord], status="cleaned"
+    skipped_files: list = field(default_factory=list)  # list[FileCleaningRecord], skipped
+
+    def summary(self) -> str:
+        lines = [f"Cleaning summary for {self.folder_path}:"]
+        lines.append(
+            f"  Untouched (no issues found): {len(self.untouched_files)} "
+            f"({', '.join(self.untouched_files) or 'none'})"
+        )
+        if self.cleaned_files:
+            lines.append(f"  Cleaned successfully: {len(self.cleaned_files)}")
+            for rec in self.cleaned_files:
+                lines.append(f"    - {rec.file_name} (attempts: {rec.attempts})")
+                for issue in rec.issues:
+                    lines.append(f"        * {issue}")
+        else:
+            lines.append("  Cleaned successfully: 0")
+        if self.skipped_files:
+            lines.append(f"  Skipped: {len(self.skipped_files)}")
+            for rec in self.skipped_files:
+                lines.append(f"    - {rec.file_name} ({rec.status}): {rec.error or 'declined by user'}")
+        if self.cleaned_files:
+            lines.append(f"  Cleaned output folder: {self.cleaned_dir}")
+        return "\n".join(lines)
+
+
+def _clone_file(file_path: Path, cleaned_dir: Path) -> Path:
+    """Copy file_path into cleaned_dir (creating it if needed) and return the clone's
+    path. The raw file at file_path is never opened for writing anywhere in this module."""
+    cleaned_dir.mkdir(parents=True, exist_ok=True)
+    dest = cleaned_dir / file_path.name
+    shutil.copy2(file_path, dest)
+    return dest
+
+
+def _strip_code_formatting(text: str) -> str:
+    """Strip markdown code fences around generated code, if the model added them anyway
+    (same pattern as agents/sql_analyst.py's _strip_sql_formatting, kept local here since
+    this module has no dependency on the sql analyst module and shouldn't gain one just
+    for a five-line string helper)."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+CLEANING_CODE_SYSTEM_PROMPT = """You are a data cleaning engineer. Given a description of \
+specific, real data-quality issues found in one CSV file, write a short, self-contained \
+Python script that fixes ONLY those issues, operating in place on the exact file path given.
+
+Rules:
+- Output ONLY raw Python code. No explanation, no commentary, no markdown fences, no backticks.
+- The script must read the CSV at the exact path given, apply targeted fixes for the issues \
+listed, and write the cleaned result back to that same path (overwrite it in place).
+- Do not invent or drop columns, and do not change rows/values unrelated to the listed issues.
+- Only address the specific issues given — do not "fix" anything not listed.
+- Import any libraries you use (e.g. `import pandas as pd`) — nothing is pre-imported for you.
+- The script will be executed exactly as returned, top to bottom, standalone."""
+
+
+def _describe_file_for_prompt(file_path: Path) -> str:
+    """Build a real-sample-rows + real-column/dtype context block for one file, the same
+    principle generate_sql's schema context uses: concrete data, not a generic instruction."""
+    df = pd.read_csv(file_path, dtype=str, keep_default_na=True, on_bad_lines="skip")
+    col_info = "\n".join(f"  - {c}" for c in df.columns)
+    sample = df.head(5)
+    sample_lines = "\n".join(str(row.to_dict()) for _, row in sample.iterrows())
+    return f"Columns:\n{col_info}\n\nSample rows (real, from this file):\n{sample_lines}"
+
+
+def _generate_cleaning_code(
+    file_path: Path,
+    issues: list,
+    llm,
+    previous_code: str = "",
+    previous_error: str = "",
+) -> str:
+    """One LLM call producing a cleaning script targeting this file's specific issues.
+    If previous_code/previous_error are given (a retry after a real execution failure),
+    both are included so the model can see exactly what it tried and what broke."""
+    file_context = _describe_file_for_prompt(file_path)
+    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    human_content = (
+        f"File to clean (read and overwrite this exact path): {file_path}\n\n"
+        f"{file_context}\n\n"
+        f"Specific issues found in THIS file (fix only these):\n{issue_lines}"
+    )
+    if previous_error:
+        human_content += (
+            "\n\nA previous attempt at this file's cleaning script failed with this real "
+            f"error when executed — fix the script so it actually works:\n{previous_error}"
+            f"\n\nPrevious (failed) script was:\n{previous_code}"
+        )
+
+    response = llm.invoke(
+        [
+            ("system", CLEANING_CODE_SYSTEM_PROMPT),
+            ("human", human_content),
+        ]
+    )
+    content = response.content
+    if isinstance(content, list):
+        # Same shape some providers (e.g. claude-sonnet-5 with extended thinking) can
+        # return for agents/sql_analyst.py's _extract_text — normalize the same way.
+        text = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+            if not (isinstance(block, dict) and block.get("type") == "thinking")
+        )
+    else:
+        text = content
+    return _strip_code_formatting(text)
+
+
+def _request_approval(code: str, file_path: Path) -> bool:
+    """The approval gate. Prints the full generated code and blocks on a real input()
+    call — not a log line, not a config flag, not Hermes's own tool-approval system
+    (which cannot see inside a script's own exec() call). This is the one and only
+    place a cleaning script gets a chance to run, for every caller, every time."""
+    print("\n" + "=" * 70)
+    print(f"GENERATED CLEANING CODE for: {file_path}")
+    print("=" * 70)
+    print(code)
+    print("=" * 70)
+    answer = input(f"Run this code against {file_path}? Type 'yes' to approve, anything else to decline: ")
+    return answer.strip().lower() == "yes"
+
+
+def _execute_cleaning_code(code: str, file_path: Path):
+    """Execute approved code in a fresh global namespace. Returns (success, error_str).
+    Only ever called against a clone path — never the original raw file — by the caller
+    below, which is what makes 'raw files are never modified' actually true rather than
+    just documented."""
+    try:
+        exec(compile(code, f"<cleaning_code:{file_path.name}>", "exec"), {"__name__": "__cleaning__"})
+        return True, ""
+    except Exception:
+        return False, traceback.format_exc()
+
+
+def clean_dataset(folder_path, llm=None) -> CleaningResult:
+    """Process every top-level CSV in folder_path SEPARATELY: run the rubric per file,
+    and for any file with real issues, clone -> generate -> approve -> execute -> retry
+    (up to MAX_CLEAN_ATTEMPTS) -> skip-and-report on exhaustion, continuing with the rest
+    of the folder either way. Files with nothing flagged are left alone entirely: no
+    clone, no LLM call, no approval prompt.
+
+    llm: optional injected chat model (used by tests to deterministically force a
+    failing-then-succeeding code-gen sequence for the retry-cap test); defaults to
+    pick_llm("high") in real use — this is a dependency default, not a safety bypass:
+    the approval gate below always uses the real input() builtin regardless of what llm
+    is passed, so no caller can construct a call that skips it.
+    """
+    from utils.llm_pick import pick_llm  # local import: keeps this module usable without
+
+    # requiring the LLM stack (e.g. for callers that only need check_rubric) to import
+    # cleanly, and avoids a module-load-time dependency on ANTHROPIC_API_KEY being set.
+
+    folder = Path(folder_path)
+    cleaned_dir = folder / "cleaned"
+    csv_files = sorted(p for p in folder.glob("*.csv") if p.is_file())
+
+    result = CleaningResult(folder_path=str(folder), cleaned_dir=str(cleaned_dir))
+
+    for file_path in csv_files:
+        issues = check_rubric(file_path)
+        if not issues:
+            result.untouched_files.append(file_path.name)
+            continue
+
+        cloned_path = _clone_file(file_path, cleaned_dir)
+        resolved_llm = llm if llm is not None else pick_llm("high")
+
+        previous_code = ""
+        previous_error = ""
+        attempt = 0
+        while attempt < MAX_CLEAN_ATTEMPTS:
+            attempt += 1
+            code = _generate_cleaning_code(
+                cloned_path, issues, resolved_llm, previous_code, previous_error
+            )
+            approved = _request_approval(code, cloned_path)
+            if not approved:
+                result.skipped_files.append(
+                    FileCleaningRecord(
+                        file_name=file_path.name,
+                        issues=issues,
+                        status="skipped_declined",
+                        attempts=attempt,
+                        error="",
+                    )
+                )
+                break
+
+            success, error = _execute_cleaning_code(code, cloned_path)
+            if success:
+                result.cleaned_files.append(
+                    FileCleaningRecord(
+                        file_name=file_path.name,
+                        issues=issues,
+                        status="cleaned",
+                        attempts=attempt,
+                    )
+                )
+                break
+
+            previous_code, previous_error = code, error
+            if attempt >= MAX_CLEAN_ATTEMPTS:
+                result.skipped_files.append(
+                    FileCleaningRecord(
+                        file_name=file_path.name,
+                        issues=issues,
+                        status="skipped_failed",
+                        attempts=attempt,
+                        error=error,
+                    )
+                )
+
+    return result
