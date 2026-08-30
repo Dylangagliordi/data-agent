@@ -44,7 +44,7 @@ def curate_question(state: SQLAnalystState) -> dict:
 
     Appends the curated question to messages as a HumanMessage.
     """
-    llm = pick_llm("low")
+    llm = pick_llm("cheap")
     response = llm.invoke(
         [
             ("system", CURATE_QUESTION_SYSTEM_PROMPT),
