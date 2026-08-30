@@ -27,9 +27,16 @@ through the SQL analyst unconditionally.
 
 ## When to Use
 
-- The user asks a business or data question about the dataset currently loaded
-  in `data_agent_db` (counts, aggregates, joins, breakdowns, "how many X",
-  "what's the average Y", "top N by Z", etc.)
+- **Deterministic trigger — always applies, no judgment call:** the user's
+  message starts with `ask:` (case-insensitive, optional leading/trailing
+  whitespace around the colon). Treat everything after the prefix as the
+  question, verbatim, and run it through `main.py`. Do not evaluate whether it
+  "looks like" a data question first — the prefix alone is sufficient and
+  final.
+- **Fallback (looser) trigger:** with no `ask:` prefix, use this skill when the
+  message is still obviously a business or data question about the dataset
+  currently loaded in `data_agent_db` (counts, aggregates, joins, breakdowns,
+  "how many X", "what's the average Y", "top N by Z", etc.).
 - Don't use for: questions about the project's code, schema design discussions,
   or requests to load/change the dataset itself (that's `utils/load_data.py`,
   run directly, not through this skill).
@@ -56,8 +63,10 @@ Nothing else (no SQL, no raw state) is on stdout.
 
 ## Procedure
 
-1. Take the user's question as literally as possible — don't pre-interpret or
-   answer it yourself first.
+1. If the message starts with `ask:`, strip that prefix (and surrounding
+   whitespace) and use the remainder as the question verbatim — no further
+   interpretation needed. Otherwise, take the user's question as literally as
+   possible — don't pre-interpret or answer it yourself first.
 2. Run `python main.py "<question>"` via the `terminal` tool from the project
    root. Quote the question so shell word-splitting doesn't mangle it.
 3. Read the real stdout the command returned.
