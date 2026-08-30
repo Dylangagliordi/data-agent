@@ -83,3 +83,56 @@ def add_context(state: SQLAnalystState) -> dict:
         conn.close()
 
     return {"prompt_query_context": context}
+
+
+GENERATE_SQL_SYSTEM_PROMPT = """You are a SQL analyst. Given a question and a description of \
+the available tables (columns, types, and sample rows), write exactly ONE SQL query that \
+answers the question against a PostgreSQL database.
+
+Output ONLY the raw SQL query. No explanation, no commentary, no markdown code fences, no \
+backticks — just the SQL statement itself."""
+
+
+def _strip_sql_formatting(text: str) -> str:
+    """Strip markdown code fences around a SQL query, if the model added them anyway."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        # Drop the opening fence line (``` or ```sql)
+        lines = lines[1:]
+        # Drop a trailing fence line if present
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def generate_sql(state: SQLAnalystState) -> dict:
+    """Node 3 (high tier): write exactly one SQL query from curated_question + context.
+
+    If this is a retry after a failed execution (sql_query_execution_result holds an
+    error), that error is included so the model can try again with real information
+    about what went wrong.
+    """
+    llm = pick_llm("high")
+
+    human_content = (
+        f"Question: {state.curated_question}\n\n"
+        f"Database context:\n{state.prompt_query_context}"
+    )
+    if state.sql_query_execution_result:
+        human_content += (
+            "\n\nA previous attempt at this query failed with this real database error "
+            f"— fix the query so it actually works:\n{state.sql_query_execution_result}"
+            f"\n\nPrevious (failed) query was:\n{state.generated_sql_query}"
+        )
+
+    response = llm.invoke(
+        [
+            ("system", GENERATE_SQL_SYSTEM_PROMPT),
+            ("human", human_content),
+        ]
+    )
+    sql_query = _strip_sql_formatting(response.content)
+
+    return {"generated_sql_query": sql_query}
