@@ -11,9 +11,11 @@ dependencies = [
     "langchain-anthropic>=1.7.0",
     "langchain-ollama>=1.1.0",
     "langgraph>=1.2.11",
+    "pandas>=3.0.5",
     "psycopg2-binary>=2.9.12",
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
+    "requests>=2.34.2",
 ]
 
 [tool.uv]
