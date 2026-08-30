@@ -4,4 +4,5 @@ __pycache__/
 .env
 *.png
 !sql_analyst_graph.png
+!etl_analyst_graph.png
 logs/
