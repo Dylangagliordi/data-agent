@@ -20,7 +20,12 @@ load_dotenv(os.path.expanduser("~/.hermes/profiles/data-agent/.env"))
 
 def pick_llm(level: str):
     if level in ("low", "medium"):
-        return ChatOllama(model="qwen3.5:4b", temperature=0)
+        # reasoning=False: qwen3.5 defaults to emitting a <think>...</think> block
+        # before its real answer. With the default token budget it can burn the
+        # entire generation on thinking and return empty content (confirmed via a
+        # live call: done_reason="length", eval_count=4058, content=""). Disabling
+        # reasoning mode and capping num_predict keeps responses fast and non-empty.
+        return ChatOllama(model="qwen3.5:4b", temperature=0, reasoning=False, num_predict=1024)
     elif level == "high":
         # Note: claude-sonnet-5 rejects an explicit `temperature` param
         # ("temperature is deprecated for this model" — confirmed via a live
