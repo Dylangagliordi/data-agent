@@ -253,3 +253,45 @@ def cancel_sql(state: SQLAnalystState) -> dict:
         "final_answer": final_answer,
         "messages": [AIMessage(content=final_answer)],
     }
+
+
+REPRESENT_FINAL_ANSWER_SYSTEM_PROMPT = """You take a raw SQL execution result and the \
+original question, and write a plain-English answer to what was actually asked.
+
+Rules:
+- No SQL, no raw column names dumped as-is — translate into natural language.
+- If the execution result is empty, or doesn't clearly answer the question, say so \
+plainly instead of forcing an answer.
+- Be concise and directly answer the question."""
+
+
+def represent_final_answer(state: SQLAnalystState) -> dict:
+    """Node 8 (low tier): turn the raw execution result into a plain-English answer.
+
+    Appends the final answer as an AIMessage to messages.
+    """
+    # If execute_sql already gave up after exhausting retries, it already wrote a
+    # final_answer explaining the failure — don't overwrite it with an LLM guess.
+    if state.final_answer:
+        return {
+            "final_answer": state.final_answer,
+            "messages": [AIMessage(content=state.final_answer)],
+        }
+
+    llm = pick_llm("low")
+    human_content = (
+        f"Original question: {state.user_question}\n\n"
+        f"Raw SQL execution result: {state.sql_query_execution_result}"
+    )
+    response = llm.invoke(
+        [
+            ("system", REPRESENT_FINAL_ANSWER_SYSTEM_PROMPT),
+            ("human", human_content),
+        ]
+    )
+    final_answer = response.content.strip()
+
+    return {
+        "final_answer": final_answer,
+        "messages": [AIMessage(content=final_answer)],
+    }
