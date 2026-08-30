@@ -51,6 +51,23 @@ NON_NEGATIVE_NAME_HINTS = ("count", "qty", "quantity", "amount", "price", "value
 UNIQUE_ID_NAME_HINTS = ("id", "code", "key")
 
 
+def _read_csv_robust(path) -> pd.DataFrame:
+    """Read a CSV into a DataFrame the same way everywhere in this module that needs
+    real column values (check_rubric's content checks, and the LLM-prompt context
+    builder) — robust to the exact kind of encoding problem the rubric itself checks
+    for. Tries UTF-8 first; on a decode failure, falls back to latin-1 (which never
+    raises on arbitrary byte values), so a file that's flagged for an encoding problem
+    can still be read well enough to describe its columns/sample rows to the LLM,
+    instead of crashing before cleaning code can even be generated for it.
+    """
+    try:
+        return pd.read_csv(path, dtype=str, keep_default_na=True, on_bad_lines="skip")
+    except UnicodeDecodeError:
+        return pd.read_csv(
+            path, dtype=str, keep_default_na=True, on_bad_lines="skip", encoding="latin-1"
+        )
+
+
 def _read_raw_bytes(path: Path) -> bytes:
     """Read the file as raw bytes, for structural/encoding checks that need to see the
     file before any parser normalizes or silently skips malformed rows."""
@@ -287,7 +304,7 @@ def check_rubric(file_path) -> list:
     issues += _check_structural(path, raw_bytes)
 
     try:
-        df = pd.read_csv(path, dtype=str, keep_default_na=True, on_bad_lines="skip")
+        df = _read_csv_robust(path)
     except Exception as e:
         issues.append(f"Structural issue: file could not be parsed as CSV at all: {e}")
         return issues
@@ -397,7 +414,7 @@ listed, and write the cleaned result back to that same path (overwrite it in pla
 def _describe_file_for_prompt(file_path: Path) -> str:
     """Build a real-sample-rows + real-column/dtype context block for one file, the same
     principle generate_sql's schema context uses: concrete data, not a generic instruction."""
-    df = pd.read_csv(file_path, dtype=str, keep_default_na=True, on_bad_lines="skip")
+    df = _read_csv_robust(file_path)
     col_info = "\n".join(f"  - {c}" for c in df.columns)
     sample = df.head(5)
     sample_lines = "\n".join(str(row.to_dict()) for _, row in sample.iterrows())
