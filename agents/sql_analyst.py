@@ -115,7 +115,18 @@ the available tables (columns, types, and sample rows), write exactly ONE SQL qu
 answers the question against a PostgreSQL database.
 
 Output ONLY the raw SQL query. No explanation, no commentary, no markdown code fences, no \
-backticks — just the SQL statement itself."""
+backticks — just the SQL statement itself.
+
+Rules:
+- If the question asks for a write/action (update, delete, insert, tier assignment, etc.) \
+that this read-only query cannot actually perform, do NOT fake it by adding a literal/constant \
+column (e.g. `'Gold' AS loyalty_tier`) that pretends the action happened. Write a plain SELECT \
+that answers whatever part of the question is genuinely a read (e.g. "which customers spent \
+the most"), and leave it at that — do not invent columns representing an action never executed.
+- Do not return unbounded full-table results when the question implies a small, specific \
+answer (e.g. "the top customer(s)", "which category", "how many") — use LIMIT, aggregation, \
+or WHERE clauses so the result set is reasonably sized. Only omit a LIMIT if the question \
+genuinely calls for every matching row."""
 
 
 def _strip_sql_formatting(text: str) -> str:
@@ -205,6 +216,8 @@ def route_after_safety_check(state: SQLAnalystState) -> str:
 
 MAX_SQL_ATTEMPTS = 5
 _SQL_ERROR_PREFIX = "SQL_EXECUTION_ERROR: "
+MAX_RESULT_ROWS = 200
+_TRUNCATION_MARKER = "[TRUNCATED TO FIRST"
 
 
 def execute_sql(state: SQLAnalystState) -> dict:
@@ -216,6 +229,13 @@ def execute_sql(state: SQLAnalystState) -> dict:
     increments the attempt counter so the conditional edge after this node can
     route back to generate_sql with that error, capped at MAX_SQL_ATTEMPTS total
     attempts across the whole cycle.
+
+    Result rows are capped at MAX_RESULT_ROWS: an unbounded query (e.g. one with
+    no LIMIT that matches a huge fraction of a table) produced a multi-megabyte
+    result string in practice, which the summarizer node could not actually see
+    in full and ended up fabricating invented statistics over. Truncation is
+    reported explicitly in the result string so downstream nodes never mistake
+    a partial result for the complete answer.
     """
     attempts = state.sql_attempts + 1
     conn = get_app_reader_connection()
@@ -228,8 +248,18 @@ def execute_sql(state: SQLAnalystState) -> dict:
             cur.execute(state.generated_sql_query)
             if cur.description is not None:
                 col_names = [desc[0] for desc in cur.description]
-                rows = cur.fetchall()
+                rows = cur.fetchmany(MAX_RESULT_ROWS + 1)
+                truncated = len(rows) > MAX_RESULT_ROWS
+                if truncated:
+                    rows = rows[:MAX_RESULT_ROWS]
                 result_str = str([dict(zip(col_names, r)) for r in rows])
+                if truncated:
+                    result_str = (
+                        f"{_TRUNCATION_MARKER} {MAX_RESULT_ROWS} ROWS — the query matched more "
+                        f"rows than this; the full result set was NOT retrieved, so do not "
+                        f"compute counts/averages/min/max over \"all\" rows from this data]\n"
+                        f"{result_str}"
+                    )
             else:
                 result_str = "(query executed, no rows returned)"
         conn.commit()
@@ -294,7 +324,14 @@ never performed — the SQL that ran may have been read-only (e.g. a SELECT), or
 entirely. Never claim, imply, or hint that any change, update, or write happened unless the \
 raw execution result itself explicitly reflects it. If the question asked for an action \
 that clearly did not occur, say plainly that only the requested data was retrieved and no \
-change was made — do not agree that it happened just because the user asked for it."""
+change was made — do not agree that it happened just because the user asked for it.
+- If the execution result starts with "[TRUNCATED TO FIRST", it means the database matched \
+more rows than were actually retrieved — you are only seeing a partial slice, not the whole \
+result set. In that case, do NOT compute or state any count, average, min, max, or other \
+aggregate as if it covers "all" matching rows — that would be fabricated from incomplete data. \
+Instead say plainly that the result was too large to fully summarize and describe only the \
+partial sample you can actually see (e.g. a few example rows), or suggest the question be \
+narrowed (e.g. add a LIMIT or filter) to get a complete answer."""
 
 
 def represent_final_answer(state: SQLAnalystState) -> dict:
@@ -308,6 +345,26 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
         return {
             "final_answer": state.final_answer,
             "messages": [AIMessage(content=state.final_answer)],
+        }
+
+    # Deterministic guard, not just a prompt instruction: a small local model was
+    # observed (live, reproduced in tests/test_result_truncation.py) to fabricate
+    # counts/averages/min/max over a truncated result anyway, despite an explicit
+    # system-prompt rule not to. Rather than trust the LLM to comply, skip the LLM
+    # summarization entirely when the result is truncated and report the
+    # limitation directly — this cannot be talked out of by the model.
+    if state.sql_query_execution_result.startswith(_TRUNCATION_MARKER):
+        final_answer = (
+            "This query matched more rows than could be retrieved in full "
+            f"(results are capped at {MAX_RESULT_ROWS} rows), so I can't give you a complete "
+            "answer over the full result set — only a partial sample was available. "
+            "Try narrowing the question (e.g. ask for a top-N, a specific filter, or an "
+            "aggregate computed directly in the query) so the database can return a complete, "
+            "summarizable answer."
+        )
+        return {
+            "final_answer": final_answer,
+            "messages": [AIMessage(content=final_answer)],
         }
 
     llm = pick_llm("low")
