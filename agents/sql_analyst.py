@@ -2,7 +2,7 @@
 SQL analyst sub-agent: LangGraph node definitions.
 """
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from models.schema import JudgeSchema, SQLAnalystState
 from utils.db import get_app_reader_connection
@@ -239,3 +239,17 @@ def route_after_execute_sql(state: SQLAnalystState) -> str:
     if state.sql_query_execution_result.startswith(_SQL_ERROR_PREFIX):
         return "generate_sql"
     return "represent_final_answer"
+
+
+def cancel_sql(state: SQLAnalystState) -> dict:
+    """Node 7: write a final_answer explaining the query was blocked, quoting the
+    judge's own comments as the reason. Appends this as an AIMessage to messages.
+    """
+    final_answer = (
+        "This query was blocked before execution because it did not pass the "
+        f"read-only safety check. Reason given by the safety judge: {state.comments}"
+    )
+    return {
+        "final_answer": final_answer,
+        "messages": [AIMessage(content=final_answer)],
+    }
