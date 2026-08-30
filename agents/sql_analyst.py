@@ -9,6 +9,30 @@ from models.schema import JudgeSchema, SQLAnalystState
 from utils.db import get_app_reader_connection
 from utils.llm_pick import pick_llm
 
+
+def _extract_text(content) -> str:
+    """Extract plain text from a chat model response's .content.
+
+    Most responses are a plain str, but some providers (confirmed live with
+    claude-sonnet-5, which can engage extended thinking even without an
+    explicit thinking config) return a list of content blocks instead, e.g.
+    [{"type": "thinking", "thinking": "..."}, {"type": "text", "text": "..."}].
+    Calling .strip() directly on that list crashes with AttributeError. This
+    normalizes both shapes down to the actual answer text.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "".join(parts)
+    return str(content)
+
+
 CURATE_QUESTION_SYSTEM_PROMPT = """You clean up the wording of a raw user question about a \
 database. Fix grammar, spelling, and phrasing only. Do NOT change what the question is \
 actually asking, do NOT add new constraints, and do NOT answer it. Output only the cleaned-up \
@@ -27,7 +51,7 @@ def curate_question(state: SQLAnalystState) -> dict:
             ("human", state.user_question),
         ]
     )
-    curated = response.content.strip()
+    curated = _extract_text(response.content).strip()
 
     return {
         "curated_question": curated,
@@ -134,7 +158,7 @@ def generate_sql(state: SQLAnalystState) -> dict:
             ("human", human_content),
         ]
     )
-    sql_query = _strip_sql_formatting(response.content)
+    sql_query = _strip_sql_formatting(_extract_text(response.content))
 
     return {"generated_sql_query": sql_query}
 
@@ -263,7 +287,14 @@ Rules:
 - No SQL, no raw column names dumped as-is — translate into natural language.
 - If the execution result is empty, or doesn't clearly answer the question, say so \
 plainly instead of forcing an answer.
-- Be concise and directly answer the question."""
+- Be concise and directly answer the question.
+- CRITICAL: only report what the execution result actually shows. The user's original \
+question may ask for an action (an update, a deletion, sending something, etc.) that was \
+never performed — the SQL that ran may have been read-only (e.g. a SELECT), or blocked \
+entirely. Never claim, imply, or hint that any change, update, or write happened unless the \
+raw execution result itself explicitly reflects it. If the question asked for an action \
+that clearly did not occur, say plainly that only the requested data was retrieved and no \
+change was made — do not agree that it happened just because the user asked for it."""
 
 
 def represent_final_answer(state: SQLAnalystState) -> dict:
@@ -282,6 +313,7 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
     llm = pick_llm("low")
     human_content = (
         f"Original question: {state.user_question}\n\n"
+        f"The SQL query that was actually executed:\n{state.generated_sql_query}\n\n"
         f"Raw SQL execution result: {state.sql_query_execution_result}"
     )
     response = llm.invoke(
@@ -290,7 +322,7 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
             ("human", human_content),
         ]
     )
-    final_answer = response.content.strip()
+    final_answer = _extract_text(response.content).strip()
 
     return {
         "final_answer": final_answer,
