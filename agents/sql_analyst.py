@@ -4,7 +4,7 @@ SQL analyst sub-agent: LangGraph node definitions.
 
 from langchain_core.messages import HumanMessage
 
-from models.schema import SQLAnalystState
+from models.schema import JudgeSchema, SQLAnalystState
 from utils.db import get_app_reader_connection
 from utils.llm_pick import pick_llm
 
@@ -136,3 +136,30 @@ def generate_sql(state: SQLAnalystState) -> dict:
     sql_query = _strip_sql_formatting(response.content)
 
     return {"generated_sql_query": sql_query}
+
+
+IS_SAFE_SYSTEM_PROMPT = """You are a security judge reviewing a SQL query. Your ONLY job is \
+to decide whether this query is strictly read-only.
+
+Answer "no" if the query contains, anywhere in it, any of: INSERT, UPDATE, DELETE, DROP, \
+ALTER, TRUNCATE (in any case, including inside subqueries, CTEs, or comments). Otherwise \
+answer "yes".
+
+Do not evaluate correctness, style, or performance — only read-only safety. Give a brief \
+reason in comments."""
+
+
+def is_safe(state: SQLAnalystState) -> dict:
+    """Node 4 (medium tier, JudgeSchema via with_structured_output).
+
+    Receives ONLY the generated SQL text — never the original or curated question.
+    """
+    llm = pick_llm("medium").with_structured_output(JudgeSchema)
+    judgement: JudgeSchema = llm.invoke(
+        [
+            ("system", IS_SAFE_SYSTEM_PROMPT),
+            ("human", state.generated_sql_query),
+        ]
+    )
+
+    return {"is_safe": judgement.answer, "comments": judgement.comments}
