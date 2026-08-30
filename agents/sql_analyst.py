@@ -163,3 +163,16 @@ def is_safe(state: SQLAnalystState) -> dict:
     )
 
     return {"is_safe": judgement.answer, "comments": judgement.comments}
+
+
+def route_after_safety_check(state: SQLAnalystState) -> str:
+    """Conditional edge function for after is_safe.
+
+    Returns a plain string key directly ("execute_sql" or "cancel_sql") based on
+    state.is_safe. This return value is passed straight into add_conditional_edges'
+    routing mapping — it is NOT written into shared state and read back out, which
+    is what would cause a LangGraph concurrent-update error in this graph.
+    """
+    if state.is_safe == "yes":
+        return "execute_sql"
+    return "cancel_sql"
