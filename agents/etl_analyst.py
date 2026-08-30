@@ -127,10 +127,10 @@ def build_etl_analyst_graph():
         START -> agent -> (tools_condition) -> tools -> agent (loop)
                                               -> END (once the LLM stops requesting tools)
 
-    Callers must pass config={"recursion_limit": N} to .invoke() (see main entry points) —
-    LangGraph raises GraphRecursionError once the limit is hit rather than looping forever;
-    that error is caught and turned into a clear message by the caller, not silently
-    swallowed here.
+    Callers must pass config={"recursion_limit": N} to .invoke() (see run_etl_analyst
+    below) — LangGraph raises GraphRecursionError once the limit is hit rather than
+    looping forever; that error is caught and turned into a clear message by the caller,
+    not silently swallowed here.
     """
     graph = StateGraph(ETLAnalystState)
 
@@ -142,3 +142,41 @@ def build_etl_analyst_graph():
     graph.add_edge("tools", "agent")
 
     return graph.compile()
+
+
+def run_etl_analyst(user_request: str, max_steps: int = MAX_ETL_STEPS) -> str:
+    """Invoke the compiled graph on a single user request, with an explicit recursion
+    limit so a bad decision pattern can't loop indefinitely.
+
+    LangGraph's own recursion_limit counts graph super-steps, not individual node
+    visits; multiplying by 2 gives room for max_steps real agent-decides/tool-runs
+    round trips before hitting the cap, while still guaranteeing termination. On
+    GraphRecursionError, returns a clear, deterministic message rather than letting the
+    opaque LangGraph exception surface or silently returning nothing.
+    """
+    from langchain_core.messages import HumanMessage
+    from langgraph.errors import GraphRecursionError
+
+    graph = build_etl_analyst_graph()
+    try:
+        final_state = graph.invoke(
+            ETLAnalystState(messages=[HumanMessage(content=user_request)]),
+            config={"recursion_limit": max_steps * 2},
+        )
+    except GraphRecursionError:
+        return (
+            f"Stopped after {max_steps} steps without completing the request — the agent "
+            "did not reach a final answer within the step limit. This may mean the request "
+            "needs to be broken into smaller pieces, or the agent got stuck retrying the "
+            "same action."
+        )
+
+    last_message = final_state["messages"][-1]
+    content = last_message.content
+    if isinstance(content, list):
+        content = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+            if not (isinstance(block, dict) and block.get("type") == "thinking")
+        )
+    return content
