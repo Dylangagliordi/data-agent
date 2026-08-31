@@ -847,16 +847,43 @@ def check_rubric(file_path) -> list:
 
 MAX_CLEAN_ATTEMPTS = 3
 
+# Row-count-loss threshold: if a cleaned file has lost this fraction (or more) of its
+# original row count, that's flagged explicitly in the result even when check_rubric now
+# passes — a technically "clean" result that deleted a large share of the data is not
+# automatically a good outcome, and should never be silently hidden inside a plain
+# success message.
+ROW_LOSS_FLAG_THRESHOLD = 0.20
+
 
 @dataclass
 class FileCleaningRecord:
-    """One file's outcome from clean_dataset(): either cleaned, or skipped."""
+    """One file's outcome from clean_dataset(): either cleaned, or skipped.
+
+    Post-cleaning-validation fields (status == "cleaned" or "skipped_incomplete"):
+    - rubric_recheck_passed: whether re-running check_rubric() after the code executed
+      found none of the originally-flagged issues still present. False only ever
+      appears on "skipped_incomplete" (attempts exhausted with real issues remaining).
+    - remaining_issues: the originally-flagged issue(s) still present after the final
+      attempt, if any — empty when rubric_recheck_passed is True.
+    - row_count_before / row_count_after: real row counts of the file before cleaning
+      started and after the final successful clean, for the row-loss check below.
+      None when not computed (e.g. declined before any execution, or row counts
+      couldn't be read).
+    - row_loss_flagged: True if row_count_after lost >= ROW_LOSS_FLAG_THRESHOLD of
+      row_count_before, even though rubric_recheck_passed is True — flagged, not
+      treated as a failure, since the LLM's row-dropping strategy may be legitimate.
+    """
 
     file_name: str
     issues: list = field(default_factory=list)
-    status: str = ""  # "cleaned" | "skipped_declined" | "skipped_failed"
+    status: str = ""  # "cleaned" | "skipped_declined" | "skipped_failed" | "skipped_incomplete"
     attempts: int = 0
     error: str = ""
+    rubric_recheck_passed: bool = True
+    remaining_issues: list = field(default_factory=list)
+    row_count_before: int | None = None
+    row_count_after: int | None = None
+    row_loss_flagged: bool = False
 
 
 @dataclass
@@ -881,12 +908,39 @@ class CleaningResult:
                 lines.append(f"    - {rec.file_name} (attempts: {rec.attempts})")
                 for issue in rec.issues:
                     lines.append(f"        * {issue}")
+                lines.append(
+                    "        Post-cleaning re-check: PASSED "
+                    "(originally-flagged issue(s) confirmed resolved)"
+                )
+                if rec.row_count_before is not None and rec.row_count_after is not None:
+                    before, after = rec.row_count_before, rec.row_count_after
+                    pct = (before - after) / before if before else 0.0
+                    lines.append(
+                        f"        Row count: {before} -> {after} "
+                        f"({pct:+.1%} change)"
+                    )
+                    if rec.row_loss_flagged:
+                        lines.append(
+                            f"        \u26a0 WARNING: lost {pct:.1%} of rows during cleaning "
+                            f"(>= {ROW_LOSS_FLAG_THRESHOLD:.0%} threshold) — a technically "
+                            "clean result that deleted a large share of the data; verify "
+                            "this wasn't over-aggressive."
+                        )
         else:
             lines.append("  Cleaned successfully: 0")
         if self.skipped_files:
             lines.append(f"  Skipped: {len(self.skipped_files)}")
             for rec in self.skipped_files:
-                lines.append(f"    - {rec.file_name} ({rec.status}): {rec.error or 'declined by user'}")
+                if rec.status == "skipped_incomplete":
+                    remaining = "; ".join(rec.remaining_issues) or "(issue no longer describable)"
+                    lines.append(
+                        f"    - {rec.file_name} (skipped_incomplete): cleaning ran but did not "
+                        f"fully resolve: {remaining}"
+                    )
+                else:
+                    lines.append(
+                        f"    - {rec.file_name} ({rec.status}): {rec.error or 'declined by user'}"
+                    )
         if self.cleaned_files:
             lines.append(f"  Cleaned output folder: {self.cleaned_dir}")
         return "\n".join(lines)
@@ -1021,9 +1075,9 @@ def _generate_cleaning_code(
     )
     if previous_error:
         human_content += (
-            "\n\nA previous attempt at this file's cleaning script failed with this real "
-            f"error when executed — fix the script so it actually works:\n{previous_error}"
-            f"\n\nPrevious (failed) script was:\n{previous_code}"
+            "\n\nA previous attempt at this file's cleaning script did not fully succeed — "
+            f"fix the script so it actually works:\n{previous_error}"
+            f"\n\nPrevious script was:\n{previous_code}"
         )
 
     response = llm.invoke(
@@ -1072,12 +1126,36 @@ def _execute_cleaning_code(code: str, file_path: Path):
         return False, traceback.format_exc()
 
 
+def _count_csv_rows(path: Path) -> int | None:
+    """Real row count of a CSV, used for the before/after row-count-loss check. Returns
+    None (rather than raising) if the file can't be read at all — a file so broken it
+    can't even be counted shouldn't crash the whole cleaning run over a metric."""
+    try:
+        return len(_read_csv_robust(path))
+    except Exception:
+        return None
+
+
 def clean_dataset(folder_path, llm=None) -> CleaningResult:
     """Process every top-level CSV in folder_path SEPARATELY: run the rubric per file,
-    and for any file with real issues, clone -> generate -> approve -> execute -> retry
-    (up to MAX_CLEAN_ATTEMPTS) -> skip-and-report on exhaustion, continuing with the rest
-    of the folder either way. Files with nothing flagged are left alone entirely: no
+    and for any file with real issues, clone -> generate -> approve -> execute ->
+    RE-CHECK the rubric against the real cleaned output -> retry on either a real
+    execution failure OR originally-flagged issues still being present (up to
+    MAX_CLEAN_ATTEMPTS) -> skip-and-report on exhaustion, continuing with the rest of
+    the folder either way. Files with nothing flagged are left alone entirely: no
     clone, no LLM call, no approval prompt.
+
+    Post-cleaning validation (the part that makes "the exec() call didn't raise" stop
+    being treated as proof cleaning worked): once execution succeeds, check_rubric() is
+    re-run against the real cleaned file. If any of the ORIGINAL issues that triggered
+    cleaning are still detectable, that is treated exactly like an execution failure —
+    the specific remaining issue(s) are fed back into the next generation attempt, within
+    the same attempt cap. If issues remain after every attempt is exhausted, the file is
+    reported as "skipped_incomplete" with the real remaining issues named plainly, rather
+    than ever being reported as a plain success. Row count before vs. after is also
+    tracked for every successfully-cleaned file and flagged (not blocked) when the loss
+    is large (see ROW_LOSS_FLAG_THRESHOLD) — a technically clean result that deleted a
+    large share of the data is not automatically a good outcome.
 
     llm: optional injected chat model (used by tests to deterministically force a
     failing-then-succeeding code-gen sequence for the retry-cap test); defaults to
@@ -1104,14 +1182,16 @@ def clean_dataset(folder_path, llm=None) -> CleaningResult:
 
         cloned_path = _clone_file(file_path, cleaned_dir)
         resolved_llm = llm if llm is not None else pick_llm("high")
+        row_count_before = _count_csv_rows(cloned_path)
 
         previous_code = ""
         previous_error = ""
+        remaining_issues: list = list(issues)
         attempt = 0
         while attempt < MAX_CLEAN_ATTEMPTS:
             attempt += 1
             code = _generate_cleaning_code(
-                cloned_path, issues, resolved_llm, previous_code, previous_error
+                cloned_path, remaining_issues, resolved_llm, previous_code, previous_error
             )
             approved = _request_approval(code, cloned_path)
             if not approved:
@@ -1127,26 +1207,70 @@ def clean_dataset(folder_path, llm=None) -> CleaningResult:
                 break
 
             success, error = _execute_cleaning_code(code, cloned_path)
-            if success:
+            if not success:
+                previous_code, previous_error = code, error
+                if attempt >= MAX_CLEAN_ATTEMPTS:
+                    result.skipped_files.append(
+                        FileCleaningRecord(
+                            file_name=file_path.name,
+                            issues=issues,
+                            status="skipped_failed",
+                            attempts=attempt,
+                            error=error,
+                        )
+                    )
+                continue
+
+            # Execution succeeded — but a clean exec() is not itself proof the flagged
+            # issue(s) are actually gone. Re-run the exact same deterministic rubric
+            # against the real cleaned output and check whether any of the ORIGINAL
+            # issues are still present (a fresh, unrelated issue introduced elsewhere in
+            # the file is out of scope here — this loop only cares about the issues it
+            # was asked to fix).
+            post_issues = check_rubric(cloned_path)
+            still_present = [issue for issue in remaining_issues if issue in post_issues]
+
+            if not still_present:
+                row_count_after = _count_csv_rows(cloned_path)
+                row_loss_flagged = False
+                if row_count_before and row_count_after is not None:
+                    loss_frac = (row_count_before - row_count_after) / row_count_before
+                    row_loss_flagged = loss_frac >= ROW_LOSS_FLAG_THRESHOLD
                 result.cleaned_files.append(
                     FileCleaningRecord(
                         file_name=file_path.name,
                         issues=issues,
                         status="cleaned",
                         attempts=attempt,
+                        rubric_recheck_passed=True,
+                        row_count_before=row_count_before,
+                        row_count_after=row_count_after,
+                        row_loss_flagged=row_loss_flagged,
                     )
                 )
                 break
 
-            previous_code, previous_error = code, error
+            # One or more original issues are still detectable in the real output —
+            # treated the same as a real execution failure: feed the specific remaining
+            # issue(s) back in and retry, within the same attempt cap.
+            remaining_issues = still_present
+            previous_code = code
+            previous_error = (
+                "The script executed without raising an exception, but re-running the "
+                "data-quality check against the real cleaned output found these "
+                "originally-listed issue(s) are STILL PRESENT (not fixed):\n"
+                + "\n".join(f"- {i}" for i in still_present)
+            )
             if attempt >= MAX_CLEAN_ATTEMPTS:
                 result.skipped_files.append(
                     FileCleaningRecord(
                         file_name=file_path.name,
                         issues=issues,
-                        status="skipped_failed",
+                        status="skipped_incomplete",
                         attempts=attempt,
-                        error=error,
+                        error=previous_error,
+                        rubric_recheck_passed=False,
+                        remaining_issues=still_present,
                     )
                 )
 

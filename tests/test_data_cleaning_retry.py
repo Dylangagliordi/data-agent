@@ -2,7 +2,9 @@
 
 Injects a fake LLM (not pick_llm) via clean_dataset's llm= parameter, so this test does
 NOT depend on the real model happening to write broken code — it deterministically forces
-a real execution failure on attempt 1, then a working fix on attempt 2, and confirms:
+a real execution failure on attempt 1, then a working fix on attempt 2 (one that actually
+resolves the flagged issues, since Part 3's post-cleaning rubric re-check would otherwise
+correctly treat an unfixed file as incomplete rather than cleaned), and confirms:
 - attempt 1's real exec() error is fed back into the second generation call (visible in
   the fake LLM's recorded call history).
 - the file ends up cleaned successfully in 2 attempts.
@@ -45,7 +47,12 @@ class FailThenSucceedLLM:
         return FakeResponse(
             "import pandas as pd\n"
             f"path = {str(RETRY_FILE)!r}\n"
-            "df = pd.read_csv(path, dtype=str)\n"
+            "df = pd.read_csv(path)\n"
+            "# customer_id is under the 20% ceiling to impute here given the small sample; fill with mode.\n"
+            "df['customer_id'] = df['customer_id'].fillna(df['customer_id'].mode(dropna=True).iloc[0])\n"
+            "# amount: fix the genuinely impossible negative value, then impute remaining real nulls.\n"
+            "df['amount'] = df['amount'].apply(lambda x: abs(x) if pd.notnull(x) and x < 0 else x)\n"
+            "df['amount'] = df['amount'].fillna(df['amount'].median())\n"
             "df.to_csv(path, index=False)\n"
         )
 
@@ -62,7 +69,11 @@ class AlwaysFailLLM:
 
 
 FOLDER = "data/_test_etl/retry"
-RETRY_FILE = Path(FOLDER) / "orders_missing.csv"
+# The cleaning script always operates on the CLONE under cleaned/, never the raw file
+# (see clean_dataset()'s _clone_file call) — this must match that path, not the raw one,
+# or the fake "successful" script silently writes to the wrong file and the post-cleaning
+# rubric re-check (Part 3) correctly catches the clone as still unfixed.
+RETRY_FILE = Path(FOLDER) / "cleaned" / "orders_missing.csv"
 
 print("=" * 70)
 print("CASE 1: fails once, then succeeds on retry")
