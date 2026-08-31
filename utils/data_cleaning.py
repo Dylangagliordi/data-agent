@@ -7,7 +7,7 @@ inspect it against the rubric from the spec and return a list of concrete issue 
 (empty list == "nothing flagged, leave this file alone"). This never touches the LLM and
 never modifies anything on disk — it only reads and reports.
 
-Rubric checked here, per file:
+Rubric checked here, per file, original 8 categories:
 - Missing values beyond a reasonable threshold in columns that matter
 - Duplicate rows, or duplicate values in a column that should be unique
 - Wrong data types (numbers stored as text, inconsistent date formats)
@@ -17,15 +17,46 @@ Rubric checked here, per file:
 - Encoding problems (garbled or mixed character encoding)
 - Structural issues (inconsistent column counts, malformed rows)
 
-Deliberately NOT checked here: fan-out (multiple rows per a foreign key relative to
-another table). That's a cross-table relationship only checkable via information_schema
-once data is already loaded into Postgres, and it's already handled live by
-agents/sql_analyst.py's add_context / _detect_fanout_warnings. Duplicating it here
-against raw, not-yet-loaded files would be redundant and would need its own (different)
-implementation since there's no foreign-key structure to check against pre-load.
+Plus 17 more, added later, same discipline (deterministic, no LLM, naming heuristics
+rather than hardcoded per-dataset column names):
+
+Value-level:
+- Placeholder values masquerading as real data ("9999", "N/A", "TBD", "Unknown", ...)
+- Inconsistent boolean representations ("Y"/"N" vs "yes"/"no" vs "1"/"0" mixed)
+- Lost leading zeros in columns that look like they should preserve them (zip/postal)
+- Currency or unit symbols embedded in an otherwise-numeric column ("$50.00", "50 kg")
+- Locale-specific number formatting mixed within one column (1,234.56 vs 1.234,56)
+- Excessive floating-point noise (19.989999999999998-style computation artifacts)
+- Non-printable/control characters embedded in text fields
+- Copy-paste artifacts from spreadsheet tools (literal formulas, Excel error strings)
+
+Structural:
+- Inconsistent delimiters within what looks like the same kind of multi-value field
+- Column header issues (whitespace, inconsistent casing, duplicate header names)
+- Column misalignment from unmatched quote characters (beyond raw column-count checks)
+- A header row duplicated mid-file
+- Trailing empty rows or a trailing empty (unnamed) column
+- A byte-order-mark corrupting the first column name
+- Special characters in column names that would break downstream tooling
+
+Relational (within a single file only -- cross-table fan-out stays out of scope, see below):
+- Inconsistent granularity within one datetime column (day-level mixed with second-level)
+- Dangling references: a column that looks like a self-referencing FK whose values don't
+  all exist in this file's own identifier column (only checked where a candidate primary
+  identifier column is actually findable in the same file)
+
+Deliberately NOT checked here: statistical outliers and cross-field logical consistency
+(both need real judgment, not a fixed rule -- a weak approximation would be worse than
+nothing), and fan-out (multiple rows per a foreign key relative to another table). Fan-out
+is a cross-table relationship only checkable via information_schema once data is already
+loaded into Postgres, and it's already handled live by agents/sql_analyst.py's add_context
+/ _detect_fanout_warnings. Duplicating it here against raw, not-yet-loaded files would be
+redundant and would need its own (different) implementation since there's no foreign-key
+structure to check against pre-load.
 """
 
 import csv
+import re
 import shutil
 import traceback
 from dataclasses import dataclass, field
@@ -49,6 +80,37 @@ NON_NEGATIVE_NAME_HINTS = ("count", "qty", "quantity", "amount", "price", "value
 # row in this file (e.g. "id", "_id", "code") — used only for the duplicate-unique-value
 # check. Again a naming heuristic, not hardcoded per-dataset names.
 UNIQUE_ID_NAME_HINTS = ("id", "code", "key")
+
+# Tokens that commonly stand in for a genuine missing value without actually being parsed
+# as NaN by pandas' default na_values list (that list already swallows things like "N/A",
+# "NULL", "NaN" before we ever see them as strings) — used only for the placeholder-value
+# check below, to catch the ones pandas does NOT already treat as missing.
+PLACEHOLDER_TOKENS = {"9999", "999", "-1", "tbd", "unknown", "missing", "xxx", "n/a", "na", "null", "none"}
+
+# Boolean representation "families" — a column made up entirely of tokens from more than
+# one of these families (e.g. some rows "Y"/"N", others "1"/"0") is inconsistent; a column
+# using tokens from exactly one family is a normal, consistent boolean column.
+BOOLEAN_FAMILIES = {
+    "y/n": {"y", "n"},
+    "yes/no": {"yes", "no"},
+    "true/false": {"true", "false"},
+    "1/0": {"1", "0"},
+    "t/f": {"t", "f"},
+}
+
+# Column-name substrings that suggest a column should preserve leading zeros (postal/zip
+# codes are the classic case: "02139" losing its leading zero becomes "2139").
+ZIP_NAME_HINTS = ("zip", "postal", "postcode")
+
+# Currency symbols and unit suffixes checked for embedding in an otherwise-numeric column.
+CURRENCY_SYMBOLS = "$€£¥"
+UNIT_SUFFIXES = ("kg", "g", "lb", "lbs", "cm", "mm", "km", "mi", "oz", "%")
+
+# Literal Excel error strings that indicate a copy-paste artifact from a spreadsheet tool.
+# Deliberately excludes "#N/A" — pandas' default na_values list already converts that to a
+# real NaN before this module ever sees it as a string, so it's caught by the existing
+# missing-values check instead.
+EXCEL_ERROR_TOKENS = {"#DIV/0!", "#REF!", "#VALUE!", "#NAME?", "#NULL!", "#NUM!"}
 
 
 def _read_csv_robust(path) -> pd.DataFrame:
@@ -287,6 +349,445 @@ def _check_impossible_values(df: pd.DataFrame) -> list:
     return issues
 
 
+# ---------------------------------------------------------------------------
+# 17 additional deterministic checks, added later, same discipline as the original 8
+# above: real logic, no LLM, naming heuristics rather than hardcoded per-dataset names.
+# ---------------------------------------------------------------------------
+
+
+def _check_placeholder_values(df: pd.DataFrame) -> list:
+    """Placeholder tokens ("9999", "-1", "TBD", "Unknown", ...) standing in for a
+    genuine value. Only fires when a placeholder token appears as a MINORITY of a
+    column's values (< 50%) — a column that legitimately consists mostly of one such
+    label (e.g. a real "status" column that's mostly "unknown") isn't a placeholder
+    problem, it's a real category; a small number mixed in among otherwise normal
+    values is the actual signal something is standing in for missing data."""
+    issues = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip()
+        if series.empty:
+            continue
+        normalized = series.str.lower()
+        is_placeholder = normalized.isin(PLACEHOLDER_TOKENS)
+        placeholder_count = is_placeholder.sum()
+        if placeholder_count == 0:
+            continue
+        placeholder_frac = placeholder_count / len(series)
+        if placeholder_frac < 0.5:
+            found_tokens = sorted(normalized[is_placeholder].unique())
+            issues.append(
+                f"Placeholder values: column '{col}' has {placeholder_count} value(s) "
+                f"that look like placeholders standing in for real data ({found_tokens}), "
+                "mixed in among otherwise genuine values."
+            )
+    return issues
+
+
+def _check_boolean_inconsistency(df: pd.DataFrame) -> list:
+    """A column whose non-null values are drawn from more than one boolean-token
+    "family" at once (e.g. some rows 'Y'/'N', others '1'/'0') — a genuine boolean
+    column uses exactly one representation consistently."""
+    issues = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip().str.lower()
+        if series.empty:
+            continue
+        distinct = set(series.unique())
+        if not (1 < len(distinct) <= 4):
+            continue
+        all_tokens = set().union(*BOOLEAN_FAMILIES.values())
+        if not distinct.issubset(all_tokens):
+            continue
+        families_used = [name for name, toks in BOOLEAN_FAMILIES.items() if distinct & toks]
+        if len(families_used) > 1:
+            issues.append(
+                f"Inconsistent boolean representations: column '{col}' mixes more than "
+                f"one boolean style at once ({sorted(families_used)}), values seen: "
+                f"{sorted(distinct)}."
+            )
+    return issues
+
+
+def _check_lost_leading_zeros(df: pd.DataFrame) -> list:
+    """A column that looks like it should preserve leading zeros (zip/postal code by
+    name) where the most common value length is longer than some other values —
+    consistent with a leading zero having been dropped somewhere upstream."""
+    issues = []
+    for col in df.columns:
+        if not any(hint in col.lower() for hint in ZIP_NAME_HINTS):
+            continue
+        series = df[col].dropna().astype(str).str.strip()
+        digit_only = series[series.str.fullmatch(r"\d+")]
+        if len(digit_only) < 2:
+            continue
+        lengths = digit_only.str.len()
+        mode_len = lengths.mode().iloc[0]
+        short_count = (lengths == mode_len - 1).sum()
+        if short_count:
+            issues.append(
+                f"Lost leading zeros: column '{col}' has {short_count} value(s) one "
+                f"digit shorter than the common length ({mode_len}) — likely a dropped "
+                "leading zero."
+            )
+    return issues
+
+
+def _check_currency_unit_symbols(df: pd.DataFrame) -> list:
+    """Currency symbols or unit suffixes embedded in what is otherwise a numeric-looking
+    column (e.g. '$50.00', '50 kg' stored as text instead of a plain number)."""
+    issues = []
+    currency_pattern = re.compile(rf"^[{re.escape(CURRENCY_SYMBOLS)}]\s?\d")
+    unit_pattern = re.compile(
+        r"^\d+(\.\d+)?\s?(" + "|".join(re.escape(u) for u in UNIT_SUFFIXES) + r")$",
+        re.IGNORECASE,
+    )
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip()
+        if series.empty:
+            continue
+        currency_matches = series.str.contains(currency_pattern)
+        unit_matches = series.str.match(unit_pattern)
+        total_matches = (currency_matches | unit_matches).sum()
+        if total_matches:
+            issues.append(
+                f"Currency/unit symbols: column '{col}' has {total_matches} value(s) with "
+                "a currency symbol or unit suffix embedded in an otherwise numeric value."
+            )
+    return issues
+
+
+def _check_locale_number_formatting(df: pd.DataFrame) -> list:
+    """Locale-specific number formatting mixed within one column: some values styled
+    '1,234.56' (comma thousands / period decimal) and others '1.234,56' (period
+    thousands / comma decimal) in the same column."""
+    us_pattern = re.compile(r"^\d{1,3}(,\d{3})+\.\d+$")
+    eu_pattern = re.compile(r"^\d{1,3}(\.\d{3})+,\d+$")
+    issues = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip()
+        if series.empty:
+            continue
+        us_count = series.str.match(us_pattern).sum()
+        eu_count = series.str.match(eu_pattern).sum()
+        if us_count and eu_count:
+            issues.append(
+                f"Locale-specific number formatting: column '{col}' mixes US-style "
+                f"({us_count} value(s), e.g. 1,234.56) and EU-style ({eu_count} value(s), "
+                "e.g. 1.234,56) number formatting."
+            )
+    return issues
+
+
+def _check_float_noise(df: pd.DataFrame) -> list:
+    """Excessive floating-point noise: a value like 19.989999999999998 that looks like
+    an upstream floating-point computation artifact rather than a genuinely entered
+    number (a long run of repeated trailing 9s or 0s right after the decimal point)."""
+    noise_pattern = re.compile(r"\.\d*([09])\1{4,}\d?$")
+    issues = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip()
+        if series.empty:
+            continue
+        matches = series.map(lambda v: bool(noise_pattern.search(v)))
+        match_count = matches.sum()
+        if match_count:
+            issues.append(
+                f"Excessive floating-point noise: column '{col}' has {match_count} "
+                "value(s) with long runs of repeated trailing digits (e.g. "
+                "19.989999999999998), suggesting an upstream computation artifact."
+            )
+    return issues
+
+
+def _check_control_characters(raw_text: str) -> list:
+    """Non-printable/control characters embedded in text fields (excludes plain
+    tab/newline/carriage-return, which pandas' CSV parsing itself relies on).
+
+    Operates on the raw decoded text via csv.reader rather than the parsed DataFrame:
+    pandas' C parser treats an embedded NUL byte as a C-string terminator and silently
+    truncates the field before it (e.g. 'Bob\\x00Smith' becomes just 'Bob'), which would
+    hide exactly the kind of corruption this check exists to catch."""
+    control_pattern = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+    issues = []
+    reader = csv.reader(raw_text.splitlines())
+    try:
+        header = next(reader)
+    except StopIteration:
+        return issues
+    counts = [0] * len(header)
+    for row in reader:
+        for i, val in enumerate(row):
+            if i < len(counts) and control_pattern.search(val):
+                counts[i] += 1
+    for col, count in zip(header, counts):
+        if count:
+            issues.append(
+                f"Non-printable characters: column '{col}' has {count} value(s) "
+                "containing control/non-printable characters."
+            )
+    return issues
+
+
+def _check_spreadsheet_artifacts(df: pd.DataFrame) -> list:
+    """Copy-paste artifacts from spreadsheet tools: a literal formula string
+    ('=SUM(A1:A2)') or an Excel error string ('#DIV/0!', '#REF!', ...) landing in the
+    data instead of a computed/real value."""
+    formula_pattern = re.compile(r"^=\s*[A-Za-z]+\s*\(")
+    issues = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip()
+        if series.empty:
+            continue
+        formula_matches = series.str.match(formula_pattern).sum()
+        error_matches = series.isin(EXCEL_ERROR_TOKENS).sum()
+        if formula_matches:
+            issues.append(
+                f"Spreadsheet artifacts: column '{col}' has {formula_matches} value(s) "
+                "that look like a literal, uncalculated spreadsheet formula (e.g. '=SUM(...)')."
+            )
+        if error_matches:
+            issues.append(
+                f"Spreadsheet artifacts: column '{col}' has {error_matches} value(s) "
+                "that are literal Excel error strings (e.g. '#DIV/0!', '#REF!')."
+            )
+    return issues
+
+
+def _looks_like_delimited_list(value: str, delim: str) -> bool:
+    """True if splitting value on delim produces 2+ short, simple, non-empty tokens —
+    a proxy for 'this looks like a deliberate multi-value list', as opposed to a
+    comma appearing incidentally inside ordinary prose (e.g. 'Smith, John')."""
+    parts = value.split(delim)
+    if len(parts) < 2:
+        return False
+    return all(0 < len(p.strip()) <= 30 and re.fullmatch(r"[\w \-]+", p.strip()) for p in parts)
+
+
+def _check_inconsistent_delimiters(df: pd.DataFrame) -> list:
+    """A column that holds multi-value fields (a list of items in one cell) where the
+    separator character isn't consistent across rows — some rows comma-separated, some
+    semicolon, some pipe, for what looks like the same kind of field."""
+    delims = (",", ";", "|")
+    issues = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str)
+        if series.empty:
+            continue
+        delims_used = set()
+        for val in series:
+            for d in delims:
+                if d in val and _looks_like_delimited_list(val, d):
+                    delims_used.add(d)
+        if len(delims_used) > 1:
+            issues.append(
+                f"Inconsistent delimiters: column '{col}' uses more than one separator "
+                f"({sorted(delims_used)}) for what looks like the same kind of "
+                "multi-value field."
+            )
+    return issues
+
+
+def _read_header_row(raw_text: str) -> list:
+    """Real header row exactly as written in the file (not pandas' post-processed
+    df.columns, which silently renames blank/duplicate headers) — needed by the
+    header-focused checks below."""
+    reader = csv.reader(raw_text.splitlines())
+    try:
+        return next(reader)
+    except StopIteration:
+        return []
+
+
+def _check_header_issues(raw_text: str) -> list:
+    """Whitespace or inconsistent casing in header names, or duplicate header names —
+    checked against the real header row as written, before pandas mangles duplicates
+    by suffixing them (e.g. 'id', 'id.1')."""
+    issues = []
+    headers = _read_header_row(raw_text)
+    if not headers:
+        return issues
+
+    whitespace_headers = [h for h in headers if h != h.strip()]
+    if whitespace_headers:
+        issues.append(
+            f"Column header issues: {len(whitespace_headers)} header(s) have leading/"
+            f"trailing whitespace ({whitespace_headers})."
+        )
+
+    normalized = [h.strip().lower() for h in headers]
+    seen = set()
+    dupes = set()
+    for h in normalized:
+        if h in seen:
+            dupes.add(h)
+        seen.add(h)
+    if dupes:
+        issues.append(f"Column header issues: duplicate column name(s) found: {sorted(dupes)}.")
+
+    def _style(h: str) -> str:
+        stripped = h.strip()
+        if not stripped or not stripped.isalpha() and "_" not in stripped and " " not in stripped:
+            return "other"
+        if stripped.isupper():
+            return "upper"
+        if stripped.islower() or "_" in stripped:
+            return "snake_or_lower"
+        if stripped[0].isupper():
+            return "title_or_camel"
+        return "other"
+
+    styles = {_style(h) for h in headers if _style(h) != "other"}
+    if len(styles) > 1:
+        issues.append(
+            f"Column header issues: header names mix inconsistent casing conventions "
+            f"({sorted(styles)}) across {headers}."
+        )
+    return issues
+
+
+def _check_special_chars_in_headers(raw_text: str) -> list:
+    """Special characters in column names (anything beyond letters/digits/underscore/
+    space/hyphen) that would break downstream SQL/tooling that expects plain
+    identifiers."""
+    issues = []
+    headers = _read_header_row(raw_text)
+    bad_headers = [h for h in headers if re.search(r"[^\w \-]", h)]
+    if bad_headers:
+        issues.append(
+            f"Special characters in headers: {len(bad_headers)} header(s) contain "
+            f"characters that would break downstream tooling ({bad_headers})."
+        )
+    return issues
+
+
+def _check_column_misalignment_quotes(raw_text: str) -> list:
+    """Column misalignment caused specifically by unmatched quote characters on a
+    single physical line — distinct from the existing ragged-column-count structural
+    check, since a stray unmatched quote can cause a parser to silently merge or split
+    rows even when the resulting field count happens to still match the header."""
+    issues = []
+    lines = raw_text.splitlines()[1:]  # skip header
+    bad_lines = sum(1 for line in lines if line.count('"') % 2 != 0)
+    if bad_lines:
+        issues.append(
+            f"Column misalignment: {bad_lines} row(s) contain an unmatched quote "
+            "character, which can cause fields to be misread or misaligned."
+        )
+    return issues
+
+
+def _check_header_duplicated_mid_file(raw_text: str) -> list:
+    """The header row appears again, verbatim, somewhere in the data — a common
+    artifact of concatenating multiple exports of the same file together."""
+    issues = []
+    reader = csv.reader(raw_text.splitlines())
+    try:
+        header = next(reader)
+    except StopIteration:
+        return issues
+    dup_count = sum(1 for row in reader if row == header)
+    if dup_count:
+        issues.append(
+            f"Header row duplicated mid-file: the header row appears again verbatim "
+            f"{dup_count} time(s) among the data rows."
+        )
+    return issues
+
+
+def _check_trailing_empty(df: pd.DataFrame, raw_text: str) -> list:
+    """Trailing empty rows at the end of the file, or a trailing column that's entirely
+    empty (either a blank/unnamed header, or a fully-null column)."""
+    issues = []
+    lines = [line for line in raw_text.splitlines()]
+    data_lines = lines[1:] if lines else []
+    trailing_empty_rows = 0
+    for line in reversed(data_lines):
+        if line.strip() == "" or set(line.strip()) <= {","}:
+            trailing_empty_rows += 1
+        else:
+            break
+    if trailing_empty_rows:
+        issues.append(f"Trailing empty rows: {trailing_empty_rows} blank row(s) at the end of the file.")
+
+    if len(df.columns) > 0:
+        last_col = str(df.columns[-1])
+        looks_unnamed = last_col.strip() == "" or last_col.startswith("Unnamed:")
+        if looks_unnamed and bool(df[last_col].isna().all()):
+            issues.append(f"Trailing empty column: last column ('{last_col}') is entirely empty.")
+    return issues
+
+
+def _check_bom(raw_bytes: bytes) -> list:
+    """A byte-order-mark at the start of the file, which corrupts the first column
+    name when read as plain UTF-8 (it ends up prefixed with a stray \\ufeff character)."""
+    issues = []
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        issues.append(
+            "Byte-order-mark: file starts with a UTF-8 BOM, which will corrupt the "
+            "first column name unless explicitly stripped."
+        )
+    return issues
+
+
+def _check_granularity_inconsistency(df: pd.DataFrame) -> list:
+    """A datetime column where some values are recorded at day-level precision and
+    others down to the second (or minute) within the same column."""
+    issues = []
+    for col in df.columns:
+        col_lower = col.lower()
+        if "date" not in col_lower and "time" not in col_lower:
+            continue
+        series = df[col].dropna().astype(str).str.strip()
+        parsed = pd.to_datetime(series, errors="coerce", format="mixed")
+        valid = series[parsed.notna()]
+        if len(valid) < 2:
+            continue
+        has_time_component = valid.str.contains(r"\d{1,2}:\d{2}")
+        day_only_count = (~has_time_component).sum()
+        with_time_count = has_time_component.sum()
+        if day_only_count and with_time_count:
+            issues.append(
+                f"Inconsistent granularity: column '{col}' mixes day-level values "
+                f"({day_only_count}) with time-of-day values ({with_time_count}) in "
+                "the same column."
+            )
+    return issues
+
+
+def _check_dangling_references(df: pd.DataFrame) -> list:
+    """A column that looks like a self-referencing identifier (name suggests it points
+    at another row in this same file, e.g. 'parent_id', 'manager_id') where some values
+    don't correspond to anything in this file's own primary identifier column. Only
+    checked when a clear primary-identifier candidate column ('id', case-insensitive)
+    actually exists in the file — otherwise there's nothing to check the references
+    against, and this is silently skipped rather than guessed at."""
+    issues = []
+    id_cols = [c for c in df.columns if c.strip().lower() == "id"]
+    if not id_cols:
+        return issues
+    primary_col = id_cols[0]
+    valid_ids = set(df[primary_col].dropna().astype(str).str.strip())
+    if not valid_ids:
+        return issues
+
+    for col in df.columns:
+        if col == primary_col:
+            continue
+        col_lower = col.lower()
+        if not col_lower.endswith("id") or col_lower == "id":
+            continue
+        values = df[col].dropna().astype(str).str.strip()
+        if values.empty:
+            continue
+        dangling = values[~values.isin(valid_ids)]
+        if len(dangling):
+            issues.append(
+                f"Dangling references: column '{col}' looks like a reference to "
+                f"'{primary_col}' but has {len(dangling)} value(s) not found there."
+            )
+    return issues
+
+
 def check_rubric(file_path) -> list:
     """Run the full rubric against a single raw file. Returns a list of human-readable
     issue strings; an empty list means nothing was flagged for this file.
@@ -300,8 +801,15 @@ def check_rubric(file_path) -> list:
     issues: list = []
 
     raw_bytes = _read_raw_bytes(path)
+    raw_text = raw_bytes.decode("utf-8", errors="replace")
     issues += _check_encoding(raw_bytes)
     issues += _check_structural(path, raw_bytes)
+    issues += _check_bom(raw_bytes)
+    issues += _check_header_issues(raw_text)
+    issues += _check_special_chars_in_headers(raw_text)
+    issues += _check_column_misalignment_quotes(raw_text)
+    issues += _check_header_duplicated_mid_file(raw_text)
+    issues += _check_control_characters(raw_text)
 
     try:
         df = _read_csv_robust(path)
@@ -315,6 +823,17 @@ def check_rubric(file_path) -> list:
     issues += _check_categorical_inconsistency(df)
     issues += _check_formatting_noise(df)
     issues += _check_impossible_values(df)
+    issues += _check_placeholder_values(df)
+    issues += _check_boolean_inconsistency(df)
+    issues += _check_lost_leading_zeros(df)
+    issues += _check_currency_unit_symbols(df)
+    issues += _check_locale_number_formatting(df)
+    issues += _check_float_noise(df)
+    issues += _check_spreadsheet_artifacts(df)
+    issues += _check_inconsistent_delimiters(df)
+    issues += _check_trailing_empty(df, raw_text)
+    issues += _check_granularity_inconsistency(df)
+    issues += _check_dangling_references(df)
 
     return issues
 
