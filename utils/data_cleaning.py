@@ -112,6 +112,122 @@ UNIT_SUFFIXES = ("kg", "g", "lb", "lbs", "cm", "mm", "km", "mi", "oz", "%")
 # missing-values check instead.
 EXCEL_ERROR_TOKENS = {"#DIV/0!", "#REF!", "#VALUE!", "#NAME?", "#NULL!", "#NUM!"}
 
+# ---------------------------------------------------------------------------
+# Severity mapping: every issue category check_rubric() can produce is classified as
+# either FAIL (a real correctness/integrity risk — silently wrong values, broken joins,
+# data that downstream tooling would misread) or WARN (cosmetic/low-risk — annoying but
+# doesn't corrupt meaning). This mapping did not exist before this restructuring; it was
+# built fresh here by asking "does leaving this specific category unfixed produce
+# SILENTLY WRONG data or broken tooling, or is it cosmetic/informational" for every one
+# of the 25 categories check_rubric() checks. It is a real, editable judgment call, not a
+# hidden assumption — if a category's placement here turns out wrong for how this project
+# actually uses its data, move its prefix between the two sets below; nothing else in this
+# module needs to change to support that.
+#
+# Classified as FAIL — leaving these unfixed risks silently wrong values, broken
+# joins/lookups, or data downstream tooling can't parse at all:
+#   - Duplicate rows / duplicate values in a column that should be unique (wrong counts,
+#     broken one-to-one assumptions)
+#   - Wrong data types (numbers stored as text, inconsistent date formats — arithmetic and
+#     date comparisons silently misbehave or fail)
+#   - Invalid/impossible values (a negative count, an out-of-range date — clearly wrong,
+#     not just unusual)
+#   - Encoding problems (garbled text corrupts every downstream read of that column)
+#   - Structural issues (ragged rows, unparseable file — the file may not even load)
+#   - Placeholder values masquerading as real data (silently wrong aggregates: a "9999"
+#     stored as a real age, for example)
+#   - Lost leading zeros (silently wrong identifiers — a zip code becomes a different one)
+#   - Locale-specific number formatting mixed in one column (a "1.234,56" parsed as the
+#     number 1.234 instead of 1234.56 — silently wrong by 1000x)
+#   - Copy-paste spreadsheet artifacts (a literal formula string or error code stored in
+#     place of a real, computed value — the "value" itself is not data)
+#   - Column misalignment from unmatched quotes (fields silently shifted into the wrong
+#     column)
+#   - Header row duplicated mid-file (a literal header row masquerading as a data row)
+#   - Byte-order-mark corruption (corrupts the FIRST COLUMN'S NAME — every downstream
+#     reference to that column by name silently breaks)
+#   - Dangling references (a foreign-key-shaped column pointing at nothing — joins
+#     silently drop or misjoin rows)
+#
+# Classified as WARN — cosmetic, informational, or judgment-dependent; doesn't corrupt
+# meaning on its own and is safe to batch:
+#   - Missing values (already has its own proportional-imputation-vs-drop reasoning; not
+#     a correctness bug by itself, a data-completeness question)
+#   - Inconsistent categorical values (same real value, different spelling/casing — an
+#     annoyance for grouping, not silently wrong data)
+#   - Formatting noise (stray whitespace — cosmetic)
+#   - Inconsistent boolean representations (still a real True/False either way, just
+#     styled two ways)
+#   - Currency/unit symbols embedded in a numeric column (the true number's still visible
+#     in the string; it just needs parsing)
+#   - Excessive floating-point noise (the value is still numerically correct to
+#     many-decimal precision, just noisy-looking)
+#   - Non-printable/control characters (usually a display/tooling annoyance, not a wrong
+#     value)
+#   - Inconsistent delimiters in a multi-value field (a parsing nuisance, not wrong data)
+#   - Column header issues — whitespace/casing/duplicate names (annoying, not wrong values)
+#   - Trailing empty rows/columns (dead weight, not wrong data)
+#   - Special characters in headers (a tooling-compatibility nuisance, not wrong data)
+#   - Inconsistent datetime granularity (still a valid, parseable timestamp either way)
+FAIL_LEVEL_PREFIXES = (
+    "Duplicate rows:",
+    "Duplicate values:",
+    "Wrong data type:",
+    "Invalid values:",
+    "Encoding problem:",
+    "Structural issue:",
+    "Placeholder values:",
+    "Lost leading zeros:",
+    "Locale-specific number formatting:",
+    "Spreadsheet artifacts:",
+    "Column misalignment:",
+    "Header row duplicated mid-file:",
+    "Byte-order-mark:",
+    "Dangling references:",
+)
+
+WARN_LEVEL_PREFIXES = (
+    "Missing values:",
+    "Inconsistent categorical values:",
+    "Formatting noise:",
+    "Inconsistent boolean representations:",
+    "Currency/unit symbols:",
+    "Excessive floating-point noise:",
+    "Non-printable characters:",
+    "Inconsistent delimiters:",
+    "Column header issues:",
+    "Trailing empty rows:",
+    "Trailing empty column:",
+    "Special characters in headers:",
+    "Inconsistent granularity:",
+)
+
+
+def _issue_severity(issue: str) -> str:
+    """Classify a single check_rubric() issue string as "fail" or "warn" using
+    FAIL_LEVEL_PREFIXES / WARN_LEVEL_PREFIXES above. An issue string that matches
+    neither list (should never happen for a category check_rubric() actually
+    produces — this is a defensive default, not an expected path) is treated as
+    "warn" rather than silently dropped or crashing, so a future new category added
+    to check_rubric() without updating this mapping fails safe (batched, lower
+    urgency) instead of being skipped from cleaning entirely.
+    """
+    for prefix in FAIL_LEVEL_PREFIXES:
+        if issue.startswith(prefix):
+            return "fail"
+    for prefix in WARN_LEVEL_PREFIXES:
+        if issue.startswith(prefix):
+            return "warn"
+    return "warn"
+
+
+def _split_issues_by_severity(issues: list) -> tuple:
+    """Split a full check_rubric() issue list into (fail_issues, warn_issues),
+    preserving the original order within each group."""
+    fail_issues = [i for i in issues if _issue_severity(i) == "fail"]
+    warn_issues = [i for i in issues if _issue_severity(i) == "warn"]
+    return fail_issues, warn_issues
+
 
 def _read_csv_robust(path) -> pd.DataFrame:
     """Read a CSV into a DataFrame the same way everywhere in this module that needs
@@ -856,19 +972,80 @@ ROW_LOSS_FLAG_THRESHOLD = 0.20
 
 
 @dataclass
+class IssueCleaningRecord:
+    """One fail-level issue's individually-processed outcome within a file (see
+    clean_dataset()'s per-issue loop). Fail-level issues are never batched together —
+    each gets its own generate -> approve -> execute -> immediate re-check cycle,
+    scoped to exactly this one issue.
+
+    status: "resolved" | "skipped_declined" | "skipped_failed" (real execution error
+    exhausted all attempts) | "skipped_incomplete" (execution succeeded but this
+    specific issue was still detected immediately afterward, every attempt).
+    """
+
+    issue: str
+    status: str = ""
+    attempts: int = 0
+    error: str = ""
+
+
+@dataclass
+class WarnBatchRecord:
+    """The batched outcome of every warn-level issue in a file, processed together in
+    one combined generate -> approve -> execute -> re-check cycle — unchanged in
+    spirit from the original whole-file design, just scoped to warn-level issues only.
+
+    status: "no_warn_issues" (nothing warn-level was flagged for this file — no clone
+    mutation, no LLM call, no approval prompt happened for this stage) | "resolved" |
+    "skipped_declined" | "skipped_failed" | "skipped_incomplete" (same meanings as
+    IssueCleaningRecord.status above, just for the batch as a whole).
+    """
+
+    issues: list = field(default_factory=list)
+    status: str = ""
+    attempts: int = 0
+    error: str = ""
+    remaining_issues: list = field(default_factory=list)
+
+
+@dataclass
 class FileCleaningRecord:
     """One file's outcome from clean_dataset(): either cleaned, or skipped.
 
-    Post-cleaning-validation fields (status == "cleaned" or "skipped_incomplete"):
-    - rubric_recheck_passed: whether re-running check_rubric() after the code executed
-      found none of the originally-flagged issues still present. False only ever
-      appears on "skipped_incomplete" (attempts exhausted with real issues remaining).
-    - remaining_issues: the originally-flagged issue(s) still present after the final
-      attempt, if any — empty when rubric_recheck_passed is True.
-    - row_count_before / row_count_after: real row counts of the file before cleaning
-      started and after the final successful clean, for the row-loss check below.
-      None when not computed (e.g. declined before any execution, or row counts
-      couldn't be read).
+    issues: every issue check_rubric() originally found for this file (fail-level +
+    warn-level together, in the order check_rubric() produced them) — the same full
+    list previous versions of this dataclass stored here, kept for anyone (tests,
+    callers) that only cares about "what was wrong with this file", not how each
+    issue was individually processed.
+
+    fail_issue_records: list[IssueCleaningRecord], one per fail-level issue, in the
+    order they were processed (== the order check_rubric() found them) — empty if
+    this file had no fail-level issues at all.
+
+    warn_batch: WarnBatchRecord for the batched warn-level pass, or None if the file's
+    processing was declined before ever reaching the warn-level stage (mid-way through
+    the fail-level loop).
+
+    status / attempts / error: an aggregate/overall view for this file — status is
+    "cleaned" (final full re-check passed cleanly), "skipped_declined" (the user
+    declined an approval prompt for some issue/batch — processing of the REST of the
+    file stops at that point, same as the original whole-file design's decline
+    semantics), or "skipped_incomplete" (every issue/batch got its full, individually-
+    scoped chance, but the final full check_rubric() pass still found at least one of
+    the file's original issues present). attempts is the sum of every fail-issue's and
+    the warn-batch's individual attempt counts, for a quick "how much retrying did
+    this file need in total" figure.
+
+    Post-cleaning-validation fields (final, whole-file check — a report/audit of the
+    complete result after every issue already got its own appropriately-scoped retry
+    loop above, not a further retry cycle itself):
+    - rubric_recheck_passed: whether the FINAL, full check_rubric() pass across the
+      complete cleaned file found none of the file's ORIGINAL issues still present.
+    - remaining_issues: which of the file's original issues are still detectable after
+      everything above has run — empty when rubric_recheck_passed is True.
+    - row_count_before / row_count_after: real row counts of the file before any
+      fail/warn processing started and after everything finished, for the row-loss
+      check below. None when not computed (e.g. declined before completion).
     - row_loss_flagged: True if row_count_after lost >= ROW_LOSS_FLAG_THRESHOLD of
       row_count_before, even though rubric_recheck_passed is True — flagged, not
       treated as a failure, since the LLM's row-dropping strategy may be legitimate.
@@ -876,7 +1053,9 @@ class FileCleaningRecord:
 
     file_name: str
     issues: list = field(default_factory=list)
-    status: str = ""  # "cleaned" | "skipped_declined" | "skipped_failed" | "skipped_incomplete"
+    fail_issue_records: list = field(default_factory=list)
+    warn_batch: WarnBatchRecord | None = None
+    status: str = ""  # "cleaned" | "skipped_declined" | "skipped_incomplete"
     attempts: int = 0
     error: str = ""
     rubric_recheck_passed: bool = True
@@ -884,6 +1063,23 @@ class FileCleaningRecord:
     row_count_before: int | None = None
     row_count_after: int | None = None
     row_loss_flagged: bool = False
+
+
+def _issue_outcome_line(status: str, attempts: int, error: str) -> str:
+    """One human-readable outcome phrase for an IssueCleaningRecord/WarnBatchRecord
+    status — shared by both so the wording is identical whether it's describing a
+    single fail-level issue or the warn-level batch."""
+    if status == "resolved":
+        return f"resolved (attempts: {attempts})"
+    if status == "skipped_declined":
+        return "declined by user"
+    if status == "skipped_failed":
+        return f"execution failed every attempt (attempts: {attempts}): {error}"
+    if status == "skipped_incomplete":
+        return f"still present after {attempts} attempt(s): {error}"
+    if status == "no_warn_issues":
+        return "no warn-level issues found — nothing to do"
+    return status or "(no outcome recorded)"
 
 
 @dataclass
@@ -896,6 +1092,45 @@ class CleaningResult:
     cleaned_files: list = field(default_factory=list)  # list[FileCleaningRecord], status="cleaned"
     skipped_files: list = field(default_factory=list)  # list[FileCleaningRecord], skipped
 
+    def _file_detail_lines(self, rec: "FileCleaningRecord") -> list:
+        """Shared detail rendering for one file's fail-issue-by-fail-issue outcomes,
+        the warn-batch outcome, and the final overall check — used for both cleaned
+        and skipped files so the same real information is visible either way."""
+        lines = []
+        if rec.fail_issue_records:
+            lines.append("        Fail-level issues (processed individually):")
+            for issue_rec in rec.fail_issue_records:
+                outcome = _issue_outcome_line(issue_rec.status, issue_rec.attempts, issue_rec.error)
+                lines.append(f"          * {issue_rec.issue}")
+                lines.append(f"              -> {outcome}")
+        if rec.warn_batch is not None and rec.warn_batch.status != "no_warn_issues":
+            lines.append("        Warn-level issues (batched together):")
+            for issue in rec.warn_batch.issues:
+                lines.append(f"          * {issue}")
+            outcome = _issue_outcome_line(rec.warn_batch.status, rec.warn_batch.attempts, rec.warn_batch.error)
+            lines.append(f"              -> batch {outcome}")
+        if rec.status != "skipped_declined":
+            if rec.rubric_recheck_passed:
+                lines.append(
+                    "        Final overall check: PASSED "
+                    "(all originally-flagged issues confirmed resolved)"
+                )
+            else:
+                remaining = "; ".join(rec.remaining_issues) or "(issue no longer describable)"
+                lines.append(f"        Final overall check: cleaning ran but did not fully resolve: {remaining}")
+            if rec.row_count_before is not None and rec.row_count_after is not None:
+                before, after = rec.row_count_before, rec.row_count_after
+                pct = (before - after) / before if before else 0.0
+                lines.append(f"        Row count: {before} -> {after} ({pct:+.1%} change)")
+                if rec.row_loss_flagged:
+                    lines.append(
+                        f"        \u26a0 WARNING: lost {pct:.1%} of rows during cleaning "
+                        f"(>= {ROW_LOSS_FLAG_THRESHOLD:.0%} threshold) — a technically "
+                        "clean result that deleted a large share of the data; verify "
+                        "this wasn't over-aggressive."
+                    )
+        return lines
+
     def summary(self) -> str:
         lines = [f"Cleaning summary for {self.folder_path}:"]
         lines.append(
@@ -905,42 +1140,15 @@ class CleaningResult:
         if self.cleaned_files:
             lines.append(f"  Cleaned successfully: {len(self.cleaned_files)}")
             for rec in self.cleaned_files:
-                lines.append(f"    - {rec.file_name} (attempts: {rec.attempts})")
-                for issue in rec.issues:
-                    lines.append(f"        * {issue}")
-                lines.append(
-                    "        Post-cleaning re-check: PASSED "
-                    "(originally-flagged issue(s) confirmed resolved)"
-                )
-                if rec.row_count_before is not None and rec.row_count_after is not None:
-                    before, after = rec.row_count_before, rec.row_count_after
-                    pct = (before - after) / before if before else 0.0
-                    lines.append(
-                        f"        Row count: {before} -> {after} "
-                        f"({pct:+.1%} change)"
-                    )
-                    if rec.row_loss_flagged:
-                        lines.append(
-                            f"        \u26a0 WARNING: lost {pct:.1%} of rows during cleaning "
-                            f"(>= {ROW_LOSS_FLAG_THRESHOLD:.0%} threshold) — a technically "
-                            "clean result that deleted a large share of the data; verify "
-                            "this wasn't over-aggressive."
-                        )
+                lines.append(f"    - {rec.file_name} (total attempts: {rec.attempts})")
+                lines.extend(self._file_detail_lines(rec))
         else:
             lines.append("  Cleaned successfully: 0")
         if self.skipped_files:
             lines.append(f"  Skipped: {len(self.skipped_files)}")
             for rec in self.skipped_files:
-                if rec.status == "skipped_incomplete":
-                    remaining = "; ".join(rec.remaining_issues) or "(issue no longer describable)"
-                    lines.append(
-                        f"    - {rec.file_name} (skipped_incomplete): cleaning ran but did not "
-                        f"fully resolve: {remaining}"
-                    )
-                else:
-                    lines.append(
-                        f"    - {rec.file_name} ({rec.status}): {rec.error or 'declined by user'}"
-                    )
+                lines.append(f"    - {rec.file_name} ({rec.status})")
+                lines.extend(self._file_detail_lines(rec))
         if self.cleaned_files:
             lines.append(f"  Cleaned output folder: {self.cleaned_dir}")
         return "\n".join(lines)
@@ -1136,32 +1344,109 @@ def _count_csv_rows(path: Path) -> int | None:
         return None
 
 
+def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
+    """Shared generate -> approve -> execute -> immediate re-check -> retry cycle for
+    ONE group of issues against one already-cloned file, capped at MAX_CLEAN_ATTEMPTS
+    for this group specifically. Used for both:
+    - a single fail-level issue (target_issues == [that one issue]), called once per
+      fail-level issue by clean_dataset()'s per-issue loop, and
+    - the full batch of warn-level issues (target_issues == all warn-level issues for
+      this file), called once for the whole batch — unchanged in spirit from the
+      original whole-file design.
+
+    The re-check after a successful execution only looks at whether THIS group's own
+    target_issues are still present in a fresh check_rubric() run — never the full
+    rubric — exactly matching "re-check ONLY this specific issue" for the single-issue
+    case, and "re-check the batch" for the warn-level case.
+
+    Returns (status, attempts, error, remaining_issues):
+    - status: "resolved" | "skipped_declined" | "skipped_failed" | "skipped_incomplete"
+    - attempts: how many attempts this group actually took
+    - error: the real last error/still-present description (empty if resolved/declined)
+    - remaining_issues: which of target_issues are still detected after the last
+      attempt (empty unless status == "skipped_incomplete")
+    """
+    previous_code = ""
+    previous_error = ""
+    remaining_issues = list(target_issues)
+    attempt = 0
+
+    while attempt < MAX_CLEAN_ATTEMPTS:
+        attempt += 1
+        code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
+        approved = _request_approval(code, cloned_path)
+        if not approved:
+            return "skipped_declined", attempt, "", []
+
+        success, error = _execute_cleaning_code(code, cloned_path)
+        if not success:
+            previous_code, previous_error = code, error
+            if attempt >= MAX_CLEAN_ATTEMPTS:
+                return "skipped_failed", attempt, error, []
+            continue
+
+        # Execution succeeded — but that alone is not proof this group's issue(s) are
+        # actually gone. Re-run check_rubric() against the real result and check
+        # whether any of THIS group's own target issues are still detectable (a fresh,
+        # unrelated issue elsewhere in the file is out of scope for this group's retry
+        # loop — it belongs to whichever other group, if any, is responsible for it).
+        post_issues = check_rubric(cloned_path)
+        still_present = [issue for issue in remaining_issues if issue in post_issues]
+
+        if not still_present:
+            return "resolved", attempt, "", []
+
+        remaining_issues = still_present
+        previous_code = code
+        previous_error = (
+            "The script executed without raising an exception, but re-running the "
+            "data-quality check against the real cleaned output found these "
+            "originally-listed issue(s) are STILL PRESENT (not fixed):\n"
+            + "\n".join(f"- {i}" for i in still_present)
+        )
+        if attempt >= MAX_CLEAN_ATTEMPTS:
+            return "skipped_incomplete", attempt, previous_error, still_present
+
+    # Unreachable in practice (the while loop always returns before falling off the
+    # end, since MAX_CLEAN_ATTEMPTS >= 1), but keeps this function's return type
+    # honest rather than implicitly returning None if MAX_CLEAN_ATTEMPTS were ever 0.
+    return "skipped_incomplete", attempt, previous_error, remaining_issues
+
+
 def clean_dataset(folder_path, llm=None) -> CleaningResult:
     """Process every top-level CSV in folder_path SEPARATELY: run the rubric per file,
-    and for any file with real issues, clone -> generate -> approve -> execute ->
-    RE-CHECK the rubric against the real cleaned output -> retry on either a real
-    execution failure OR originally-flagged issues still being present (up to
-    MAX_CLEAN_ATTEMPTS) -> skip-and-report on exhaustion, continuing with the rest of
-    the folder either way. Files with nothing flagged are left alone entirely: no
-    clone, no LLM call, no approval prompt.
+    split its issues into fail-level and warn-level (see FAIL_LEVEL_PREFIXES /
+    WARN_LEVEL_PREFIXES), and for any file with real issues:
 
-    Post-cleaning validation (the part that makes "the exec() call didn't raise" stop
-    being treated as proof cleaning worked): once execution succeeds, check_rubric() is
-    re-run against the real cleaned file. If any of the ORIGINAL issues that triggered
-    cleaning are still detectable, that is treated exactly like an execution failure —
-    the specific remaining issue(s) are fed back into the next generation attempt, within
-    the same attempt cap. If issues remain after every attempt is exhausted, the file is
-    reported as "skipped_incomplete" with the real remaining issues named plainly, rather
-    than ever being reported as a plain success. Row count before vs. after is also
-    tracked for every successfully-cleaned file and flagged (not blocked) when the loss
-    is large (see ROW_LOSS_FLAG_THRESHOLD) — a technically clean result that deleted a
-    large share of the data is not automatically a good outcome.
+    1. Process EACH fail-level issue individually, one at a time, in the order
+       check_rubric() found them: its own generate -> approve -> execute -> immediate
+       re-check (scoped to just that one issue) -> retry cycle, capped at
+       MAX_CLEAN_ATTEMPTS for that issue specifically (see _clean_issue_group). If one
+       fail-level issue is declined, the rest of the file's processing (remaining
+       fail-level issues, the warn-level batch, the final check) is skipped entirely —
+       same decline semantics as the original whole-file design. If a fail-level issue
+       is NOT declined but still can't be resolved (a real execution error every
+       attempt, or the issue's still detectably present every attempt), it's recorded
+       as skipped for that one issue and processing moves on to the next fail-level
+       issue — one unresolved issue never aborts the rest of the file.
+    2. Once every fail-level issue has been individually processed (and none were
+       declined), batch every warn-level issue into ONE combined generate -> approve
+       -> execute -> re-check cycle, same as the original whole-file design, just
+       scoped to warn-level issues only.
+    3. Run a final, full check_rubric() pass across the complete result (unless
+       something above was declined) and compare row counts before vs. after — exactly
+       the same post-cleaning validation and row-count-loss check as before this
+       restructuring, just now describing the outcome of the fail-then-warn pipeline
+       instead of one undifferentiated retry loop.
+
+    Files with nothing flagged are left alone entirely: no clone, no LLM call, no
+    approval prompt.
 
     llm: optional injected chat model (used by tests to deterministically force a
-    failing-then-succeeding code-gen sequence for the retry-cap test); defaults to
-    pick_llm("high") in real use — this is a dependency default, not a safety bypass:
-    the approval gate below always uses the real input() builtin regardless of what llm
-    is passed, so no caller can construct a call that skips it.
+    failing-then-succeeding code-gen sequence); defaults to pick_llm("high") in real
+    use — this is a dependency default, not a safety bypass: the approval gate always
+    uses the real input() builtin regardless of what llm is passed, so no caller can
+    construct a call that skips it.
     """
     from utils.llm_pick import pick_llm  # local import: keeps this module usable without
 
@@ -1183,95 +1468,89 @@ def clean_dataset(folder_path, llm=None) -> CleaningResult:
         cloned_path = _clone_file(file_path, cleaned_dir)
         resolved_llm = llm if llm is not None else pick_llm("high")
         row_count_before = _count_csv_rows(cloned_path)
+        fail_issues, warn_issues = _split_issues_by_severity(issues)
 
-        previous_code = ""
-        previous_error = ""
-        remaining_issues: list = list(issues)
-        attempt = 0
-        while attempt < MAX_CLEAN_ATTEMPTS:
-            attempt += 1
-            code = _generate_cleaning_code(
-                cloned_path, remaining_issues, resolved_llm, previous_code, previous_error
+        total_attempts = 0
+        fail_issue_records: list = []
+        warn_batch: WarnBatchRecord | None = None
+        declined = False
+
+        # Step 2: each fail-level issue gets its OWN generate/approve/execute/re-check
+        # cycle, one at a time, in the order check_rubric() found them — never batched
+        # together with the others.
+        for issue in fail_issues:
+            status, attempts, error, _remaining = _clean_issue_group(cloned_path, [issue], resolved_llm)
+            total_attempts += attempts
+            fail_issue_records.append(
+                IssueCleaningRecord(issue=issue, status=status, attempts=attempts, error=error)
             )
-            approved = _request_approval(code, cloned_path)
-            if not approved:
-                result.skipped_files.append(
-                    FileCleaningRecord(
-                        file_name=file_path.name,
-                        issues=issues,
-                        status="skipped_declined",
-                        attempts=attempt,
-                        error="",
-                    )
-                )
+            if status == "skipped_declined":
+                declined = True
                 break
+            # skipped_failed / skipped_incomplete: report and continue to the next
+            # fail-level issue — one unresolved issue never aborts the rest of the file.
 
-            success, error = _execute_cleaning_code(code, cloned_path)
-            if not success:
-                previous_code, previous_error = code, error
-                if attempt >= MAX_CLEAN_ATTEMPTS:
-                    result.skipped_files.append(
-                        FileCleaningRecord(
-                            file_name=file_path.name,
-                            issues=issues,
-                            status="skipped_failed",
-                            attempts=attempt,
-                            error=error,
-                        )
-                    )
-                continue
-
-            # Execution succeeded — but a clean exec() is not itself proof the flagged
-            # issue(s) are actually gone. Re-run the exact same deterministic rubric
-            # against the real cleaned output and check whether any of the ORIGINAL
-            # issues are still present (a fresh, unrelated issue introduced elsewhere in
-            # the file is out of scope here — this loop only cares about the issues it
-            # was asked to fix).
-            post_issues = check_rubric(cloned_path)
-            still_present = [issue for issue in remaining_issues if issue in post_issues]
-
-            if not still_present:
-                row_count_after = _count_csv_rows(cloned_path)
-                row_loss_flagged = False
-                if row_count_before and row_count_after is not None:
-                    loss_frac = (row_count_before - row_count_after) / row_count_before
-                    row_loss_flagged = loss_frac >= ROW_LOSS_FLAG_THRESHOLD
-                result.cleaned_files.append(
-                    FileCleaningRecord(
-                        file_name=file_path.name,
-                        issues=issues,
-                        status="cleaned",
-                        attempts=attempt,
-                        rubric_recheck_passed=True,
-                        row_count_before=row_count_before,
-                        row_count_after=row_count_after,
-                        row_loss_flagged=row_loss_flagged,
-                    )
+        # Step 3: every warn-level issue, batched into one combined cycle — unchanged
+        # from the original whole-file design, just scoped to warn-level issues only.
+        # Skipped entirely if a fail-level issue was declined above.
+        if not declined:
+            if warn_issues:
+                status, attempts, error, remaining = _clean_issue_group(cloned_path, warn_issues, resolved_llm)
+                total_attempts += attempts
+                warn_batch = WarnBatchRecord(
+                    issues=warn_issues,
+                    status=status,
+                    attempts=attempts,
+                    error=error,
+                    remaining_issues=remaining,
                 )
-                break
+                if status == "skipped_declined":
+                    declined = True
+            else:
+                warn_batch = WarnBatchRecord(issues=[], status="no_warn_issues")
 
-            # One or more original issues are still detectable in the real output —
-            # treated the same as a real execution failure: feed the specific remaining
-            # issue(s) back in and retry, within the same attempt cap.
-            remaining_issues = still_present
-            previous_code = code
-            previous_error = (
-                "The script executed without raising an exception, but re-running the "
-                "data-quality check against the real cleaned output found these "
-                "originally-listed issue(s) are STILL PRESENT (not fixed):\n"
-                + "\n".join(f"- {i}" for i in still_present)
+        if declined:
+            result.skipped_files.append(
+                FileCleaningRecord(
+                    file_name=file_path.name,
+                    issues=issues,
+                    fail_issue_records=fail_issue_records,
+                    warn_batch=warn_batch,
+                    status="skipped_declined",
+                    attempts=total_attempts,
+                )
             )
-            if attempt >= MAX_CLEAN_ATTEMPTS:
-                result.skipped_files.append(
-                    FileCleaningRecord(
-                        file_name=file_path.name,
-                        issues=issues,
-                        status="skipped_incomplete",
-                        attempts=attempt,
-                        error=previous_error,
-                        rubric_recheck_passed=False,
-                        remaining_issues=still_present,
-                    )
-                )
+            continue
+
+        # Step 4: final, full check_rubric() pass across the complete result, plus the
+        # row-count-loss comparison against the original — the same post-cleaning
+        # validation this module already had, now describing the outcome of the
+        # fail-then-warn pipeline as a whole rather than one undifferentiated retry loop.
+        post_issues = check_rubric(cloned_path)
+        still_present = [issue for issue in issues if issue in post_issues]
+        row_count_after = _count_csv_rows(cloned_path)
+        row_loss_flagged = False
+        if row_count_before and row_count_after is not None:
+            loss_frac = (row_count_before - row_count_after) / row_count_before
+            row_loss_flagged = loss_frac >= ROW_LOSS_FLAG_THRESHOLD
+
+        file_record = FileCleaningRecord(
+            file_name=file_path.name,
+            issues=issues,
+            fail_issue_records=fail_issue_records,
+            warn_batch=warn_batch,
+            attempts=total_attempts,
+            rubric_recheck_passed=not still_present,
+            remaining_issues=still_present,
+            row_count_before=row_count_before,
+            row_count_after=row_count_after,
+            row_loss_flagged=row_loss_flagged,
+        )
+        if still_present:
+            file_record.status = "skipped_incomplete"
+            result.skipped_files.append(file_record)
+        else:
+            file_record.status = "cleaned"
+            result.cleaned_files.append(file_record)
 
     return result

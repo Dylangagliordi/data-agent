@@ -1,10 +1,13 @@
 """Standalone test: clean_dataset() approval gate, APPROVE path.
 
 Uses a real LLM call (pick_llm("high")) to generate real cleaning code against a real
-messy fixture file, and feeds the approval gate's input() a real 'yes' via piped stdin.
-Run with stdin piped, e.g.:
+messy fixture file, and feeds the approval gate's input() a real 'yes' via piped stdin
+for every prompt it produces (the fixture has one fail-level issue processed on its own,
+plus warn-level issues batched together — each stage gets its own approval prompt, and
+either stage may need more than one attempt, so more 'yes' than stages is safest). Run
+with stdin piped generously, e.g.:
 
-    printf 'yes\\n' | uv run python -m tests.test_data_cleaning_approve
+    printf 'yes\\nyes\\nyes\\nyes\\n' | uv run python -m tests.test_data_cleaning_approve
 
 Confirms:
 - The raw source file is never modified (checksum before/after).

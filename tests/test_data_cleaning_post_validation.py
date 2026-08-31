@@ -1,23 +1,29 @@
-"""Standalone test for Part 3: post-cleaning validation in clean_dataset().
+"""Standalone test for post-cleaning validation in clean_dataset() (the final, full
+check_rubric() pass + row-count-loss comparison run after the fail-then-warn pipeline
+completes — see the fail/warn severity-split restructuring in
+test_data_cleaning_fail_warn_split.py for the per-issue/batch mechanics themselves).
 
 Confirms clean_dataset() no longer treats "the generated code executed without raising"
 as proof cleaning actually worked — it now re-runs check_rubric() against the real
 cleaned output and reacts to what it finds there, plus tracks row-count loss.
 
-Case 1 (real LLM): a straightforward, single genuinely-fixable issue. Confirms the
-post-cleaning re-check passes and this is reflected in both the FileCleaningRecord and
-result.summary() text.
+Case 1 (real LLM): a straightforward, single genuinely-fixable fail-level issue (no
+warn-level issues in this fixture). Confirms the final post-cleaning re-check passes and
+this is reflected in both the FileCleaningRecord and result.summary() text.
 
-Case 2 (fake LLM, deterministic): a file with TWO flagged issues. The fake LLM's first
-response fixes only one of them (a real, executable script — no exception) and leaves
-the other completely untouched. Confirms the post-cleaning re-check catches the still-
-present issue and triggers a genuine retry (not a false "cleaned" report) — the second
-call actually fixes the remaining issue, and only THEN is the file reported cleaned,
-with attempts == 2.
+Case 2 (fake LLM, deterministic): a file with one fail-level issue and one warn-level
+issue. The fake LLM's first response (targeting the fail-level issue alone) succeeds
+immediately; the warn-level batch's first response fixes only the categorical-value
+issue's actual DATA but is deliberately written so the re-check still detects the
+formatting-noise wording is generated correctly on retry — the fake LLM's first response
+for the batch is a real, executable script that does NOT actually fix the batch's issue,
+leaving it detectable. Confirms the post-cleaning re-check at the warn-batch level
+catches the still-present issue and triggers a genuine retry (not a false "resolved"
+report) — the second call actually fixes it, and only THEN is the file reported cleaned.
 
-Case 3 (fake LLM, deterministic): a file with one flagged issue, whose fake LLM response
-technically fixes that one issue but does so by dropping most of the file's rows.
-Confirms the row-count-loss check fires (row_loss_flagged=True) and is visible in
+Case 3 (fake LLM, deterministic): a file with one fail-level issue, whose fake LLM
+response technically fixes that one issue but does so by dropping most of the file's
+rows. Confirms the row-count-loss check fires (row_loss_flagged=True) and is visible in
 result.summary(), while the file is still (correctly) reported "cleaned" since the
 flagged issue really is gone — the over-aggressiveness is a flag, not a failure.
 
@@ -36,7 +42,7 @@ class FakeResponse:
 
 
 print("=" * 70)
-print("CASE 1: a genuinely fixable single issue — real LLM, expect a clean pass")
+print("CASE 1: a genuinely fixable single fail-level issue — real LLM, expect a clean pass")
 print("=" * 70)
 
 D1 = "data/_test_etl/postcheck_success"
@@ -50,14 +56,15 @@ assert len(result1.cleaned_files) == 1, f"expected 1 cleaned file, got: {result1
 rec1 = result1.cleaned_files[0]
 assert rec1.rubric_recheck_passed is True, "expected the post-cleaning re-check to pass"
 assert rec1.remaining_issues == [], f"expected no remaining issues, got: {rec1.remaining_issues}"
-assert "Post-cleaning re-check: PASSED" in result1.summary()
+assert "Final overall check: PASSED" in result1.summary()
 cleaned1 = pd.read_csv(f"{D1}/cleaned/orders.csv")
 assert (cleaned1["amount"].dropna() < 0).sum() == 0, "negative value should have been fixed"
-print("PASS: genuinely fixed issue -> re-check passes, reflected in the record and summary.\n")
+print("PASS: genuinely fixed issue -> final re-check passes, reflected in the record and summary.\n")
 
 
 print("=" * 70)
-print("CASE 2: a deliberately incomplete fix — fake LLM fixes only ONE of two issues")
+print("CASE 2: a deliberately incomplete warn-level fix — fake LLM's first batch attempt")
+print("does not actually fix the batch's issue; second attempt does")
 print("=" * 70)
 
 D2 = "data/_test_etl/postcheck_incomplete"
@@ -65,26 +72,40 @@ CLONE2 = f"{D2}/cleaned/orders.csv"
 issues2 = check_rubric(f"{D2}/orders.csv")
 print("issues:", issues2)
 assert len(issues2) == 2, f"expected exactly 2 issues in the fixture, got: {issues2}"
+fail_issue = next(i for i in issues2 if i.startswith("Invalid values:"))
+warn_issue = next(i for i in issues2 if i.startswith("Inconsistent categorical"))
 
 
-class FixOneIssueThenTheOtherLLM:
-    """Attempt 1: fixes only the negative-amount issue via a REAL, successful script —
-    the categorical inconsistency in 'status' is left completely untouched, so the
-    post-cleaning rubric re-check must still find it. Attempt 2: actually fixes it."""
+class FixFailImmediatelyThenFixWarnOnRetryLLM:
+    """Called once per group's own attempt loop. The fail-level issue's calls always
+    return a real, successful fix. The warn-level batch's FIRST call returns a real,
+    executable script that does NOT touch 'status' at all (leaving the categorical
+    inconsistency completely untouched, so the post-execution re-check must still find
+    it); the batch's SECOND call actually fixes it."""
 
     def __init__(self):
         self.calls = []
+        self.warn_calls = 0
 
     def invoke(self, messages):
         human_content = messages[1][1]
         self.calls.append(human_content)
-        if len(self.calls) == 1:
+        if fail_issue in human_content and warn_issue not in human_content:
             return FakeResponse(
                 "import pandas as pd\n"
                 f"path = {CLONE2!r}\n"
                 "df = pd.read_csv(path)\n"
                 "df.loc[df['amount'] < 0, 'amount'] = df.loc[df['amount'] < 0, 'amount'].abs()\n"
                 "df.to_csv(path, index=False)\n"
+            )
+        # Warn-level batch call.
+        self.warn_calls += 1
+        if self.warn_calls == 1:
+            return FakeResponse(
+                "import pandas as pd\n"
+                f"path = {CLONE2!r}\n"
+                "df = pd.read_csv(path)\n"
+                "df.to_csv(path, index=False)\n"  # no-op: leaves 'status' untouched
             )
         return FakeResponse(
             "import pandas as pd\n"
@@ -95,26 +116,22 @@ class FixOneIssueThenTheOtherLLM:
         )
 
 
-fake_llm_2 = FixOneIssueThenTheOtherLLM()
+fake_llm_2 = FixFailImmediatelyThenFixWarnOnRetryLLM()
 result2 = clean_dataset(D2, llm=fake_llm_2)
 print(result2.summary())
 
-assert len(fake_llm_2.calls) == 2, (
-    f"expected exactly 2 generation calls (retry triggered by the still-present issue), "
-    f"got {len(fake_llm_2.calls)}"
-)
-assert "STILL PRESENT" in fake_llm_2.calls[1], (
-    "expected the second call's prompt to be told the specific issue was still present "
-    "after the first (falsely 'successful') attempt"
-)
-assert "Inconsistent categorical" in fake_llm_2.calls[1]
-print("PASS: post-cleaning re-check caught the still-present issue and fed it back for a real retry.")
-
-assert len(result2.cleaned_files) == 1, f"expected 1 cleaned file, got: {result2.cleaned_files}"
+assert len(result2.cleaned_files) == 1, f"expected 1 cleaned file, got: {result2.cleaned_files + result2.skipped_files}"
 rec2 = result2.cleaned_files[0]
-assert rec2.attempts == 2, f"expected it to take 2 real attempts, got attempts={rec2.attempts}"
+assert len(rec2.fail_issue_records) == 1 and rec2.fail_issue_records[0].status == "resolved"
+assert rec2.warn_batch is not None
+assert rec2.warn_batch.status == "resolved", f"expected the warn batch eventually resolved, got: {rec2.warn_batch}"
+assert rec2.warn_batch.attempts == 2, (
+    f"expected the warn batch to need 2 attempts (first was a no-op), got {rec2.warn_batch.attempts}"
+)
 assert rec2.rubric_recheck_passed is True
-print("PASS: file only reported 'cleaned' once BOTH issues were actually gone (attempts=2).\n")
+print("PASS: post-cleaning re-check caught the still-present warn-level issue after a "
+      "no-op first attempt and triggered a real retry; file only reported cleaned once "
+      "both the fail-level issue and the warn-level batch were actually resolved.\n")
 
 
 print("=" * 70)
@@ -162,5 +179,6 @@ assert "WARNING: lost" in result3.summary(), "expected the row-loss warning visi
 print("PASS: over-aggressive fix (80% row loss) correctly flagged, visible in the real summary.\n")
 
 print("=" * 70)
-print("ALL POST-CLEANING VALIDATION (PART 3) ASSERTIONS PASSED")
+print("ALL POST-CLEANING VALIDATION ASSERTIONS PASSED")
 print("=" * 70)
+
