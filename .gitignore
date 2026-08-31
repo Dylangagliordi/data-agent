@@ -5,4 +5,5 @@ __pycache__/
 *.png
 !sql_analyst_graph.png
 !etl_analyst_graph.png
+!data_agent_graph.png
 logs/
