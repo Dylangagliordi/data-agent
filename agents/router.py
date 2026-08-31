@@ -31,6 +31,18 @@ from models.etl_schema import ETLAnalystState
 _SQL_ANALYST_GRAPH = build_sql_analyst_graph()
 _ETL_ANALYST_GRAPH = build_etl_analyst_graph()
 
+# Side channel for main.py's logging only — NOT part of DataAgentSchema (that
+# schema is deliberately kept to exactly messages/route_response/
+# route_comments/final_answer, per spec, so a sub-agent's own internal fields
+# never leak into or overwrite the router's own state). main.py needs the SQL
+# analyst's full internal trace (curated_question, generated_sql_query, etc.)
+# to log it exactly as before the router existed; sql_node stashes the real
+# sub-agent result dict here on every call so a caller can read it right after
+# graph.invoke() returns, without re-running the sub-agent a second time just
+# to get its trace. Reset to {} at the start of every sql_node call so a
+# caller never sees a stale trace from a previous, unrelated invocation.
+LAST_SQL_ANALYST_STATE: dict = {}
+
 
 ROUTER_SYSTEM_PROMPT = """You classify an incoming request into exactly one of two \
 categories, for a data platform with two sub-agents:
@@ -80,7 +92,15 @@ def sql_node(state: DataAgentSchema) -> dict:
     Any unexpected exception from the sub-agent is caught here and turned into a
     clear final_answer naming which sub-agent failed and the real error, rather
     than propagating and crashing the router.
+
+    Also stashes the full real sub-agent result dict into the module-level
+    LAST_SQL_ANALYST_STATE (see its own comment above) so main.py's logging can
+    access the SQL analyst's internal trace fields without DataAgentSchema itself
+    needing to carry them.
     """
+    global LAST_SQL_ANALYST_STATE
+    LAST_SQL_ANALYST_STATE = {}
+
     last_message = state.messages[-1]
     content = last_message.content if hasattr(last_message, "content") else str(last_message)
 
@@ -89,6 +109,7 @@ def sql_node(state: DataAgentSchema) -> dict:
             SQLAnalystState(user_question=content),
             config={"recursion_limit": 50},
         )
+        LAST_SQL_ANALYST_STATE = result
         final_answer = result["final_answer"]
     except Exception as e:
         final_answer = f"The SQL analyst sub-agent failed with an unexpected error: {type(e).__name__}: {e}"

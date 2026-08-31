@@ -1,15 +1,22 @@
 """
-CLI entry point for the SQL analyst sub-agent.
+CLI entry point for the data agent: the router-orchestrated graph automatically
+dispatches an incoming question to either the SQL analyst or the ETL analyst
+sub-agent, instead of either one being invoked by hand.
 
 Usage:
     python main.py "how many orders came from São Paulo"
+    python main.py "download this file: https://example.com/data.csv into data/mydata as csv"
 
 Prints only the final plain-English answer — not the full graph state.
 
-Every run also appends one JSON line to logs/query_log.jsonl with the full
-intermediate trace (curated question, generated SQL, safety verdict, raw
-execution result, final answer) so a run can be inspected after the fact —
-this is purely an additional trace file and does not change stdout.
+Every run also appends one JSON line to logs/query_log.jsonl with the run's
+trace, branching on which sub-agent actually handled the request:
+- route_response == "sql_analyst": the full existing set of fields (as before
+  the router existed) plus route_response/route_comments.
+- route_response == "etl_analyst": user_question, final_answer,
+  route_response, route_comments only — the SQL-specific fields don't apply
+  to an ETL run and are omitted entirely, not written as null/empty
+  placeholders.
 """
 
 import json
@@ -17,26 +24,64 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agents.sql_analyst import build_sql_analyst_graph
-from models.schema import SQLAnalystState
+from langchain_core.messages import HumanMessage
+
+import agents.router as router_module
+from agents.data_agent import build_data_agent_graph
+from models.router_schema import DataAgentSchema
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_PATH = PROJECT_ROOT / "logs" / "query_log.jsonl"
 
 
-def log_run(final_state: dict) -> None:
-    """Append one JSON line capturing this run's full trace to logs/query_log.jsonl."""
+def log_run(user_question: str, result: dict) -> None:
+    """Append one JSON line capturing this run's trace to logs/query_log.jsonl,
+    shaped according to which sub-agent actually handled the request.
+    """
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    route_response = result.get("route_response", "")
+
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "user_question": final_state.get("user_question", ""),
-        "curated_question": final_state.get("curated_question", ""),
-        "generated_sql_query": final_state.get("generated_sql_query", ""),
-        "is_safe": final_state.get("is_safe", ""),
-        "comments": final_state.get("comments", ""),
-        "sql_query_execution_result": final_state.get("sql_query_execution_result", ""),
-        "final_answer": final_state.get("final_answer", ""),
+        "route_response": route_response,
+        "route_comments": result.get("route_comments", ""),
     }
+
+    if route_response == "sql_analyst":
+        # The SQL analyst's own internal trace (curated_question,
+        # generated_sql_query, is_safe, comments, sql_query_execution_result)
+        # isn't part of DataAgentSchema — sql_node stashes the real sub-agent
+        # result dict in this module-level side channel for exactly this use.
+        sql_state = router_module.LAST_SQL_ANALYST_STATE
+        entry.update(
+            {
+                "user_question": user_question,
+                "curated_question": sql_state.get("curated_question", ""),
+                "generated_sql_query": sql_state.get("generated_sql_query", ""),
+                "is_safe": sql_state.get("is_safe", ""),
+                "comments": sql_state.get("comments", ""),
+                "sql_query_execution_result": sql_state.get("sql_query_execution_result", ""),
+                "final_answer": result.get("final_answer", ""),
+            }
+        )
+    elif route_response == "etl_analyst":
+        entry.update(
+            {
+                "user_question": user_question,
+                "final_answer": result.get("final_answer", ""),
+            }
+        )
+    else:
+        # Defensive: route_response should always be one of the two literals
+        # once router_node has run, but never silently drop the fact that
+        # something unexpected happened here.
+        entry.update(
+            {
+                "user_question": user_question,
+                "final_answer": result.get("final_answer", ""),
+            }
+        )
+
     with open(LOG_PATH, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -51,13 +96,13 @@ def main() -> None:
         sys.exit(1)
 
     question = sys.argv[1]
-    graph = build_sql_analyst_graph()
-    final_state = graph.invoke(
-        SQLAnalystState(user_question=question),
+    graph = build_data_agent_graph()
+    result = graph.invoke(
+        DataAgentSchema(messages=[HumanMessage(content=question)]),
         config={"recursion_limit": 50},
     )
-    log_run(final_state)
-    print(final_state["final_answer"])
+    log_run(question, result)
+    print(result["final_answer"])
 
 
 if __name__ == "__main__":
