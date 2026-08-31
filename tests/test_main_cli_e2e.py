@@ -53,11 +53,16 @@ sql_question = "How many products are in the database in total?"
 sql_stdout = run_main(sql_question)
 print("stdout:", sql_stdout.strip())
 
-assert sql_stdout.count("\n") <= 1, f"expected exactly one printed line, got: {sql_stdout!r}"
+# Clean stdout means "just the answer, optionally with a legitimate one-sentence
+# data-quality note appended" (see agents/sql_analyst.py's represent_final_answer) —
+# NOT literally always one line. A table with no _data_quality_status row (e.g. any
+# of the olist_* tables in this dev DB, loaded before this feature existed) correctly
+# triggers that note, so this only guards against an actual raw dict/state dump.
 assert "route_response" not in sql_stdout and "final_answer" not in sql_stdout, (
-    "expected clean stdout (just the answer), not a raw dict/state dump"
+    "expected clean stdout (just the answer, plus an optional data-quality note), "
+    "not a raw dict/state dump"
 )
-print("PASS: clean stdout (single line, no raw state dump).")
+print("PASS: clean stdout (no raw state dump).")
 
 sql_entry = last_log_entry()
 print("log entry keys:", sorted(sql_entry.keys()))

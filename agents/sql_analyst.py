@@ -94,6 +94,57 @@ def _detect_fanout_warnings(conn, tables: dict) -> list:
     return warnings
 
 
+def _fetch_data_quality_status(conn, table_names: list) -> dict:
+    """Look up each table's row (if any) in _data_quality_status, keyed by table name.
+
+    Tables the loader has never seen (dropped in mid-development, or loaded before
+    this system existed) simply have no row — that absence is itself meaningful (see
+    add_context below), not an error, so this returns whatever subset of table_names
+    actually has a row rather than raising or padding in fake entries.
+
+    Defensive: _data_quality_status itself might not exist yet (e.g. a fresh DB that
+    hasn't had utils/load_data.py run against it since this feature shipped) — in that
+    case every table is treated as having no status row, same as a genuinely missing
+    row, rather than crashing add_context.
+    """
+    if not table_names:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT to_regclass(%s) IS NOT NULL", ("public._data_quality_status",)
+        )
+        (table_exists,) = cur.fetchone()
+        if not table_exists:
+            return {}
+
+        placeholders = ", ".join(["%s"] * len(table_names))
+        cur.execute(
+            f"""
+            SELECT table_name, status, issues_found
+            FROM _data_quality_status
+            WHERE table_name IN ({placeholders})
+            """,
+            tuple(table_names),
+        )
+        rows = cur.fetchall()
+    return {table_name: (status, issues_found) for table_name, status, issues_found in rows}
+
+
+def _summarize_fail_issues(issues_found) -> str:
+    """One short human-readable summary of the fail-level issues in a status row's
+    issues_found jsonb payload, for the WARNING line injected into generate_sql's
+    context. issues_found is a list of {"issue": ..., "severity": ...} dicts (see
+    utils/load_data.py's write_data_quality_status) — this picks out only the
+    fail-severity ones, since that's the only case this helper is ever called for.
+    """
+    if not issues_found:
+        return "(no details recorded)"
+    fail_texts = [
+        entry.get("issue", "") for entry in issues_found if entry.get("severity") == "fail"
+    ]
+    return "; ".join(fail_texts) if fail_texts else "(no details recorded)"
+
+
 def _extract_text(content) -> str:
     """Extract plain text from a chat model response's .content.
 
@@ -154,6 +205,21 @@ def add_context(state: SQLAnalystState) -> dict:
     so generate_sql is told explicitly, every call, which tables in THIS dataset have
     more than one row per some referenced key — rather than relying on the prompt's
     general rule alone to be remembered.
+
+    Also queries the persistent _data_quality_status table (written by
+    utils/load_data.py) for every table currently in the database. Two cases are
+    surfaced into generate_sql's context, prepended as WARNING lines exactly like the
+    fan-out warnings above:
+    - a table with NO status row at all (never went through the load_data.py path
+      this system tracks) gets "WARNING: <table> has no recorded data-quality check."
+    - a table whose latest status is "fail" (an unresolved critical issue survived
+      cleaning) gets "WARNING: <table> has an unresolved critical data-quality issue:
+      <summary>."
+    "warn"-status tables are deliberately NOT injected here — real but not serious
+    enough to affect query generation (see the module docstring / project spec). The
+    full set of both warning kinds (never warn-level) is also returned as
+    data_quality_warnings on state, for represent_final_answer to filter down to just
+    the tables the actually-generated query touches.
     """
     conn = get_app_reader_connection()
     try:
@@ -162,10 +228,10 @@ def add_context(state: SQLAnalystState) -> dict:
                 """
                 SELECT table_name, column_name, data_type
                 FROM information_schema.columns
-                WHERE table_schema = %s
+                WHERE table_schema = %s AND table_name != %s
                 ORDER BY table_name, ordinal_position
                 """,
-                ("public",),
+                ("public", "_data_quality_status"),
             )
             rows = cur.fetchall()
 
@@ -175,6 +241,32 @@ def add_context(state: SQLAnalystState) -> dict:
             tables.setdefault(table_name, []).append((column_name, data_type))
 
         fanout_warnings = _detect_fanout_warnings(conn, tables)
+
+        status_by_table = _fetch_data_quality_status(conn, list(tables.keys()))
+        data_quality_warnings = []
+        for table_name in tables:
+            entry = status_by_table.get(table_name)
+            if entry is None:
+                data_quality_warnings.append(
+                    {
+                        "table": table_name,
+                        "warning": f"WARNING: {table_name} has no recorded data-quality check.",
+                    }
+                )
+                continue
+            status, issues_found = entry
+            if status == "fail":
+                summary = _summarize_fail_issues(issues_found)
+                data_quality_warnings.append(
+                    {
+                        "table": table_name,
+                        "warning": (
+                            f"WARNING: {table_name} has an unresolved critical "
+                            f"data-quality issue: {summary}."
+                        ),
+                    }
+                )
+            # status == "warn" or "pass": nothing injected into generate_sql's context.
 
         sections = []
         with conn.cursor() as cur:
@@ -196,12 +288,13 @@ def add_context(state: SQLAnalystState) -> dict:
                 )
 
         context = "\n\n".join(sections)
-        if fanout_warnings:
-            context = "\n".join(fanout_warnings) + "\n\n" + context
+        warning_lines = fanout_warnings + [w["warning"] for w in data_quality_warnings]
+        if warning_lines:
+            context = "\n".join(warning_lines) + "\n\n" + context
     finally:
         conn.close()
 
-    return {"prompt_query_context": context}
+    return {"prompt_query_context": context, "data_quality_warnings": data_quality_warnings}
 
 
 GENERATE_SQL_SYSTEM_PROMPT = """You are a SQL analyst. Given a question and a description of \
@@ -436,7 +529,46 @@ result set. In that case, do NOT compute or state any count, average, min, max, 
 aggregate as if it covers "all" matching rows — that would be fabricated from incomplete data. \
 Instead say plainly that the result was too large to fully summarize and describe only the \
 partial sample you can actually see (e.g. a few example rows), or suggest the question be \
-narrowed (e.g. add a LIMIT or filter) to get a complete answer."""
+narrowed (e.g. add a LIMIT or filter) to get a complete answer.
+- Data-quality note: if the "Data quality notes" section below is non-empty, it means at \
+least one table this query actually touched either has no recorded data-quality check, or \
+has an unresolved critical (fail-level) data-quality issue. State this plainly but briefly \
+— one clear sentence, not alarming — e.g. "Note: this data has an unresolved quality issue \
+and the result may be affected." or "Note: this table has never been checked for data \
+quality." Do this ONLY when that section is actually non-empty; if it's empty, say nothing \
+about data quality at all."""
+
+
+_TABLE_NAME_RE_CACHE: dict = {}
+
+
+def _query_touches_table(sql_query: str, table_name: str) -> bool:
+    """Whether table_name appears as a real identifier (not a substring of a longer
+    word) anywhere in the executed SQL text — quoted ("table") or bare, case-
+    insensitive (Postgres folds unquoted identifiers to lowercase, and table_name here
+    always comes from information_schema, already lowercase).
+    """
+    pattern = _TABLE_NAME_RE_CACHE.get(table_name)
+    if pattern is None:
+        pattern = re.compile(r'(?<![\w"])' + re.escape(table_name) + r'(?![\w"])', re.IGNORECASE)
+        _TABLE_NAME_RE_CACHE[table_name] = pattern
+    return bool(pattern.search(sql_query))
+
+
+def _relevant_data_quality_notes(state: SQLAnalystState) -> list:
+    """Filter state.data_quality_warnings (fail-level + no-record only, never
+    warn-level — add_context never puts warn-level entries in this list at all) down
+    to just the tables the actually-generated/executed query touches, by name-matching
+    against generated_sql_query. A warning about a table this specific query never
+    referenced would be noise unrelated to this answer, so it's excluded here even
+    though it's true and present in the wider schema context."""
+    if not state.data_quality_warnings or not state.generated_sql_query:
+        return []
+    return [
+        w["warning"]
+        for w in state.data_quality_warnings
+        if _query_touches_table(state.generated_sql_query, w["table"])
+    ]
 
 
 def represent_final_answer(state: SQLAnalystState) -> dict:
@@ -472,11 +604,15 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
             "messages": [AIMessage(content=final_answer)],
         }
 
+    relevant_notes = _relevant_data_quality_notes(state)
+    data_quality_section = "\n".join(relevant_notes) if relevant_notes else "(none)"
+
     llm = pick_llm("cheap")
     human_content = (
         f"Original question: {state.user_question}\n\n"
         f"The SQL query that was actually executed:\n{state.generated_sql_query}\n\n"
-        f"Raw SQL execution result: {state.sql_query_execution_result}"
+        f"Raw SQL execution result: {state.sql_query_execution_result}\n\n"
+        f"Data quality notes for tables this query touched:\n{data_quality_section}"
     )
     response = llm.invoke(
         [

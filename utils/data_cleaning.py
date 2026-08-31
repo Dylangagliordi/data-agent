@@ -1065,6 +1065,39 @@ class FileCleaningRecord:
     row_loss_flagged: bool = False
 
 
+def unresolved_issues_for_record(rec: "FileCleaningRecord") -> list:
+    """Best-known list of a file's ORIGINAL issues that are still actually present,
+    for use by any caller (currently utils/load_data.py) that needs to know a file's
+    real post-cleaning data-quality state, not just its top-level status label.
+
+    For "cleaned" / "skipped_incomplete" files this is simply rec.remaining_issues —
+    clean_dataset() already computed it from a real, final check_rubric() re-check
+    across the whole file, which is authoritative (not a bookkeeping guess).
+
+    For "skipped_declined" files, that final re-check never ran (processing stopped
+    the moment the user declined), so rec.remaining_issues is just its unused default
+    ([]). This falls back to a bookkeeping computation instead: every original issue
+    EXCEPT ones individually confirmed "resolved" before the decline point (a
+    fail-level issue with its own IssueCleaningRecord.status == "resolved", or every
+    warn-level issue if the whole warn batch resolved) counts as still unresolved.
+    """
+    if rec.status != "skipped_declined":
+        return rec.remaining_issues
+
+    resolved_fail_issues = {r.issue for r in rec.fail_issue_records if r.status == "resolved"}
+    warn_batch_resolved = rec.warn_batch is not None and rec.warn_batch.status == "resolved"
+    warn_issue_set = set(rec.warn_batch.issues) if rec.warn_batch is not None else set()
+
+    unresolved = []
+    for issue in rec.issues:
+        if issue in resolved_fail_issues:
+            continue
+        if warn_batch_resolved and issue in warn_issue_set:
+            continue
+        unresolved.append(issue)
+    return unresolved
+
+
 def _issue_outcome_line(status: str, attempts: int, error: str) -> str:
     """One human-readable outcome phrase for an IssueCleaningRecord/WarnBatchRecord
     status — shared by both so the wording is identical whether it's describing a

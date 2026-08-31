@@ -16,11 +16,26 @@ Cleaning (Path A from the ETL analyst spec): before loading anything, this now c
 utils.data_cleaning.clean_dataset() on the folder. Files with nothing flagged load from
 their original location exactly as before. Files needing cleaning go through the
 approval-gated clone/generate/execute/retry process (same shared implementation used by
-clean_data.py and the ETL analyst's transform_load tool) and, once cleaning completes for
-that file, load from folder_path/cleaned/ instead. A file that was skipped (declined
-approval, or failed cleaning after exhausting retries) is reported clearly and excluded
-from the load — it is never loaded raw once the rubric has flagged it, and never loaded
-from a clone that didn't actually get cleaned.
+clean_data.py and the ETL analyst's transform_load tool).
+
+Every file is now loaded regardless of cleaning outcome — a file that was declined at
+the approval gate, or still has unresolved issues after cleaning exhausted its retries,
+is loaded from whatever the best-available version is (the cleaned/ clone if cleaning
+was ever attempted on it, the original raw file otherwise) rather than silently being
+excluded from the database. Refusing to load used to be this script's way of protecting
+against bad data; that job now belongs to _data_quality_status (see below), which lets
+the SQL analyst honestly warn about a specific table's real, current quality state
+instead of the loader deciding — invisibly, at load time — that a table simply
+shouldn't exist for later querying.
+
+Data-quality tracking: after loading each table, this writes/updates one row for it in
+_data_quality_status (table_name text PK, last_loaded_at timestamp, status "pass"/
+"warn"/"fail", issues_found jsonb, was_cleaned bool). status/issues_found reflect
+whichever of the table's ORIGINAL check_rubric() issues are still actually unresolved
+after clean_dataset() finished (see utils.data_cleaning.unresolved_issues_for_record),
+classified with the existing _issue_severity() mapping — never a new/parallel severity
+scheme. agents/sql_analyst.py's add_context reads this table to warn about tables that
+were never checked or still have an unresolved fail-level issue.
 """
 
 import csv
@@ -29,9 +44,14 @@ import sys
 from pathlib import Path
 
 import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
-from utils.data_cleaning import clean_dataset
+from utils.data_cleaning import (
+    _issue_severity,
+    clean_dataset,
+    unresolved_issues_for_record,
+)
 
 load_dotenv(os.path.expanduser("~/.hermes/profiles/data-agent/.env"))
 
@@ -45,6 +65,75 @@ def get_admin_connection():
         user=os.environ["PG_ADMIN_USER"],
         # local trust auth for the admin user: no password needed/stored
     )
+
+
+def ensure_data_quality_status_table(conn) -> None:
+    """Create _data_quality_status if it doesn't already exist. Table/column
+    identifiers here can't be parameterized (DDL doesn't support placeholders for
+    identifiers in any SQL dialect) but every identifier below is a fixed literal
+    written in this source file, not runtime/user input, so this is not the kind of
+    string-built SQL the project's "always use parameterized queries" rule targets —
+    that rule is about values, and every value-position query elsewhere in this
+    function/module already uses %s placeholders.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _data_quality_status (
+                table_name TEXT PRIMARY KEY,
+                last_loaded_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL,
+                issues_found JSONB NOT NULL,
+                was_cleaned BOOLEAN NOT NULL
+            );
+            """
+        )
+    conn.commit()
+
+
+def compute_quality_status(unresolved_issues: list) -> tuple:
+    """Classify a file's still-unresolved issues (post clean_dataset()) into
+    (status, issues_found_payload) using the existing _issue_severity() mapping —
+    the one already defined in utils.data_cleaning, not a new/parallel scheme.
+
+    status is "fail" if any unresolved issue is fail-level, "warn" if only warn-level
+    issues remain, "pass" if none remain at all. issues_found_payload is the real list
+    of {"issue": ..., "severity": ...} entries for those same unresolved issues (never
+    just the summary status), for _data_quality_status.issues_found and for
+    agents/sql_analyst.py's add_context to build a concrete WARNING message from.
+    """
+    issues_found_payload = [
+        {"issue": issue, "severity": _issue_severity(issue)} for issue in unresolved_issues
+    ]
+    severities = {entry["severity"] for entry in issues_found_payload}
+    if "fail" in severities:
+        status = "fail"
+    elif "warn" in severities:
+        status = "warn"
+    else:
+        status = "pass"
+    return status, issues_found_payload
+
+
+def write_data_quality_status(conn, table_name: str, status: str, issues_found: list, was_cleaned: bool) -> None:
+    """Insert or update table_name's row in _data_quality_status. All four values
+    (table_name, status, issues_found, was_cleaned) are bound as real placeholders —
+    only last_loaded_at uses the server-side now() function, not a value needing a
+    placeholder."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO _data_quality_status (table_name, last_loaded_at, status, issues_found, was_cleaned)
+            VALUES (%s, now(), %s, %s, %s)
+            ON CONFLICT (table_name) DO UPDATE SET
+                last_loaded_at = EXCLUDED.last_loaded_at,
+                status = EXCLUDED.status,
+                issues_found = EXCLUDED.issues_found,
+                was_cleaned = EXCLUDED.was_cleaned
+            """,
+            (table_name, status, psycopg2.extras.Json(issues_found), was_cleaned),
+        )
+    conn.commit()
 
 
 def infer_pg_type(values):
@@ -163,31 +252,43 @@ def main() -> None:
     cleaning_result = clean_dataset(folder)
     print(cleaning_result.summary())
 
+    # Every file loads regardless of cleaning outcome now — see module docstring.
+    # cleaned_names: cleaning fully resolved every original issue -> load from cleaned/.
+    # attempted_names: cleaning was attempted but declined or left something unresolved
+    # -> still load from cleaned/ (the clone always exists once issues were found, even
+    # if some/all of the generated fixes were declined or didn't stick).
+    records_by_name = {rec.file_name: rec for rec in cleaning_result.cleaned_files}
+    records_by_name.update({rec.file_name: rec for rec in cleaning_result.skipped_files})
     cleaned_names = {rec.file_name for rec in cleaning_result.cleaned_files}
-    skipped_names = {rec.file_name for rec in cleaning_result.skipped_files}
+    attempted_names = set(records_by_name.keys())
 
     load_plan = []  # list[(csv_path_to_actually_load, original_name)]
     for csv_path in csv_files:
-        if csv_path.name in skipped_names:
-            continue
-        if csv_path.name in cleaned_names:
+        if csv_path.name in attempted_names:
             load_plan.append((Path(cleaning_result.cleaned_dir) / csv_path.name, csv_path.name))
         else:
             load_plan.append((csv_path, csv_path.name))
 
-    if skipped_names:
-        print(
-            f"\nSkipping load for {len(skipped_names)} file(s) that were not successfully "
-            f"cleaned: {', '.join(sorted(skipped_names))}"
-        )
-
     print(f"\nLoading {len(load_plan)} file(s) into Postgres...")
     conn = get_admin_connection()
     try:
+        ensure_data_quality_status_table(conn)
         for load_path, original_name in load_plan:
             table_name, row_count = load_csv_to_table(conn, load_path)
             source_note = " (cleaned)" if original_name in cleaned_names else ""
             print(f"Loaded {original_name}{source_note} -> table '{table_name}' ({row_count} rows)")
+
+            rec = records_by_name.get(original_name)
+            if rec is None:
+                # Untouched: check_rubric() found nothing at all for this file.
+                unresolved_issues = []
+                was_cleaned = False
+            else:
+                unresolved_issues = unresolved_issues_for_record(rec)
+                was_cleaned = True
+            status, issues_found = compute_quality_status(unresolved_issues)
+            write_data_quality_status(conn, table_name, status, issues_found, was_cleaned)
+            print(f"  -> data quality status: {status} ({len(issues_found)} unresolved issue(s))")
     finally:
         conn.close()
 
