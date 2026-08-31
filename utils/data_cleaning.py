@@ -925,9 +925,34 @@ Rules:
 - The script must read the CSV at the exact path given, apply targeted fixes for the issues \
 listed, and write the cleaned result back to that same path (overwrite it in place).
 - Do not invent or drop columns, and do not change rows/values unrelated to the listed issues.
-- Only address the specific issues given — do not "fix" anything not listed.
+- Only address the specific issues given — do not "fix" anything not listed. This includes \
+values you notice in the sample rows that merely LOOK unusual (an extreme-but-plausible price, \
+a rare-but-real category) — an unusual value is not automatically wrong, and is not yours to \
+alter unless it is explicitly named in the issues list below.
 - Import any libraries you use (e.g. `import pandas as pd`) — nothing is pre-imported for you.
-- The script will be executed exactly as returned, top to bottom, standalone."""
+- The script will be executed exactly as returned, top to bottom, standalone.
+
+Special reasoning required for two specific issue categories, when they appear below:
+
+MISSING VALUES: each such issue states the real percentage of that column that's missing. Your \
+chosen strategy must be proportional to that real number, not a reflexive default:
+- Under ~20% missing: imputing is reasonable (mean/median for a numeric column, mode for a \
+categorical one).
+- ~20% or more missing: do NOT silently impute — imputing most of a column risks inventing data \
+that was never there. Prefer dropping the column, dropping the affected rows, or leaving the \
+values null with a clear flag column, whichever fits the file best.
+- Either way, add a one-line code comment immediately above the fix stating which strategy you \
+chose, the real percentage this column is missing, and why that strategy fits that percentage. \
+This comment is read by a human at an approval gate before the code ever runs — it must be \
+honest and specific, not generic.
+
+INVALID VALUES: this category is reserved for genuinely impossible values (a negative count/\
+amount, a date outside any sane calendar range) — these are safe to correct as before. Do not \
+extend this reasoning to values that are merely unusual but structurally possible (a very high \
+but real-looking price, an uncommon-but-valid date) — those are potentially real signal, not \
+errors, and altering them without being explicitly told to is fabrication, not cleaning. If \
+you are genuinely unsure whether a value in this category is an error, leave it unchanged and \
+say so explicitly in a code comment rather than guessing."""
 
 
 def _describe_file_for_prompt(file_path: Path) -> str:
@@ -938,6 +963,37 @@ def _describe_file_for_prompt(file_path: Path) -> str:
     sample = df.head(5)
     sample_lines = "\n".join(str(row.to_dict()) for _, row in sample.iterrows())
     return f"Columns:\n{col_info}\n\nSample rows (real, from this file):\n{sample_lines}"
+
+
+# Missing-value percentage above which imputation is discouraged in the cleaning-code prompt
+# (see CLEANING_CODE_SYSTEM_PROMPT) — same 20% figure named in the project spec, distinct from
+# MISSING_VALUE_THRESHOLD (5%) which controls whether check_rubric flags the column at all.
+MISSING_VALUE_IMPUTE_CEILING = 0.20
+
+_MISSING_PCT_RE = re.compile(r"is (\d+(?:\.\d+)?)% missing")
+
+
+def _issue_guidance(issue: str) -> str:
+    """Extra, deterministic guidance appended under one issue line in the code-gen prompt —
+    currently only fires for "Missing values" issues, where the real percentage is parsed
+    straight out of check_rubric's own issue string (the same number, not a re-guess) so the
+    LLM is pointed at a concrete number rather than left to eyeball the threshold itself."""
+    if not issue.startswith("Missing values:"):
+        return ""
+    match = _MISSING_PCT_RE.search(issue)
+    if not match:
+        return ""
+    pct = float(match.group(1))
+    if pct < MISSING_VALUE_IMPUTE_CEILING * 100:
+        return (
+            f"    (This column is {pct:.1f}% missing — under the "
+            f"{MISSING_VALUE_IMPUTE_CEILING:.0%} ceiling, so imputing is reasonable here.)"
+        )
+    return (
+        f"    (This column is {pct:.1f}% missing — at or above the "
+        f"{MISSING_VALUE_IMPUTE_CEILING:.0%} ceiling, so do NOT silently impute; prefer "
+        "dropping the column/rows or flagging nulls instead.)"
+    )
 
 
 def _generate_cleaning_code(
@@ -951,7 +1007,13 @@ def _generate_cleaning_code(
     If previous_code/previous_error are given (a retry after a real execution failure),
     both are included so the model can see exactly what it tried and what broke."""
     file_context = _describe_file_for_prompt(file_path)
-    issue_lines = "\n".join(f"- {issue}" for issue in issues)
+    issue_lines_parts = []
+    for issue in issues:
+        issue_lines_parts.append(f"- {issue}")
+        guidance = _issue_guidance(issue)
+        if guidance:
+            issue_lines_parts.append(guidance)
+    issue_lines = "\n".join(issue_lines_parts)
     human_content = (
         f"File to clean (read and overwrite this exact path): {file_path}\n\n"
         f"{file_context}\n\n"
