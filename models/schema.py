@@ -54,6 +54,16 @@ class SQLAnalystState(BaseModel):
     tables_to_clean: list = Field(default_factory=list)
     cleaning_attempted_tables: list = Field(default_factory=list)
 
+    # Visualization fields: set when the router dispatches to visualize_node
+    # instead of sql_node. wants_visualization=False leaves every visualization
+    # node unreachable — the routing functions gate on this flag so normal
+    # sql_analyst questions are completely unaffected.
+    wants_visualization: bool = False
+    chart_type: str = ""
+    chart_type_source: Literal["explicit", "reasoned"] = "explicit"
+    chart_type_reasoning: str = ""
+    output_file_path: str = ""
+
 
 class JudgeSchema(BaseModel):
     """Structured output schema for the safety-judge node only.
@@ -64,3 +74,17 @@ class JudgeSchema(BaseModel):
 
     answer: Literal["yes", "no"]
     comments: str
+
+
+class ChartTypeSchema(BaseModel):
+    """Structured output schema for the determine_chart_type node only.
+
+    Used via with_structured_output — never exposed to the main state directly
+    until its fields are copied into chart_type/chart_type_source/chart_type_reasoning.
+    chart_type_reasoning must be a real, specific justification when
+    chart_type_source is "reasoned"; it must be empty string when "explicit".
+    """
+
+    chart_type: str
+    chart_type_source: Literal["explicit", "reasoned"]
+    chart_type_reasoning: str

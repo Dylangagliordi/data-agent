@@ -36,5 +36,5 @@ class RouterSchema(BaseModel):
     with_structured_output) — never exposed to the main state directly until
     its fields are copied into route_response/route_comments."""
 
-    answer: Literal["sql_analyst", "etl_analyst"]
+    answer: Literal["sql_analyst", "etl_analyst", "visualize"]
     comments: str

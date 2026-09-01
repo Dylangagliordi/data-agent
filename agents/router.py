@@ -44,17 +44,23 @@ _ETL_ANALYST_GRAPH = build_etl_analyst_graph()
 LAST_SQL_ANALYST_STATE: dict = {}
 
 
-ROUTER_SYSTEM_PROMPT = """You classify an incoming request into exactly one of two \
-categories, for a data platform with two sub-agents:
+ROUTER_SYSTEM_PROMPT = """You classify an incoming request into exactly one of three \
+categories, for a data platform with three sub-agents:
 
 - "sql_analyst": the request is a question ABOUT data already loaded into the database \
 — counts, aggregates, breakdowns, comparisons, "how many X", "what's the average Y", \
-"top N by Z", or any question whose answer comes from querying existing data.
+"top N by Z", or any question whose answer comes from querying existing data. The user \
+wants a plain-English answer, not a visual output.
 - "etl_analyst": the request is about GETTING or PREPARING data — downloading a file \
 from a URL, loading data from an external source, or cleaning/transforming a folder of \
 raw data files.
+- "visualize": the request explicitly asks for a chart, plot, graph, or visual summary \
+— look for language like "chart", "plot", "graph", "visualize", "show me a graph", or \
+any phrasing implying the user wants to SEE a comparison, trend, or breakdown rather \
+than just read a plain-English answer. Only use this category when visualization language \
+is present; a data question with no visual language is "sql_analyst".
 
-Answer with exactly one of these two literal values, plus a brief comment explaining \
+Answer with exactly one of these three literal values, plus a brief comment explaining \
 why you classified it that way."""
 
 
@@ -117,6 +123,39 @@ def sql_node(state: DataAgentSchema) -> dict:
     return {"final_answer": final_answer}
 
 
+def visualize_node(state: DataAgentSchema) -> dict:
+    """Dispatch to the compiled SQL analyst graph with wants_visualization=True.
+
+    Uses the same _SQL_ANALYST_GRAPH as sql_node — the visualization path is
+    handled by conditional edges inside the SQL analyst graph that check
+    wants_visualization on state. Setting it True here is the only difference
+    from sql_node; all other nodes (curate_question, add_context, generate_sql,
+    is_safe, execute_sql) are shared and unmodified.
+
+    Also stashes the full sub-agent result into LAST_SQL_ANALYST_STATE exactly
+    as sql_node does, so main.py's logging can read the visualization-specific
+    fields (chart_type, output_file_path, etc.) without DataAgentSchema needing
+    to carry them.
+    """
+    global LAST_SQL_ANALYST_STATE
+    LAST_SQL_ANALYST_STATE = {}
+
+    last_message = state.messages[-1]
+    content = last_message.content if hasattr(last_message, "content") else str(last_message)
+
+    try:
+        result = _SQL_ANALYST_GRAPH.invoke(
+            SQLAnalystState(user_question=content, wants_visualization=True),
+            config={"recursion_limit": 50},
+        )
+        LAST_SQL_ANALYST_STATE = result
+        final_answer = result["final_answer"]
+    except Exception as e:
+        final_answer = f"The visualize sub-agent failed with an unexpected error: {type(e).__name__}: {e}"
+
+    return {"final_answer": final_answer}
+
+
 def etl_node(state: DataAgentSchema) -> dict:
     """Dispatch to the compiled ETL analyst graph with the last message wrapped as
     a HumanMessage — the ETL analyst's own ReAct loop handles the rest.
@@ -156,5 +195,6 @@ def router_edge(state: DataAgentSchema) -> str:
     the same discipline as every other conditional edge in this project
     (route_after_safety_check, route_after_execute_sql): never branch by reading
     shared state inside the edge function beyond returning the key itself.
+    Valid return values: "sql_analyst", "etl_analyst", "visualize".
     """
     return state.route_response

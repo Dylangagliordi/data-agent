@@ -2,14 +2,20 @@
 SQL analyst sub-agent: LangGraph node definitions.
 """
 
+import ast
+import csv
 import re
+from datetime import datetime
+from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 
-from models.schema import JudgeSchema, SQLAnalystState
+from models.schema import ChartTypeSchema, JudgeSchema, SQLAnalystState
 from utils.db import get_app_reader_connection
 from utils.llm_pick import pick_llm
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _ID_COLUMN_RE = re.compile(r"_id$")
 
@@ -344,6 +350,55 @@ def add_context(state: SQLAnalystState) -> dict:
     }
 
 
+DETERMINE_CHART_TYPE_SYSTEM_PROMPT = """You are a data visualization expert. Given a user question, \
+determine the most appropriate chart type.
+
+Step 1: Check whether the question explicitly names a chart type.
+Examples of explicit naming: "bar chart", "line graph", "pie chart", "scatter plot", "histogram", \
+"box plot", "donut chart", "stacked bar", "treemap".
+If a chart type is explicitly named, use it exactly as the chart_type. Set chart_type_source to \
+"explicit" and chart_type_reasoning to an empty string — no justification is needed for something \
+the user already specified.
+
+Step 2: If no chart type is named, choose the best fit using this rubric:
+- Change over time / trend → line chart
+- Comparing categories (not over time) → bar chart
+- Relationship between two numeric variables → scatter plot
+- Proportion of a whole (5 or fewer categories ONLY) → pie chart (never for comparisons or distributions)
+- Distribution of one variable → histogram
+- Distribution of one variable across groups → box plot
+- Composition across several categories → stacked bar chart
+- Hierarchical part-to-whole → treemap
+If genuinely uncertain between two reasonable fits, default to whichever of line/bar/scatter is \
+closest, and say so explicitly in the reasoning.
+Set chart_type_source to "reasoned". chart_type_reasoning must be a real, specific justification \
+grounded in the question — never a generic placeholder like "best fit" or "seems appropriate"."""
+
+
+def determine_chart_type(state: SQLAnalystState) -> dict:
+    """Node: given the curated question, choose the chart type to produce.
+
+    Runs only when wants_visualization=True — the conditional edge from
+    add_context routes here only on that path; normal sql_analyst questions
+    never reach this node at all.
+
+    Uses ChartTypeSchema via with_structured_output so chart_type_source is
+    always one of the two valid literals and chart_type is never empty.
+    """
+    llm = pick_llm("cheap").with_structured_output(ChartTypeSchema)
+    result: ChartTypeSchema = llm.invoke(
+        [
+            ("system", DETERMINE_CHART_TYPE_SYSTEM_PROMPT),
+            ("human", state.curated_question),
+        ]
+    )
+    return {
+        "chart_type": result.chart_type,
+        "chart_type_source": result.chart_type_source,
+        "chart_type_reasoning": result.chart_type_reasoning,
+    }
+
+
 GENERATE_SQL_SYSTEM_PROMPT = """You are a SQL analyst. Given a question and a description of \
 the available tables (columns, types, and sample rows), write exactly ONE SQL query that \
 answers the question against a PostgreSQL database.
@@ -388,12 +443,76 @@ def _strip_sql_formatting(text: str) -> str:
     return cleaned
 
 
+_CHART_SQL_SHAPING: dict = {
+    "line": (
+        "GROUP BY the relevant time period and ORDER BY it chronologically. "
+        "Return exactly one row per time period so the chart has a clean x-axis."
+    ),
+    "bar": (
+        "GROUP BY the category, aggregate the metric (e.g. SUM, COUNT, or AVG), "
+        "and ORDER BY the aggregate. Consider a reasonable LIMIT (e.g. TOP 10 or TOP 20) "
+        "if there are many categories."
+    ),
+    "scatter": (
+        "Return the two raw numeric columns unaggregated, one row per entity. "
+        "Do not GROUP BY or aggregate — the chart engine plots individual points."
+    ),
+    "pie": (
+        "GROUP BY the category and aggregate. Cap at 5 categories maximum — "
+        "use a LIMIT or roll up smaller categories into 'Other'."
+    ),
+    "donut": (
+        "GROUP BY the category and aggregate. Cap at 5 categories maximum — "
+        "use a LIMIT or roll up smaller categories into 'Other'."
+    ),
+    "histogram": (
+        "Return the raw values of the single variable being distributed, one row per entity. "
+        "Do not pre-bucket — the chart engine bins the values."
+    ),
+    "box": (
+        "Return the raw values of the measured variable plus the grouping column, "
+        "one row per entity. Do not pre-aggregate."
+    ),
+    "stacked bar": (
+        "GROUP BY both the main category (x-axis) and the sub-category (the stack dimension), "
+        "with the aggregate value. Return one row per (category, sub-category) pair."
+    ),
+    "treemap": (
+        "GROUP BY the hierarchy levels (e.g. category and sub-category) and aggregate the metric. "
+        "Return the hierarchical labels and aggregate values."
+    ),
+}
+
+
+def _chart_shaping_instruction(chart_type: str) -> str:
+    """Return the SQL-shaping instruction for a given chart type.
+
+    Matches on any key that appears as a substring in the lowercased chart_type,
+    so "horizontal bar chart" -> bar, "line graph" -> line, etc.
+    Falls back to a generic instruction if nothing matches.
+    """
+    ct = chart_type.lower()
+    # Check stacked bar before plain bar so it doesn't match bar first.
+    for key in ("stacked bar", "line", "bar", "scatter", "donut", "pie", "histogram", "box", "treemap"):
+        if key in ct:
+            return _CHART_SQL_SHAPING[key]
+    return (
+        "Shape the query to return data appropriate for the chart type. "
+        "Use GROUP BY and ORDER BY as needed."
+    )
+
+
 def generate_sql(state: SQLAnalystState) -> dict:
     """Node 3 (high tier): write exactly one SQL query from curated_question + context.
 
     If this is a retry after a failed execution (sql_query_execution_result holds an
     error), that error is included so the model can try again with real information
     about what went wrong.
+
+    When wants_visualization is True, the prompt is extended with the determined
+    chart_type and chart-type-specific shaping instructions so the query result
+    structure matches what a chart renderer expects. The normal (non-visualization)
+    path is completely unchanged.
     """
     llm = pick_llm("high")
 
@@ -401,6 +520,14 @@ def generate_sql(state: SQLAnalystState) -> dict:
         f"Question: {state.curated_question}\n\n"
         f"Database context:\n{state.prompt_query_context}"
     )
+
+    if state.wants_visualization and state.chart_type:
+        shaping = _chart_shaping_instruction(state.chart_type)
+        human_content += (
+            f"\n\nThis query will supply data for a {state.chart_type} chart. "
+            f"Shape the query accordingly: {shaping}"
+        )
+
     if state.sql_query_execution_result:
         human_content += (
             "\n\nA previous attempt at this query failed with this real database error "
@@ -529,15 +656,19 @@ def execute_sql(state: SQLAnalystState) -> dict:
 def route_after_execute_sql(state: SQLAnalystState) -> str:
     """Conditional edge function for after execute_sql.
 
-    Returns a plain string key: "represent_final_answer" on success or once
-    MAX_SQL_ATTEMPTS is reached (final_answer is already set with the error in
-    that case by execute_sql itself), otherwise "generate_sql" to retry.
+    Returns a plain string key: "represent_final_answer" on the exhausted-retry
+    error case (final_answer already set by execute_sql), "generate_sql" on a
+    retryable error, "build_visualization" on success when wants_visualization
+    is True, and "represent_final_answer" on success for a normal question.
     """
     if state.final_answer:
-        # execute_sql already gave up and wrote the final failure answer.
+        # execute_sql already gave up after MAX_SQL_ATTEMPTS — pass the error
+        # through represent_final_answer unchanged, regardless of wants_visualization.
         return "represent_final_answer"
     if state.sql_query_execution_result.startswith(_SQL_ERROR_PREFIX):
         return "generate_sql"
+    if state.wants_visualization:
+        return "build_visualization"
     return "represent_final_answer"
 
 
@@ -675,14 +806,111 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
     }
 
 
+def _humanize_column(col: str) -> str:
+    """Convert a SQL alias like 'avg_payment_value' -> 'Average Payment Value'."""
+    return col.replace("_", " ").title()
+
+
+BUILD_VISUALIZATION_SUMMARY_SYSTEM_PROMPT = """You are a data analyst writing a brief \
+interpretive summary of a SQL query result for a chart.
+
+Rules:
+- Write exactly 2-3 sentences.
+- Be specific: reference actual numbers, trends, or patterns visible in the data.
+- Ground every claim strictly in the result shown — never invent a claim the data \
+does not support.
+- Do not describe the chart type or the SQL — only describe what the data shows."""
+
+
+def build_visualization(state: SQLAnalystState) -> dict:
+    """Node: write a CSV file from the SQL result and produce an interpretive summary.
+
+    Replaces represent_final_answer specifically when wants_visualization=True.
+    The normal represent_final_answer node is completely unchanged and still used
+    for every non-visualization question.
+
+    Steps:
+    1. Parse the execution result and write a real CSV with human-readable headers.
+    2. Ask the cheap LLM for a short, grounded interpretive summary.
+    3. Compose final_answer: file path + chart type + reasoning (if reasoned) + summary.
+    """
+    # --- Parse result ---
+    try:
+        result_data = ast.literal_eval(state.sql_query_execution_result)
+    except (ValueError, SyntaxError):
+        result_data = []
+
+    # --- Write CSV ---
+    viz_dir = _PROJECT_ROOT / "outputs" / "visualizations"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+
+    question_slug = re.sub(r"[^a-z0-9]+", "_", state.curated_question.lower())[:40].strip("_")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{question_slug}_{timestamp}.csv"
+    output_path = viz_dir / filename
+
+    if result_data and isinstance(result_data, list) and isinstance(result_data[0], dict):
+        raw_cols = list(result_data[0].keys())
+        human_cols = [_humanize_column(c) for c in raw_cols]
+        with open(output_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=human_cols)
+            writer.writeheader()
+            for row in result_data:
+                writer.writerow(dict(zip(human_cols, row.values())))
+    else:
+        # Empty result or unexpected shape — write an empty CSV with a note.
+        with open(output_path, "w", newline="") as f:
+            f.write("(no data returned)\n")
+
+    # --- Interpretive summary ---
+    llm = pick_llm("cheap")
+    sample = result_data[:10] if isinstance(result_data, list) else []
+    summary_human = (
+        f"Chart type: {state.chart_type}\n"
+        f"User question: {state.user_question}\n"
+        f"SQL result (up to 10 rows): {sample}"
+    )
+    summary_response = llm.invoke(
+        [
+            ("system", BUILD_VISUALIZATION_SUMMARY_SYSTEM_PROMPT),
+            ("human", summary_human),
+        ]
+    )
+    summary = _extract_text(summary_response.content).strip()
+
+    # --- Compose final answer ---
+    reasoning_note = ""
+    if state.chart_type_source == "reasoned" and state.chart_type_reasoning:
+        reasoning_note = f"\nChart type reasoning: {state.chart_type_reasoning}"
+
+    final_answer = (
+        f"Visualization data saved to: {output_path}\n"
+        f"Chart type: {state.chart_type}{reasoning_note}\n\n"
+        f"Summary: {summary}"
+    )
+
+    return {
+        "output_file_path": str(output_path),
+        "final_answer": final_answer,
+        "messages": [AIMessage(content=final_answer)],
+    }
+
+
 def route_after_add_context(state: SQLAnalystState) -> str:
-    """Conditional edge after add_context: route to clean_and_reload when at least one
-    queried table has an unresolved fail-level issue with a known source_folder AND
-    hasn't been cleaned yet this question; otherwise proceed directly to generate_sql.
+    """Conditional edge after add_context.
+
+    Priority order:
+    1. "needs_cleaning" — at least one fail-level table with a known source_folder
+       not yet attempted this question: fire clean_and_reload first.
+    2. "determine_chart_type" — visualization request (wants_visualization=True)
+       with a clean data quality check: determine chart type before generating SQL.
+    3. "generate_sql" — normal question, proceed directly.
     """
     if state.data_quality_action == "needs_cleaning":
         return "needs_cleaning"
-    return "proceed"
+    if state.wants_visualization:
+        return "determine_chart_type"
+    return "generate_sql"
 
 
 def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
@@ -777,7 +1005,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
 def build_sql_analyst_graph():
     """Wire all nodes into a StateGraph using SQLAnalystState, and compile it.
 
-    Graph shape:
+    Graph shape (normal ask: path, wants_visualization=False):
         START -> curate_question -> add_context
         add_context --(route_after_add_context)--> generate_sql | clean_and_reload
         clean_and_reload -> add_context  (loop; stop condition via cleaning_attempted_tables)
@@ -786,26 +1014,39 @@ def build_sql_analyst_graph():
         execute_sql --(route_after_execute_sql)--> generate_sql (retry) | represent_final_answer
         cancel_sql -> END
         represent_final_answer -> END
+
+    Additional visualization path (wants_visualization=True):
+        add_context --(route_after_add_context)--> determine_chart_type
+        determine_chart_type -> generate_sql  (same generate_sql, extended prompt)
+        execute_sql --(route_after_execute_sql)--> build_visualization
+        build_visualization -> END
     """
     graph = StateGraph(SQLAnalystState)
 
     graph.add_node("curate_question", curate_question)
     graph.add_node("add_context", add_context)
     graph.add_node("clean_and_reload", clean_and_reload)
+    graph.add_node("determine_chart_type", determine_chart_type)
     graph.add_node("generate_sql", generate_sql)
     graph.add_node("is_safe", is_safe)
     graph.add_node("execute_sql", execute_sql)
     graph.add_node("cancel_sql", cancel_sql)
     graph.add_node("represent_final_answer", represent_final_answer)
+    graph.add_node("build_visualization", build_visualization)
 
     graph.add_edge(START, "curate_question")
     graph.add_edge("curate_question", "add_context")
     graph.add_conditional_edges(
         "add_context",
         route_after_add_context,
-        {"proceed": "generate_sql", "needs_cleaning": "clean_and_reload"},
+        {
+            "generate_sql": "generate_sql",
+            "determine_chart_type": "determine_chart_type",
+            "needs_cleaning": "clean_and_reload",
+        },
     )
     graph.add_edge("clean_and_reload", "add_context")
+    graph.add_edge("determine_chart_type", "generate_sql")
     graph.add_edge("generate_sql", "is_safe")
 
     graph.add_conditional_edges(
@@ -816,10 +1057,15 @@ def build_sql_analyst_graph():
     graph.add_conditional_edges(
         "execute_sql",
         route_after_execute_sql,
-        {"generate_sql": "generate_sql", "represent_final_answer": "represent_final_answer"},
+        {
+            "generate_sql": "generate_sql",
+            "represent_final_answer": "represent_final_answer",
+            "build_visualization": "build_visualization",
+        },
     )
 
     graph.add_edge("cancel_sql", END)
     graph.add_edge("represent_final_answer", END)
+    graph.add_edge("build_visualization", END)
 
     return graph.compile()

@@ -64,6 +64,25 @@ def log_run(user_question: str, result: dict) -> None:
                 "final_answer": result.get("final_answer", ""),
             }
         )
+    elif route_response == "visualize":
+        # visualize_node also stashes its SQL analyst sub-agent result in
+        # LAST_SQL_ANALYST_STATE (same side channel, same pattern as sql_node)
+        # so all visualization-specific fields are accessible here.
+        sql_state = router_module.LAST_SQL_ANALYST_STATE
+        entry.update(
+            {
+                "user_question": user_question,
+                "curated_question": sql_state.get("curated_question", ""),
+                "chart_type": sql_state.get("chart_type", ""),
+                "chart_type_source": sql_state.get("chart_type_source", ""),
+                "chart_type_reasoning": sql_state.get("chart_type_reasoning", ""),
+                "generated_sql_query": sql_state.get("generated_sql_query", ""),
+                "is_safe": sql_state.get("is_safe", ""),
+                "sql_query_execution_result": sql_state.get("sql_query_execution_result", ""),
+                "output_file_path": sql_state.get("output_file_path", ""),
+                "final_answer": result.get("final_answer", ""),
+            }
+        )
     elif route_response == "etl_analyst":
         entry.update(
             {
