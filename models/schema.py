@@ -2,7 +2,7 @@
 Pydantic schemas for the SQL analyst sub-agent's graph state.
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -39,6 +39,20 @@ class SQLAnalystState(BaseModel):
     # "cap at 5 total attempts across the whole generate->execute cycle" rule —
     # there is no other way to count retries across graph steps without it.
     sql_attempts: int = 0
+
+    # Auto-clean redirect fields: set by add_context after the data-quality status
+    # check; consumed by the conditional edge and clean_and_reload node.
+    #
+    # data_quality_action: "needs_cleaning" when at least one queried table has
+    #   status == "fail" AND a non-null source_folder AND hasn't been attempted yet
+    #   this question; "proceed" otherwise.
+    # tables_to_clean: list of {"table": <name>, "source_folder": <path>} dicts
+    #   for every table that triggered "needs_cleaning" this pass.
+    # cleaning_attempted_tables: list of table names already cleaned (or attempted)
+    #   this question — the stop condition that prevents the redirect from looping.
+    data_quality_action: Literal["proceed", "needs_cleaning"] = "proceed"
+    tables_to_clean: list = Field(default_factory=list)
+    cleaning_attempted_tables: list = Field(default_factory=list)
 
 
 class JudgeSchema(BaseModel):

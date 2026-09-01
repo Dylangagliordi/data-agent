@@ -68,13 +68,14 @@ def get_admin_connection():
 
 
 def ensure_data_quality_status_table(conn) -> None:
-    """Create _data_quality_status if it doesn't already exist. Table/column
-    identifiers here can't be parameterized (DDL doesn't support placeholders for
-    identifiers in any SQL dialect) but every identifier below is a fixed literal
-    written in this source file, not runtime/user input, so this is not the kind of
-    string-built SQL the project's "always use parameterized queries" rule targets —
-    that rule is about values, and every value-position query elsewhere in this
-    function/module already uses %s placeholders.
+    """Create _data_quality_status if it doesn't already exist, and add any columns
+    that were introduced after the initial schema. Table/column identifiers here can't
+    be parameterized (DDL doesn't support placeholders for identifiers in any SQL
+    dialect) but every identifier below is a fixed literal written in this source file,
+    not runtime/user input, so this is not the kind of string-built SQL the project's
+    "always use parameterized queries" rule targets — that rule is about values, and
+    every value-position query elsewhere in this function/module already uses %s
+    placeholders.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -86,6 +87,15 @@ def ensure_data_quality_status_table(conn) -> None:
                 issues_found JSONB NOT NULL,
                 was_cleaned BOOLEAN NOT NULL
             );
+            """
+        )
+        # source_folder added after initial schema — idempotent migration so older
+        # installs gain the column on their next load_data.py run. Existing rows
+        # will have source_folder = NULL (treated as "can't auto-redirect").
+        cur.execute(
+            """
+            ALTER TABLE _data_quality_status
+            ADD COLUMN IF NOT EXISTS source_folder TEXT;
             """
         )
     conn.commit()
@@ -115,23 +125,32 @@ def compute_quality_status(unresolved_issues: list) -> tuple:
     return status, issues_found_payload
 
 
-def write_data_quality_status(conn, table_name: str, status: str, issues_found: list, was_cleaned: bool) -> None:
-    """Insert or update table_name's row in _data_quality_status. All four values
-    (table_name, status, issues_found, was_cleaned) are bound as real placeholders —
-    only last_loaded_at uses the server-side now() function, not a value needing a
-    placeholder."""
+def write_data_quality_status(
+    conn,
+    table_name: str,
+    status: str,
+    issues_found: list,
+    was_cleaned: bool,
+    source_folder: str | None = None,
+) -> None:
+    """Insert or update table_name's row in _data_quality_status. All values are bound
+    as real placeholders — only last_loaded_at uses the server-side now() function.
+    source_folder is the folder path load_data.py (or clean_and_reload) loaded this
+    table from; NULL means unknown (table loaded before this column was added)."""
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO _data_quality_status (table_name, last_loaded_at, status, issues_found, was_cleaned)
-            VALUES (%s, now(), %s, %s, %s)
+            INSERT INTO _data_quality_status
+                (table_name, last_loaded_at, status, issues_found, was_cleaned, source_folder)
+            VALUES (%s, now(), %s, %s, %s, %s)
             ON CONFLICT (table_name) DO UPDATE SET
                 last_loaded_at = EXCLUDED.last_loaded_at,
                 status = EXCLUDED.status,
                 issues_found = EXCLUDED.issues_found,
-                was_cleaned = EXCLUDED.was_cleaned
+                was_cleaned = EXCLUDED.was_cleaned,
+                source_folder = EXCLUDED.source_folder
             """,
-            (table_name, status, psycopg2.extras.Json(issues_found), was_cleaned),
+            (table_name, status, psycopg2.extras.Json(issues_found), was_cleaned, source_folder),
         )
     conn.commit()
 
@@ -287,7 +306,10 @@ def main() -> None:
                 unresolved_issues = unresolved_issues_for_record(rec)
                 was_cleaned = True
             status, issues_found = compute_quality_status(unresolved_issues)
-            write_data_quality_status(conn, table_name, status, issues_found, was_cleaned)
+            write_data_quality_status(
+                conn, table_name, status, issues_found, was_cleaned,
+                source_folder=str(folder),
+            )
             print(f"  -> data quality status: {status} ({len(issues_found)} unresolved issue(s))")
     finally:
         conn.close()

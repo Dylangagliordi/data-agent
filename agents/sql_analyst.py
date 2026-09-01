@@ -106,6 +106,10 @@ def _fetch_data_quality_status(conn, table_names: list) -> dict:
     hasn't had utils/load_data.py run against it since this feature shipped) — in that
     case every table is treated as having no status row, same as a genuinely missing
     row, rather than crashing add_context.
+
+    Returns tuples of (status, issues_found, source_folder). source_folder is None
+    when the column doesn't exist yet (pre-migration schema) or when the row pre-dates
+    the source_folder feature — both mean "can't auto-redirect for this table".
     """
     if not table_names:
         return {}
@@ -117,17 +121,48 @@ def _fetch_data_quality_status(conn, table_names: list) -> dict:
         if not table_exists:
             return {}
 
-        placeholders = ", ".join(["%s"] * len(table_names))
+        # source_folder was added after the initial schema; check before querying so
+        # that an older schema that hasn't run load_data.py yet still works cleanly.
         cur.execute(
-            f"""
-            SELECT table_name, status, issues_found
-            FROM _data_quality_status
-            WHERE table_name IN ({placeholders})
-            """,
-            tuple(table_names),
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = '_data_quality_status'
+              AND column_name = 'source_folder'
+            """
         )
-        rows = cur.fetchall()
-    return {table_name: (status, issues_found) for table_name, status, issues_found in rows}
+        (has_source_folder,) = cur.fetchone()
+
+        placeholders = ", ".join(["%s"] * len(table_names))
+        if has_source_folder:
+            cur.execute(
+                f"""
+                SELECT table_name, status, issues_found, source_folder
+                FROM _data_quality_status
+                WHERE table_name IN ({placeholders})
+                """,
+                tuple(table_names),
+            )
+            rows = cur.fetchall()
+            return {
+                table_name: (status, issues_found, source_folder)
+                for table_name, status, issues_found, source_folder in rows
+            }
+        else:
+            cur.execute(
+                f"""
+                SELECT table_name, status, issues_found
+                FROM _data_quality_status
+                WHERE table_name IN ({placeholders})
+                """,
+                tuple(table_names),
+            )
+            rows = cur.fetchall()
+            return {
+                table_name: (status, issues_found, None)
+                for table_name, status, issues_found in rows
+            }
 
 
 def _summarize_fail_issues(issues_found) -> str:
@@ -244,6 +279,8 @@ def add_context(state: SQLAnalystState) -> dict:
 
         status_by_table = _fetch_data_quality_status(conn, list(tables.keys()))
         data_quality_warnings = []
+        tables_to_clean = []
+        already_attempted = set(state.cleaning_attempted_tables)
         for table_name in tables:
             entry = status_by_table.get(table_name)
             if entry is None:
@@ -254,7 +291,7 @@ def add_context(state: SQLAnalystState) -> dict:
                     }
                 )
                 continue
-            status, issues_found = entry
+            status, issues_found, source_folder = entry
             if status == "fail":
                 summary = _summarize_fail_issues(issues_found)
                 data_quality_warnings.append(
@@ -266,6 +303,10 @@ def add_context(state: SQLAnalystState) -> dict:
                         ),
                     }
                 )
+                # Eligible for auto-clean if source_folder is known and this table
+                # hasn't already been attempted this question (stop-once rule).
+                if source_folder is not None and table_name not in already_attempted:
+                    tables_to_clean.append({"table": table_name, "source_folder": source_folder})
             # status == "warn" or "pass": nothing injected into generate_sql's context.
 
         sections = []
@@ -294,7 +335,13 @@ def add_context(state: SQLAnalystState) -> dict:
     finally:
         conn.close()
 
-    return {"prompt_query_context": context, "data_quality_warnings": data_quality_warnings}
+    data_quality_action = "needs_cleaning" if tables_to_clean else "proceed"
+    return {
+        "prompt_query_context": context,
+        "data_quality_warnings": data_quality_warnings,
+        "data_quality_action": data_quality_action,
+        "tables_to_clean": tables_to_clean,
+    }
 
 
 GENERATE_SQL_SYSTEM_PROMPT = """You are a SQL analyst. Given a question and a description of \
@@ -628,11 +675,113 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
     }
 
 
+def route_after_add_context(state: SQLAnalystState) -> str:
+    """Conditional edge after add_context: route to clean_and_reload when at least one
+    queried table has an unresolved fail-level issue with a known source_folder AND
+    hasn't been cleaned yet this question; otherwise proceed directly to generate_sql.
+    """
+    if state.data_quality_action == "needs_cleaning":
+        return "needs_cleaning"
+    return "proceed"
+
+
+def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
+    """Node: for each fail-level table that has a known source_folder, run
+    clean_dataset() against that folder, then reload the table and update its
+    _data_quality_status row with the new outcome.
+
+    Fires AT MOST ONCE per table per question — cleaning_attempted_tables (returned
+    here and checked by add_context on the next pass) enforces the stop condition.
+
+    After this node, the graph unconditionally routes back to add_context so schema
+    and status context refresh; add_context's updated data_quality_action then
+    determines whether to proceed to generate_sql (either the table improved, or it
+    was already attempted and can't be retried).
+
+    _llm is a test-only injection point: when None (always in production) clean_dataset
+    uses its own real LLM. Tests pass a deterministic fake to keep cleaning predictable.
+    """
+    from pathlib import Path
+
+    from utils.data_cleaning import clean_dataset, unresolved_issues_for_record
+    from utils.load_data import (
+        compute_quality_status,
+        ensure_data_quality_status_table,
+        get_admin_connection,
+        load_csv_to_table,
+        sanitize_identifier,
+        write_data_quality_status,
+    )
+
+    newly_attempted = list(state.cleaning_attempted_tables)
+
+    # Group tables by source_folder: one clean_dataset() call per folder covers all
+    # CSVs in it, so multiple fail tables from the same dataset need only one run.
+    folder_to_tables: dict = {}
+    for item in state.tables_to_clean:
+        sf = item["source_folder"]
+        folder_to_tables.setdefault(sf, []).append(item["table"])
+
+    conn = get_admin_connection()
+    try:
+        ensure_data_quality_status_table(conn)
+
+        for source_folder, table_names in folder_to_tables.items():
+            folder_path = Path(source_folder)
+            cleaning_result = clean_dataset(folder_path, llm=_llm)
+
+            all_records = {rec.file_name: rec for rec in cleaning_result.cleaned_files}
+            all_records.update({rec.file_name: rec for rec in cleaning_result.skipped_files})
+
+            for table_name in table_names:
+                # Reverse-map table_name back to its CSV file by sanitized stem.
+                target_csv = None
+                for csv_path in sorted(folder_path.glob("*.csv")):
+                    if sanitize_identifier(csv_path.stem) == table_name:
+                        target_csv = csv_path
+                        break
+
+                if target_csv is None:
+                    # CSV not found in folder — mark attempted, skip reload.
+                    newly_attempted.append(table_name)
+                    continue
+
+                csv_name = target_csv.name
+                if csv_name in all_records:
+                    load_path = Path(cleaning_result.cleaned_dir) / csv_name
+                else:
+                    load_path = target_csv
+
+                load_csv_to_table(conn, load_path)
+
+                rec = all_records.get(csv_name)
+                if rec is None:
+                    unresolved = []
+                    was_cleaned = False
+                else:
+                    unresolved = unresolved_issues_for_record(rec)
+                    was_cleaned = True
+
+                status, issues_found = compute_quality_status(unresolved)
+                write_data_quality_status(
+                    conn, table_name, status, issues_found, was_cleaned,
+                    source_folder=source_folder,
+                )
+                newly_attempted.append(table_name)
+    finally:
+        conn.close()
+
+    return {"cleaning_attempted_tables": newly_attempted}
+
+
 def build_sql_analyst_graph():
     """Wire all nodes into a StateGraph using SQLAnalystState, and compile it.
 
     Graph shape:
-        START -> curate_question -> add_context -> generate_sql -> is_safe
+        START -> curate_question -> add_context
+        add_context --(route_after_add_context)--> generate_sql | clean_and_reload
+        clean_and_reload -> add_context  (loop; stop condition via cleaning_attempted_tables)
+        generate_sql -> is_safe
         is_safe --(route_after_safety_check)--> execute_sql | cancel_sql
         execute_sql --(route_after_execute_sql)--> generate_sql (retry) | represent_final_answer
         cancel_sql -> END
@@ -642,6 +791,7 @@ def build_sql_analyst_graph():
 
     graph.add_node("curate_question", curate_question)
     graph.add_node("add_context", add_context)
+    graph.add_node("clean_and_reload", clean_and_reload)
     graph.add_node("generate_sql", generate_sql)
     graph.add_node("is_safe", is_safe)
     graph.add_node("execute_sql", execute_sql)
@@ -650,7 +800,12 @@ def build_sql_analyst_graph():
 
     graph.add_edge(START, "curate_question")
     graph.add_edge("curate_question", "add_context")
-    graph.add_edge("add_context", "generate_sql")
+    graph.add_conditional_edges(
+        "add_context",
+        route_after_add_context,
+        {"proceed": "generate_sql", "needs_cleaning": "clean_and_reload"},
+    )
+    graph.add_edge("clean_and_reload", "add_context")
     graph.add_edge("generate_sql", "is_safe")
 
     graph.add_conditional_edges(
