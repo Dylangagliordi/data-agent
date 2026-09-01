@@ -576,7 +576,42 @@ that key (a subquery or CTE with GROUP BY), and only then join it to the rest of
 aggregate further. The database context below may include explicit "WARNING: ... fan-out \
 risk" notes identifying which tables actually have this issue for the currently loaded data — \
 treat those as confirmed, but apply this same reasoning even for tables not called out, since \
-the context only flags what could be checked mechanically."""
+the context only flags what could be checked mechanically.
+- Binning / bucketing: when a question implies grouping a continuous value into ranges \
+(age groups, price brackets, order-size tiers, time-of-day slots, score bands, etc.), \
+create the buckets directly in the query with a CASE WHEN expression — do NOT return raw, \
+ungrouped values and let the caller bin them. GROUP BY the CASE WHEN expression (or its \
+positional alias) and include an aggregate for each bucket. Concrete example:
+    SELECT
+      CASE
+        WHEN price < 50  THEN 'Under $50'
+        WHEN price < 100 THEN '$50-$99'
+        WHEN price < 200 THEN '$100-$199'
+        ELSE '$200+'
+      END AS price_range,
+      COUNT(*) AS order_count
+    FROM order_items
+    GROUP BY 1
+    ORDER BY MIN(price);
+- Pivot (long-to-wide): when a question needs one output column per category value \
+(e.g. "monthly revenue as a separate column for each product category"), use conditional \
+aggregation — a CASE WHEN inside an aggregate function for each target column. Concrete \
+example (two category values becoming separate columns):
+    SELECT
+      month,
+      SUM(CASE WHEN category = 'electronics' THEN revenue ELSE 0 END) AS electronics,
+      SUM(CASE WHEN category = 'apparel'     THEN revenue ELSE 0 END) AS apparel
+    FROM monthly_sales
+    GROUP BY month
+    ORDER BY month;
+- Unpivot (wide-to-long): when multiple metric columns should become rows, use UNION ALL \
+with a literal label column to stack them into long format. Concrete example (two metric \
+columns unpivoted into rows):
+    SELECT 'revenue' AS metric, revenue AS value FROM summary
+    UNION ALL
+    SELECT 'cost'    AS metric, cost    AS value FROM summary
+    ORDER BY metric;
+  Adjust source columns, table names, and label strings to match the actual schema."""
 
 
 def _strip_sql_formatting(text: str) -> str:
@@ -628,8 +663,10 @@ _CHART_SQL_SHAPING: dict = {
         "with the aggregate value. Return one row per (category, sub-category) pair."
     ),
     "treemap": (
-        "GROUP BY the hierarchy levels (e.g. category and sub-category) and aggregate the metric. "
-        "Return the hierarchical labels and aggregate values."
+        "GROUP BY the outer (parent) category first, then the inner (child) sub-category. "
+        "Include an aggregate (e.g. SUM or COUNT) for the size dimension. "
+        "Return exactly one row per (outer_category, inner_sub_category) pair — "
+        "the two label columns plus the aggregate value."
     ),
 }
 
@@ -663,6 +700,17 @@ def generate_sql(state: SQLAnalystState) -> dict:
     chart_type and chart-type-specific shaping instructions so the query result
     structure matches what a chart renderer expects. The normal (non-visualization)
     path is completely unchanged.
+
+    DELIBERATELY OUT OF SCOPE — do not add these here:
+    - Data-cleaning operations (trimming whitespace, normalising casing, filling nulls,
+      replacing placeholder values, deduplicating rows): that is clean_dataset()'s job,
+      which runs at load time. This function assumes it is querying already-clean data.
+    - Building a persistent, multi-table data model with a relationship layer (the
+      equivalent of Power BI's DAX model or Tableau's calculated fields/relationships).
+      Each invocation produces one flat, correctly-shaped result for one specific chart
+      or question — not an interconnected model with cross-table calculated metrics.
+      A genuinely complex multi-table dashboard is BI-tool development work and is
+      outside what this system does.
     """
     llm = pick_llm("high")
 
