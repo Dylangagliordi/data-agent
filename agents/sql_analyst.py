@@ -4,8 +4,8 @@ SQL analyst sub-agent: LangGraph node definitions.
 
 import ast
 import csv
+import datetime as _dt
 import re
-from datetime import datetime
 from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -16,6 +16,42 @@ from utils.db import get_app_reader_connection
 from utils.llm_pick import pick_llm
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# ── Result parsing ────────────────────────────────────────────────────────────
+
+_DECIMAL_RE = re.compile(r"Decimal\('([^']+)'\)")
+
+
+def _parse_sql_result(result_str: str) -> list:
+    """Parse execute_sql's str() repr of a list of dicts.
+
+    ast.literal_eval alone cannot handle two psycopg2 types that commonly
+    appear in query results:
+    - Decimal('1.23') — produced for NUMERIC/DECIMAL columns and aggregates
+      like SUM/AVG over numeric columns; replaced with the bare float literal
+      before parsing.
+    - datetime.datetime / datetime.date — produced for timestamp and date
+      columns; requires a controlled eval() with the datetime module available.
+
+    Uses eval() with a restricted namespace (no __builtins__) rather than
+    ast.literal_eval so these types resolve. The input is always the str()
+    repr of our own database execution result — not user-supplied text — and
+    the SQL that produced it was already cleared by the is_safe judge, so
+    the controlled-eval approach is safe here.
+    """
+    cleaned = _DECIMAL_RE.sub(r"\1", result_str)
+    namespace = {
+        "__builtins__": {},
+        "datetime": _dt,
+        "Decimal": float,
+    }
+    try:
+        result = eval(cleaned, namespace)  # noqa: S307
+        if isinstance(result, list):
+            return result
+        return []
+    except Exception:
+        return []
 
 _ID_COLUMN_RE = re.compile(r"_id$")
 
@@ -350,6 +386,116 @@ def add_context(state: SQLAnalystState) -> dict:
     }
 
 
+# ── Export-target detection ───────────────────────────────────────────────────
+
+# Explicit Tableau mention patterns (all lower-cased for comparison).
+# We match the bare word "tableau" case-insensitively — it is specific enough
+# that a false positive is essentially impossible in a data question, and we
+# deliberately do NOT infer the target from any indirect cues.
+_TABLEAU_RE = re.compile(r"\btableau\b", re.IGNORECASE)
+
+
+def _detect_export_target(curated_question: str) -> str:
+    """Return "tableau" when the question explicitly names Tableau; "csv" otherwise.
+
+    Detection is purely lexical — we never guess or infer tool preference from
+    phrasing that does not literally say "Tableau".  Power BI, Looker Studio,
+    and Metabase all consume plain CSV without issue, so they have no dedicated
+    export path.  Tableau is the single exception because it has a first-party
+    binary extract format (.hyper) that can be embedded directly in Tableau
+    workbooks / data sources and loads substantially faster than CSV at scale.
+    """
+    if _TABLEAU_RE.search(curated_question):
+        return "tableau"
+    return "csv"
+
+
+# ── Hyper file export ─────────────────────────────────────────────────────────
+
+def _python_to_hyper_type(value):
+    """Map a live Python value to the corresponding Tableau hyper SqlType.
+
+    Inspect the first non-None value encountered for a column. Falls back to
+    SqlType.text() for unknown types or all-None columns.
+    """
+    from tableauhyperapi import SqlType
+    if isinstance(value, bool):
+        return SqlType.bool()
+    if isinstance(value, int):
+        return SqlType.big_int()
+    if isinstance(value, float):
+        return SqlType.double()
+    if isinstance(value, _dt.datetime):
+        return SqlType.timestamp()
+    if isinstance(value, _dt.date):
+        return SqlType.date()
+    return SqlType.text()
+
+
+def _write_hyper_file(data: list, csv_path: Path) -> Path:
+    """Write a Tableau .hyper extract file from parsed query-result data.
+
+    Saved alongside the CSV in the same directory with the same stem but a
+    .hyper extension.  Column types are inferred from the first non-None value
+    in each column; all-None columns fall back to text.
+
+    Why only Tableau and not Power BI / Looker Studio / Metabase?
+    Power BI, Looker Studio, and Metabase all accept plain CSV natively and
+    import it without any type guessing or performance penalty at the sizes
+    this system produces.  Tableau is the sole exception: its .hyper format is
+    a proprietary binary extract (Hyper database) that embeds directly into
+    Tableau workbooks and data sources, preserves column types without
+    heuristic inference, and loads significantly faster than CSV for large
+    datasets.  There is no equivalent first-party binary format worth
+    pre-building for the other tools.
+    """
+    from tableauhyperapi import (
+        Connection,
+        CreateMode,
+        HyperProcess,
+        Inserter,
+        SqlType,
+        TableDefinition,
+        TableName,
+        Telemetry,
+    )
+
+    hyper_path = csv_path.with_suffix(".hyper")
+
+    if not data or not isinstance(data[0], dict):
+        # Empty result: write a valid but empty .hyper so downstream callers
+        # always receive a file at the promised path.
+        with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+            with Connection(hyper.endpoint, str(hyper_path), CreateMode.CREATE_AND_REPLACE):
+                pass
+        return hyper_path
+
+    raw_cols = list(data[0].keys())
+    human_cols = [_humanize_column(c) for c in raw_cols]
+
+    # Infer each column's Hyper type from the first non-None value in that column.
+    col_types = []
+    for rc in raw_cols:
+        sample = next((row[rc] for row in data if row.get(rc) is not None), None)
+        col_types.append(_python_to_hyper_type(sample))
+
+    table_def = TableDefinition(
+        TableName("Extract", "Extract"),
+        [TableDefinition.Column(hc, ct) for hc, ct in zip(human_cols, col_types)],
+    )
+
+    with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
+        with Connection(hyper.endpoint, str(hyper_path), CreateMode.CREATE_AND_REPLACE) as conn:
+            conn.catalog.create_schema_if_not_exists("Extract")
+            conn.catalog.create_table_if_not_exists(table_def)
+            with Inserter(conn, table_def) as ins:
+                for row in data:
+                    ins.add_row([row[rc] for rc in raw_cols])
+                ins.execute()
+
+    return hyper_path
+
+
 DETERMINE_CHART_TYPE_SYSTEM_PROMPT = """You are a data visualization expert. Given a user question, \
 determine the most appropriate chart type.
 
@@ -376,14 +522,17 @@ grounded in the question — never a generic placeholder like "best fit" or "see
 
 
 def determine_chart_type(state: SQLAnalystState) -> dict:
-    """Node: given the curated question, choose the chart type to produce.
+    """Node: given the curated question, choose the chart type and export target.
 
     Runs only when wants_visualization=True — the conditional edge from
     add_context routes here only on that path; normal sql_analyst questions
     never reach this node at all.
 
-    Uses ChartTypeSchema via with_structured_output so chart_type_source is
-    always one of the two valid literals and chart_type is never empty.
+    Chart type uses ChartTypeSchema via with_structured_output so chart_type_source
+    is always one of the two valid literals and chart_type is never empty.
+
+    Export target is detected deterministically (no LLM): "tableau" iff the
+    curated question explicitly names Tableau, "csv" otherwise.
     """
     llm = pick_llm("cheap").with_structured_output(ChartTypeSchema)
     result: ChartTypeSchema = llm.invoke(
@@ -396,6 +545,7 @@ def determine_chart_type(state: SQLAnalystState) -> dict:
         "chart_type": result.chart_type,
         "chart_type_source": result.chart_type_source,
         "chart_type_reasoning": result.chart_type_reasoning,
+        "export_target": _detect_export_target(state.curated_question),
     }
 
 
@@ -823,29 +973,28 @@ does not support.
 
 
 def build_visualization(state: SQLAnalystState) -> dict:
-    """Node: write a CSV file from the SQL result and produce an interpretive summary.
+    """Node: write output file(s) from the SQL result and produce an interpretive summary.
 
     Replaces represent_final_answer specifically when wants_visualization=True.
     The normal represent_final_answer node is completely unchanged and still used
     for every non-visualization question.
 
     Steps:
-    1. Parse the execution result and write a real CSV with human-readable headers.
-    2. Ask the cheap LLM for a short, grounded interpretive summary.
-    3. Compose final_answer: file path + chart type + reasoning (if reasoned) + summary.
+    1. Parse the execution result (handles Decimal and datetime from psycopg2).
+    2. Always write a CSV with human-readable headers (universal default output).
+    3. When export_target == "tableau", also write a .hyper extract alongside the CSV.
+    4. Ask the cheap LLM for a short, grounded interpretive summary.
+    5. Compose final_answer: file(s) produced + chart type + reasoning (if reasoned) + summary.
     """
-    # --- Parse result ---
-    try:
-        result_data = ast.literal_eval(state.sql_query_execution_result)
-    except (ValueError, SyntaxError):
-        result_data = []
+    # --- Parse result (handles Decimal / datetime from psycopg2 repr) ---
+    result_data = _parse_sql_result(state.sql_query_execution_result)
 
-    # --- Write CSV ---
+    # --- Write CSV (always, regardless of export_target) ---
     viz_dir = _PROJECT_ROOT / "outputs" / "visualizations"
     viz_dir.mkdir(parents=True, exist_ok=True)
 
     question_slug = re.sub(r"[^a-z0-9]+", "_", state.curated_question.lower())[:40].strip("_")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{question_slug}_{timestamp}.csv"
     output_path = viz_dir / filename
 
@@ -861,6 +1010,11 @@ def build_visualization(state: SQLAnalystState) -> dict:
         # Empty result or unexpected shape — write an empty CSV with a note.
         with open(output_path, "w", newline="") as f:
             f.write("(no data returned)\n")
+
+    # --- Optionally write .hyper extract (Tableau only) ---
+    hyper_path = None
+    if state.export_target == "tableau":
+        hyper_path = _write_hyper_file(result_data, output_path)
 
     # --- Interpretive summary ---
     llm = pick_llm("cheap")
@@ -883,8 +1037,17 @@ def build_visualization(state: SQLAnalystState) -> dict:
     if state.chart_type_source == "reasoned" and state.chart_type_reasoning:
         reasoning_note = f"\nChart type reasoning: {state.chart_type_reasoning}"
 
+    if hyper_path is not None:
+        files_note = (
+            f"Files produced:\n"
+            f"  CSV:    {output_path}\n"
+            f"  Hyper:  {hyper_path}"
+        )
+    else:
+        files_note = f"Visualization data saved to: {output_path}"
+
     final_answer = (
-        f"Visualization data saved to: {output_path}\n"
+        f"{files_note}\n"
         f"Chart type: {state.chart_type}{reasoning_note}\n\n"
         f"Summary: {summary}"
     )

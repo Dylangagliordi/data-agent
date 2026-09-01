@@ -63,6 +63,9 @@ class SQLAnalystState(BaseModel):
     chart_type_source: Literal["explicit", "reasoned"] = "explicit"
     chart_type_reasoning: str = ""
     output_file_path: str = ""
+    # "tableau" only when the curated question explicitly names Tableau;
+    # default "csv" otherwise — detection never guesses from context alone.
+    export_target: Literal["csv", "tableau"] = "csv"
 
 
 class JudgeSchema(BaseModel):

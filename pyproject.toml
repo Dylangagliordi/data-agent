@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
     "requests>=2.34.2",
+    "tableauhyperapi>=0.0.26359",
 ]
 
 [tool.uv]
