@@ -56,13 +56,18 @@ structure to check against pre-load.
 """
 
 import csv
+import json
 import re
 import shutil
 import traceback
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CLEANING_LOG_PATH = _PROJECT_ROOT / "logs" / "cleaning_log.jsonl"
 
 # Missing-values threshold: a column with more than this fraction of nulls/blank is
 # flagged. 5% is a deliberately conservative default — real data almost always has a
@@ -987,6 +992,7 @@ class IssueCleaningRecord:
     status: str = ""
     attempts: int = 0
     error: str = ""
+    generated_code: str = ""
 
 
 @dataclass
@@ -1006,6 +1012,7 @@ class WarnBatchRecord:
     attempts: int = 0
     error: str = ""
     remaining_issues: list = field(default_factory=list)
+    generated_code: str = ""
 
 
 @dataclass
@@ -1392,31 +1399,36 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
     rubric — exactly matching "re-check ONLY this specific issue" for the single-issue
     case, and "re-check the batch" for the warn-level case.
 
-    Returns (status, attempts, error, remaining_issues):
+    Returns (status, attempts, error, remaining_issues, last_code):
     - status: "resolved" | "skipped_declined" | "skipped_failed" | "skipped_incomplete"
     - attempts: how many attempts this group actually took
     - error: the real last error/still-present description (empty if resolved/declined)
     - remaining_issues: which of target_issues are still detected after the last
       attempt (empty unless status == "skipped_incomplete")
+    - last_code: the last code that was approved and executed (empty if declined, or if
+      execution never succeeded); used by clean_dataset() to capture reasoning comments.
     """
     previous_code = ""
     previous_error = ""
     remaining_issues = list(target_issues)
     attempt = 0
+    last_executed_code = ""
 
     while attempt < MAX_CLEAN_ATTEMPTS:
         attempt += 1
         code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
         approved = _request_approval(code, cloned_path)
         if not approved:
-            return "skipped_declined", attempt, "", []
+            return "skipped_declined", attempt, "", [], ""
 
         success, error = _execute_cleaning_code(code, cloned_path)
         if not success:
             previous_code, previous_error = code, error
             if attempt >= MAX_CLEAN_ATTEMPTS:
-                return "skipped_failed", attempt, error, []
+                return "skipped_failed", attempt, error, [], last_executed_code
             continue
+
+        last_executed_code = code
 
         # Execution succeeded — but that alone is not proof this group's issue(s) are
         # actually gone. Re-run check_rubric() against the real result and check
@@ -1427,7 +1439,7 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
         still_present = [issue for issue in remaining_issues if issue in post_issues]
 
         if not still_present:
-            return "resolved", attempt, "", []
+            return "resolved", attempt, "", [], last_executed_code
 
         remaining_issues = still_present
         previous_code = code
@@ -1438,15 +1450,80 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
             + "\n".join(f"- {i}" for i in still_present)
         )
         if attempt >= MAX_CLEAN_ATTEMPTS:
-            return "skipped_incomplete", attempt, previous_error, still_present
+            return "skipped_incomplete", attempt, previous_error, still_present, last_executed_code
 
     # Unreachable in practice (the while loop always returns before falling off the
     # end, since MAX_CLEAN_ATTEMPTS >= 1), but keeps this function's return type
     # honest rather than implicitly returning None if MAX_CLEAN_ATTEMPTS were ever 0.
-    return "skipped_incomplete", attempt, previous_error, remaining_issues
+    return "skipped_incomplete", attempt, previous_error, remaining_issues, last_executed_code
 
 
-def clean_dataset(folder_path, llm=None) -> CleaningResult:
+def _extract_reasoning_comments(code: str) -> list:
+    """Pull the # comment lines from a generated cleaning script — these are the LLM's
+    reasoning about WHY each transformation was applied, not just what it did."""
+    return [line.strip() for line in code.splitlines() if line.strip().startswith("#")]
+
+
+def _append_cleaning_log(result: "CleaningResult", source_folder: str, trigger: str) -> None:
+    """Append one entry to logs/cleaning_log.jsonl capturing this clean_dataset() run.
+    Never raises — a logging failure must not abort a successful cleaning run.
+    """
+    try:
+        files = []
+        all_processed = list(result.cleaned_files) + list(result.skipped_files)
+        for rec in all_processed:
+            table_name = Path(rec.file_name).stem
+
+            issues_found = [
+                {"issue": i, "severity": _issue_severity(i)} for i in rec.issues
+            ]
+
+            fail_entries = []
+            for fir in rec.fail_issue_records:
+                fail_entries.append({
+                    "issue": fir.issue,
+                    "status": fir.status,
+                    "reasoning_comments": _extract_reasoning_comments(fir.generated_code),
+                })
+
+            warn_entry = None
+            if rec.warn_batch is not None:
+                warn_entry = {
+                    "issues": rec.warn_batch.issues,
+                    "status": rec.warn_batch.status,
+                    "reasoning_comments": _extract_reasoning_comments(rec.warn_batch.generated_code),
+                }
+
+            issues_resolved = [i for i in rec.issues if i not in (rec.remaining_issues or [])]
+            files.append({
+                "file_name": rec.file_name,
+                "table_name": table_name,
+                "status": rec.status,
+                "issues_found": issues_found,
+                "row_count_before": rec.row_count_before,
+                "row_count_after": rec.row_count_after,
+                "row_loss_flagged": rec.row_loss_flagged,
+                "issues_resolved": issues_resolved,
+                "issues_still_unresolved": list(rec.remaining_issues or []),
+                "fail_issues": fail_entries,
+                "warn_batch": warn_entry,
+            })
+
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source_folder": source_folder,
+            "trigger": trigger,
+            "files": files,
+        }
+
+        _CLEANING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_CLEANING_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningResult:
     """Process every top-level CSV in folder_path SEPARATELY: run the rubric per file,
     split its issues into fail-level and warn-level (see FAIL_LEVEL_PREFIXES /
     WARN_LEVEL_PREFIXES), and for any file with real issues:
@@ -1512,10 +1589,10 @@ def clean_dataset(folder_path, llm=None) -> CleaningResult:
         # cycle, one at a time, in the order check_rubric() found them — never batched
         # together with the others.
         for issue in fail_issues:
-            status, attempts, error, _remaining = _clean_issue_group(cloned_path, [issue], resolved_llm)
+            status, attempts, error, _remaining, code = _clean_issue_group(cloned_path, [issue], resolved_llm)
             total_attempts += attempts
             fail_issue_records.append(
-                IssueCleaningRecord(issue=issue, status=status, attempts=attempts, error=error)
+                IssueCleaningRecord(issue=issue, status=status, attempts=attempts, error=error, generated_code=code)
             )
             if status == "skipped_declined":
                 declined = True
@@ -1528,7 +1605,7 @@ def clean_dataset(folder_path, llm=None) -> CleaningResult:
         # Skipped entirely if a fail-level issue was declined above.
         if not declined:
             if warn_issues:
-                status, attempts, error, remaining = _clean_issue_group(cloned_path, warn_issues, resolved_llm)
+                status, attempts, error, remaining, code = _clean_issue_group(cloned_path, warn_issues, resolved_llm)
                 total_attempts += attempts
                 warn_batch = WarnBatchRecord(
                     issues=warn_issues,
@@ -1536,6 +1613,7 @@ def clean_dataset(folder_path, llm=None) -> CleaningResult:
                     attempts=attempts,
                     error=error,
                     remaining_issues=remaining,
+                    generated_code=code,
                 )
                 if status == "skipped_declined":
                     declined = True
@@ -1586,4 +1664,5 @@ def clean_dataset(folder_path, llm=None) -> CleaningResult:
             file_record.status = "cleaned"
             result.cleaned_files.append(file_record)
 
+    _append_cleaning_log(result, str(folder), trigger)
     return result

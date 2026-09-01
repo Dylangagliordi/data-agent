@@ -1167,7 +1167,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
 
         for source_folder, table_names in folder_to_tables.items():
             folder_path = Path(source_folder)
-            cleaning_result = clean_dataset(folder_path, llm=_llm)
+            cleaning_result = clean_dataset(folder_path, llm=_llm, trigger="auto_redirect")
 
             all_records = {rec.file_name: rec for rec in cleaning_result.cleaned_files}
             all_records.update({rec.file_name: rec for rec in cleaning_result.skipped_files})
