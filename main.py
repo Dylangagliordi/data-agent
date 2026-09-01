@@ -105,6 +105,17 @@ def log_run(user_question: str, result: dict) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+def _run_question(question: str) -> dict:
+    """Invoke the data-agent graph for question, log the run, and return the result dict."""
+    graph = build_data_agent_graph()
+    result = graph.invoke(
+        DataAgentSchema(messages=[HumanMessage(content=question)]),
+        config={"recursion_limit": 50},
+    )
+    log_run(question, result)
+    return result
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         print(
@@ -114,13 +125,33 @@ def main() -> None:
         )
         sys.exit(1)
 
-    question = sys.argv[1]
-    graph = build_data_agent_graph()
-    result = graph.invoke(
-        DataAgentSchema(messages=[HumanMessage(content=question)]),
-        config={"recursion_limit": 50},
-    )
-    log_run(question, result)
+    raw = sys.argv[1]
+
+    # report last — no re-run, pull the most recent query_log entry and build a report.
+    if raw.strip().lower() == "report last":
+        from utils.generate_report import generate_report, last_query_log_entry
+        entry = last_query_log_entry()
+        if entry is None:
+            print("No entries found in logs/query_log.jsonl — run a query first.", file=sys.stderr)
+            sys.exit(1)
+        report_path = generate_report(entry)
+        print(f"Report: {report_path}")
+        return
+
+    # report: <question> — run the question fresh, then build a report from that run.
+    if raw.startswith("report: "):
+        from utils.generate_report import generate_report, last_query_log_entry
+        question = raw[len("report: "):].strip()
+        result = _run_question(question)
+        print(result["final_answer"])
+        entry = last_query_log_entry()
+        if entry is not None:
+            report_path = generate_report(entry)
+            print(f"\nReport: {report_path}")
+        return
+
+    # Normal question — run through the graph and print the answer.
+    result = _run_question(raw)
     print(result["final_answer"])
 
 
