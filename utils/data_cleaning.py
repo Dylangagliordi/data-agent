@@ -1321,6 +1321,22 @@ def _generate_cleaning_code(
         f"{file_context}\n\n"
         f"Specific issues found in THIS file (fix only these):\n{issue_lines}"
     )
+
+    # Optional per-dataset hints: plain, unstructured English written by the person who
+    # knows this dataset — e.g. "a value of 0 in the quantity column means out-of-stock,
+    # not missing" or "salary ranges should be split into real min/max columns". This is
+    # domain knowledge, not a config format to learn. If data/<NAME>/hints.txt is absent,
+    # behavior is completely unchanged — the file is never required.
+    # The cloned file lives at <dataset>/cleaned/<file>, so hints.txt is at <dataset>/hints.txt.
+    hints_path = file_path.parent.parent / "hints.txt"
+    if hints_path.exists():
+        hints_text = hints_path.read_text().strip()
+        if hints_text:
+            human_content += (
+                f"\n\nDataset-specific context (domain knowledge about this data — "
+                f"treat these facts as authoritative when generating fix code):\n{hints_text}"
+            )
+
     if previous_error:
         human_content += (
             "\n\nA previous attempt at this file's cleaning script did not fully succeed — "

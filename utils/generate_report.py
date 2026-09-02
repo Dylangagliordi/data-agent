@@ -90,6 +90,12 @@ def _cleaning_entries_for_tables(table_names: list) -> dict:
     if not _CLEANING_LOG_PATH.exists() or not table_names:
         return result
 
+    # cleaning_log.jsonl stores table_name from the raw file stem (e.g. "Uncleaned_DS_jobs")
+    # while Postgres (and touched_tables from information_schema) uses lowercase names
+    # (e.g. "uncleaned_ds_jobs"). Normalize both sides at lookup time so real log entries
+    # are found regardless of the original file's casing — the log itself is never changed.
+    normalized_lookup = {t.lower().strip(): t for t in table_names}
+
     lines = _CLEANING_LOG_PATH.read_text().splitlines()
     for line in lines:
         try:
@@ -98,8 +104,10 @@ def _cleaning_entries_for_tables(table_names: list) -> dict:
             continue
         for file_rec in entry.get("files", []):
             tname = file_rec.get("table_name", "")
-            if tname in result:
-                result[tname] = (entry, file_rec)
+            tname_normalized = tname.lower().strip()
+            if tname_normalized in normalized_lookup:
+                original_key = normalized_lookup[tname_normalized]
+                result[original_key] = (entry, file_rec)
     return result
 
 

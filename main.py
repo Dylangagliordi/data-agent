@@ -136,6 +136,7 @@ def main() -> None:
             sys.exit(1)
         report_path = generate_report(entry)
         print(f"Report: {report_path}")
+        print(f'Open with: open "{report_path}"')
         return
 
     # report: <question> — run the question fresh, then build a report from that run.
@@ -148,6 +149,7 @@ def main() -> None:
         if entry is not None:
             report_path = generate_report(entry)
             print(f"\nReport: {report_path}")
+            print(f'Open with: open "{report_path}"')
         return
 
     # Normal question — run through the graph and print the answer.
