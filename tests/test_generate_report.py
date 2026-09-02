@@ -4,7 +4,13 @@ Test 1: plain SQL entry (no chart_type/output_file_path) — all four sections
   present (Introduction, Data Cleaning, Topic Focus, Summary), Visualization
   section correctly OMITTED.
 
-Test 2: visualize entry — Visualization section correctly INCLUDED.
+Test 2a: visualize entry with chart_type_source == "reasoned" — Visualization
+  section includes the real generated SQL, the real reasoning text, and a
+  query-shape note.
+
+Test 2b: visualize entry with chart_type_source == "explicit" — Visualization
+  section includes the real generated SQL and a shape note, but no reasoning
+  text (none was ever generated for explicit selections).
 
 Test 3: table with no cleaning history — Data Cleaning section states this
   honestly (does not fabricate content).
@@ -62,31 +68,92 @@ assert "<h2>Visualization</h2>" not in html1, (
 )
 print("PASS: four sections present, Visualization correctly omitted.\n")
 
-# ── Test 2: visualize entry — Visualization section included ──────────────────
+# ── Test 2a: visualize entry with chart_type_source == "reasoned" ────────────
 print("=" * 70)
-print("TEST 2: visualize entry — Visualization section INCLUDED")
+print("TEST 2a: visualize entry (reasoned) — SQL, reasoning, and shape note present")
 print("=" * 70)
 
 viz_entries = [e for e in entries if e.get("route_response") == "visualize"]
+reasoned_entries = [e for e in viz_entries if e.get("chart_type_source") == "reasoned"]
 
-if not viz_entries:
-    print("SKIP: no visualize entries in query_log.jsonl — create one with 'visualize: ...' first.")
-    print("      (This test will be run during the full integration test below.)\n")
+if not reasoned_entries:
+    print("SKIP: no visualize entries with chart_type_source='reasoned' in query_log.jsonl.\n")
 else:
-    entry2 = viz_entries[-1]
-    print(f"Using entry: {entry2.get('user_question')!r}")
-    report_path2 = generate_report(entry2)
-    html2 = Path(report_path2).read_text()
+    entry2a = reasoned_entries[-1]
+    print(f"Using entry: {entry2a.get('user_question')!r}")
+    report_path2a = generate_report(entry2a)
+    html2a = Path(report_path2a).read_text()
 
-    assert "<h2>Visualization</h2>" in html2, (
-        "Visualization section must be INCLUDED for a visualize entry"
+    assert "<h2>Visualization</h2>" in html2a, (
+        "Visualization section must be present for a visualize entry"
     )
-    chart_type = entry2.get("chart_type", "")
-    if chart_type:
-        assert _esc_check(chart_type, html2), (
-            f"chart_type {chart_type!r} must appear in the Visualization section"
+    chart_type_2a = entry2a.get("chart_type", "")
+    if chart_type_2a:
+        assert _esc_check(chart_type_2a, html2a), (
+            f"chart_type {chart_type_2a!r} must appear in the Visualization section"
         )
-    print(f"PASS: Visualization section included with chart_type={chart_type!r}.\n")
+
+    sql_2a = entry2a.get("generated_sql_query", "")
+    assert sql_2a, "Test entry must have a generated_sql_query"
+    # SQL is rendered in a <pre> block — check a distinctive fragment appears.
+    sql_fragment = sql_2a.split("\n")[0][:40]
+    assert _esc_check(sql_fragment, html2a), (
+        f"Generated SQL must appear in the Visualization section; "
+        f"missing fragment: {sql_fragment!r}"
+    )
+
+    reasoning_2a = entry2a.get("chart_type_reasoning", "")
+    assert reasoning_2a, "Test entry must have chart_type_reasoning for reasoned selection"
+    reasoning_fragment = reasoning_2a[:60]
+    assert _esc_check(reasoning_fragment, html2a), (
+        "chart_type_reasoning must appear in the Visualization section for a reasoned entry"
+    )
+
+    assert "Query shape" in html2a, (
+        "A query-shape note must appear in the Visualization section"
+    )
+    print(f"PASS: Visualization section has SQL, reasoning, and shape note "
+          f"for chart_type={chart_type_2a!r}.\n")
+
+# ── Test 2b: visualize entry with chart_type_source == "explicit" ────────────
+print("=" * 70)
+print("TEST 2b: visualize entry (explicit) — SQL and shape note present, no reasoning")
+print("=" * 70)
+
+explicit_entries = [e for e in viz_entries if e.get("chart_type_source") == "explicit"]
+
+if not explicit_entries:
+    print("SKIP: no visualize entries with chart_type_source='explicit' in query_log.jsonl.\n")
+else:
+    entry2b = explicit_entries[-1]
+    print(f"Using entry: {entry2b.get('user_question')!r}")
+    report_path2b = generate_report(entry2b)
+    html2b = Path(report_path2b).read_text()
+
+    assert "<h2>Visualization</h2>" in html2b, (
+        "Visualization section must be present for a visualize entry"
+    )
+
+    sql_2b = entry2b.get("generated_sql_query", "")
+    assert sql_2b, "Test entry must have a generated_sql_query"
+    sql_fragment_2b = sql_2b.split("\n")[0][:40]
+    assert _esc_check(sql_fragment_2b, html2b), (
+        f"Generated SQL must appear in the Visualization section; "
+        f"missing fragment: {sql_fragment_2b!r}"
+    )
+
+    assert "Query shape" in html2b, (
+        "A query-shape note must appear in the Visualization section"
+    )
+
+    # No reasoning should appear — explicit selection means none was generated.
+    reasoning_2b = entry2b.get("chart_type_reasoning", "")
+    if not reasoning_2b:
+        assert "<strong>Reasoning:</strong>" not in html2b, (
+            "Reasoning block must be omitted when chart_type_reasoning is empty"
+        )
+    print(f"PASS: Visualization section has SQL and shape note but no reasoning "
+          f"for chart_type={entry2b.get('chart_type')!r}.\n")
 
 # ── Test 3: table with no cleaning history ────────────────────────────────────
 print("=" * 70)
@@ -162,5 +229,5 @@ assert Path(report_path4).stat().st_size > 0, "Report file must not be empty"
 print("PASS: generate_report(last_entry) produced a non-empty HTML file.\n")
 
 print("=" * 70)
-print("ALL GENERATE_REPORT TESTS PASSED")
+print("ALL GENERATE_REPORT TESTS PASSED (1, 2a, 2b, 3, 4)")
 print("=" * 70)

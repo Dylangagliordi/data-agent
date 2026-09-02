@@ -296,6 +296,7 @@ def _section_visualization(entry: dict) -> str:
     chart_type_source = entry.get("chart_type_source", "")
     chart_type_reasoning = entry.get("chart_type_reasoning", "")
     output_file_path = entry.get("output_file_path", "")
+    generated_sql = entry.get("generated_sql_query", "")
 
     if not chart_type or not output_file_path:
         return ""
@@ -305,8 +306,28 @@ def _section_visualization(entry: dict) -> str:
         f"<p><strong>Chart type:</strong> {_esc(chart_type)}</p>",
         f"<p><strong>Selection method:</strong> {_esc(chart_type_source)}</p>",
     ]
-    if chart_type_reasoning:
+
+    # Only emit reasoning when the chart type was derived by the model, not named by the user.
+    if chart_type_source == "reasoned" and chart_type_reasoning:
         lines.append(f"<p><strong>Reasoning:</strong> {_esc(chart_type_reasoning)}</p>")
+
+    if generated_sql:
+        lines.append("<p><strong>Generated SQL:</strong></p>")
+        lines.append(f"<pre>{_esc(generated_sql)}</pre>")
+
+        # Derive query shape from the actual SQL — aggregated if GROUP BY is present.
+        if re.search(r"\bGROUP\s+BY\b", generated_sql, re.IGNORECASE):
+            shape_note = (
+                f"Aggregated (GROUP BY present): each output row is a group summary — "
+                f"the right grain for a {chart_type} that compares values across categories."
+            )
+        else:
+            shape_note = (
+                f"Row-level (no GROUP BY): each output row is a source record — "
+                f"the right grain for a {chart_type} that plots individual data points."
+            )
+        lines.append(f"<div class='note'><strong>Query shape:</strong> {_esc(shape_note)}</div>")
+
     lines.append(f"<p><strong>Output file:</strong> <code>{_esc(output_file_path)}</code></p>")
     return "\n".join(lines)
 
