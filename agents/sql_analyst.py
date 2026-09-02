@@ -22,7 +22,32 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DECIMAL_RE = re.compile(r"Decimal\('([^']+)'\)")
 
 
-def _parse_sql_result(result_str: str) -> list:
+def _strip_truncation_marker(result_str: str) -> tuple[str, bool]:
+    """Split execute_sql's truncation note off the front of a result string, if present.
+
+    execute_sql prepends a human-readable bracketed note (starting with
+    _TRUNCATION_MARKER, containing an em-dash and free text — not valid Python) when
+    a query matched more than MAX_RESULT_ROWS rows. That note is followed by
+    "]\\n" and then the actual list-of-dicts repr. Without stripping it first,
+    _parse_sql_result's eval() hits a SyntaxError on the note text and silently
+    returns [] — which build_visualization then can't distinguish from a query that
+    genuinely returned zero rows, producing a false "no data" answer over a result
+    that actually had 200+ real rows.
+
+    Returns (actual_list_repr, was_truncated). When no marker is present, returns
+    (result_str, False) unchanged.
+    """
+    if not result_str.startswith(_TRUNCATION_MARKER):
+        return result_str, False
+    idx = result_str.find("]\n")
+    if idx == -1:
+        # Marker present but the expected closing "]\n" wasn't found — nothing safe
+        # to strip; let the caller's eval fail loudly rather than guess at a split.
+        return result_str, True
+    return result_str[idx + 2:], True
+
+
+def _parse_sql_result(result_str: str) -> tuple[list, bool]:
     """Parse execute_sql's str() repr of a list of dicts.
 
     ast.literal_eval alone cannot handle two psycopg2 types that commonly
@@ -38,8 +63,15 @@ def _parse_sql_result(result_str: str) -> list:
     repr of our own database execution result — not user-supplied text — and
     the SQL that produced it was already cleared by the is_safe judge, so
     the controlled-eval approach is safe here.
+
+    Also strips execute_sql's truncation note (see _strip_truncation_marker) before
+    parsing, so a truncated-but-nonempty result still parses into real data instead
+    of silently becoming []. Returns (parsed_rows, was_truncated) — callers must
+    check was_truncated to disclose a partial result rather than presenting it as
+    complete.
     """
-    cleaned = _DECIMAL_RE.sub(r"\1", result_str)
+    stripped, was_truncated = _strip_truncation_marker(result_str)
+    cleaned = _DECIMAL_RE.sub(r"\1", stripped)
     namespace = {
         "__builtins__": {},
         "datetime": _dt,
@@ -48,10 +80,10 @@ def _parse_sql_result(result_str: str) -> list:
     try:
         result = eval(cleaned, namespace)  # noqa: S307
         if isinstance(result, list):
-            return result
-        return []
+            return result, was_truncated
+        return [], was_truncated
     except Exception:
-        return []
+        return [], was_truncated
 
 _ID_COLUMN_RE = re.compile(r"_id$")
 
@@ -639,8 +671,18 @@ _CHART_SQL_SHAPING: dict = {
         "if there are many categories."
     ),
     "scatter": (
-        "Return the two raw numeric columns unaggregated, one row per entity. "
-        "Do not GROUP BY or aggregate — the chart engine plots individual points."
+        "Identify what the 'entity' being plotted actually is. If each point is meant to "
+        "be an individual raw record (a single transaction, order, job posting, etc.), "
+        "return the two raw numeric columns unaggregated, one row per record — do not "
+        "GROUP BY. But if each point is meant to be a GROUP or CATEGORY (e.g. one point "
+        "per industry, region, product category, customer segment), you MUST GROUP BY "
+        "that category and aggregate both numeric measures (e.g. AVG, COUNT, percentage) "
+        "down to exactly one row per category first — returning raw unaggregated rows in "
+        "that case produces a meaningless plot (hundreds of individual records/duplicated "
+        "category labels instead of one point per category) and silently truncates before "
+        "covering every category. When the question explicitly asks to compare categories "
+        "or groups against each other (not individual records), always aggregate to one "
+        "row per group."
     ),
     "pie": (
         "GROUP BY the category and aggregate. Cap at 5 categories maximum — "
@@ -1009,6 +1051,317 @@ def _humanize_column(col: str) -> str:
     return col.replace("_", " ").title()
 
 
+# ── Chart image rendering ────────────────────────────────────────────────────
+
+
+def _to_float(val):
+    """Safely coerce any value to float; return None if not possible."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _numeric_cols(data: list, cols: list) -> list:
+    """Return subset of cols whose first non-None value parses as float."""
+    if not data:
+        return []
+    first = data[0]
+    return [c for c in cols if _to_float(first.get(c)) is not None]
+
+
+def _chart_bar(ax, data: list, cols: list) -> None:
+    x_labels = [str(r[cols[0]]) for r in data]
+    y_vals = [_to_float(r[cols[1]]) or 0 for r in data] if len(cols) >= 2 else list(range(len(data)))
+    pos = list(range(len(x_labels)))
+    ax.bar(pos, y_vals)
+    ax.set_xticks(pos)
+    ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
+    ax.set_xlabel(_humanize_column(cols[0]))
+    if len(cols) >= 2:
+        ax.set_ylabel(_humanize_column(cols[1]))
+
+
+def _chart_line(ax, data: list, cols: list) -> None:
+    x_labels = [str(r[cols[0]]) for r in data]
+    y_vals = [_to_float(r[cols[1]]) or 0 for r in data] if len(cols) >= 2 else []
+    pos = list(range(len(x_labels)))
+    ax.plot(pos, y_vals, marker="o", linewidth=2, markersize=4)
+    ax.set_xticks(pos)
+    step = max(1, len(x_labels) // 12)
+    ax.set_xticklabels(
+        [lbl if i % step == 0 else "" for i, lbl in enumerate(x_labels)],
+        rotation=45, ha="right", fontsize=8,
+    )
+    ax.set_xlabel(_humanize_column(cols[0]))
+    if len(cols) >= 2:
+        ax.set_ylabel(_humanize_column(cols[1]))
+
+
+def _chart_scatter(ax, data: list, cols: list) -> None:
+    num = _numeric_cols(data, cols)
+    str_cols = [c for c in cols if c not in num]
+    if len(num) >= 2:
+        x_col, y_col = num[0], num[1]
+        label_col = str_cols[0] if str_cols else None
+    elif len(cols) >= 2:
+        x_col, y_col = cols[-2], cols[-1]
+        label_col = None
+    else:
+        return
+    xs = [_to_float(r[x_col]) for r in data]
+    ys = [_to_float(r[y_col]) for r in data]
+    valid_xs = [x for x, y in zip(xs, ys) if x is not None and y is not None]
+    valid_ys = [y for x, y in zip(xs, ys) if x is not None and y is not None]
+    if not valid_xs:
+        return
+    ax.scatter(valid_xs, valid_ys, alpha=0.7, s=60)
+    if label_col:
+        for i, row in enumerate(data):
+            xi, yi = _to_float(row[x_col]), _to_float(row[y_col])
+            if xi is not None and yi is not None:
+                ax.annotate(str(row[label_col]), (xi, yi), fontsize=6, alpha=0.8,
+                            xytext=(3, 3), textcoords="offset points")
+    ax.set_xlabel(_humanize_column(x_col))
+    ax.set_ylabel(_humanize_column(y_col))
+
+
+def _chart_pie(ax, data: list, cols: list, donut: bool = False) -> None:
+    if len(cols) < 2:
+        return
+    labels = [str(r[cols[0]]) for r in data]
+    vals = [abs(_to_float(r[cols[1]]) or 0) for r in data]
+    if sum(vals) == 0:
+        return
+    wedge_kw = {"width": 0.5} if donut else {}
+    ax.pie(vals, labels=labels, autopct="%1.1f%%", wedgeprops=wedge_kw)
+
+
+def _chart_histogram(ax, data: list, cols: list) -> None:
+    num = _numeric_cols(data, cols)
+    col = num[0] if num else cols[0]
+    vals = [_to_float(r[col]) for r in data if _to_float(r.get(col)) is not None]
+    if not vals:
+        return
+    ax.hist(vals, bins=min(20, max(5, len(vals) // 5)), edgecolor="black", alpha=0.7)
+    ax.set_xlabel(_humanize_column(col))
+    ax.set_ylabel("Count")
+
+
+def _chart_box(ax, data: list, cols: list) -> None:
+    if len(cols) >= 2:
+        groups: dict = {}
+        for row in data:
+            g = str(row[cols[0]])
+            v = _to_float(row[cols[1]])
+            if v is not None:
+                groups.setdefault(g, []).append(v)
+        if not groups:
+            return
+        group_labels = list(groups.keys())
+        # tick_labels= is the current API (≥3.9); fall back for older versions.
+        try:
+            ax.boxplot([groups[g] for g in group_labels], tick_labels=group_labels, vert=True)
+        except TypeError:
+            ax.boxplot([groups[g] for g in group_labels], vert=True)
+            ax.set_xticks(range(1, len(group_labels) + 1))
+            ax.set_xticklabels(group_labels, rotation=45, ha="right", fontsize=8)
+        ax.set_xlabel(_humanize_column(cols[0]))
+        ax.set_ylabel(_humanize_column(cols[1]))
+    else:
+        vals = [_to_float(r[cols[0]]) for r in data if _to_float(r.get(cols[0])) is not None]
+        if not vals:
+            return
+        ax.boxplot(vals)
+        ax.set_ylabel(_humanize_column(cols[0]))
+
+
+def _chart_stacked_bar(ax, data: list, cols: list) -> None:
+    import numpy as np
+    if len(cols) < 3:
+        _chart_bar(ax, data, cols)
+        return
+    pivot: dict = {}
+    subcat_order: list = []
+    for row in data:
+        cat = str(row[cols[0]])
+        sub = str(row[cols[1]])
+        val = _to_float(row[cols[2]]) or 0
+        pivot.setdefault(cat, {})[sub] = val
+        if sub not in subcat_order:
+            subcat_order.append(sub)
+    categories = list(pivot.keys())
+    bottom = np.zeros(len(categories))
+    for i, sc in enumerate(subcat_order):
+        vals = [pivot[cat].get(sc, 0) for cat in categories]
+        ax.bar(categories, vals, bottom=bottom, label=sc, color=f"C{i % 10}")
+        bottom += np.array(vals)
+    ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8)
+    ax.set_xlabel(_humanize_column(cols[0]))
+    ax.set_ylabel(_humanize_column(cols[2]))
+    ax.legend(title=_humanize_column(cols[1]), bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+
+
+def _squarify_rects(sizes, x=0.0, y=0.0, width=1.0, height=1.0) -> list:
+    """Minimal squarify layout — returns list of (x, y, w, h) tuples.
+
+    Uses the squarify slice-and-dice algorithm so treemaps render without
+    relying on the external squarify package (which uses deprecated
+    matplotlib.cm.get_cmap in v0.4.4 and fails on matplotlib ≥3.9).
+    """
+    total = sum(sizes)
+    if not sizes or total == 0:
+        return []
+    rects = []
+    remaining = list(sizes)
+    rx, ry, rw, rh = x, y, width, height
+    while remaining:
+        if rw >= rh:
+            # Slice vertically
+            slc_w = rw * remaining[0] / sum(remaining)
+            col_sizes = []
+            col_total = 0.0
+            for s in remaining:
+                if col_total + s <= sum(remaining) * slc_w / rw + 1e-9:
+                    col_sizes.append(s)
+                    col_total += s
+                else:
+                    break
+            if not col_sizes:
+                col_sizes = [remaining[0]]
+            slc_w = rw * sum(col_sizes) / sum(remaining)
+            cy = ry
+            for s in col_sizes:
+                ch = rh * s / sum(col_sizes)
+                rects.append((rx, cy, slc_w, ch))
+                cy += ch
+            remaining = remaining[len(col_sizes):]
+            rx += slc_w
+            rw -= slc_w
+        else:
+            # Slice horizontally
+            slc_h = rh * remaining[0] / sum(remaining)
+            row_sizes = []
+            row_total = 0.0
+            for s in remaining:
+                if row_total + s <= sum(remaining) * slc_h / rh + 1e-9:
+                    row_sizes.append(s)
+                    row_total += s
+                else:
+                    break
+            if not row_sizes:
+                row_sizes = [remaining[0]]
+            slc_h = rh * sum(row_sizes) / sum(remaining)
+            cx = rx
+            for s in row_sizes:
+                cw = rw * s / sum(row_sizes)
+                rects.append((cx, ry, cw, slc_h))
+                cx += cw
+            remaining = remaining[len(row_sizes):]
+            ry += slc_h
+            rh -= slc_h
+    return rects
+
+
+def _chart_treemap(fig, data: list, cols: list) -> None:
+    ax = fig.add_subplot(111)
+    if len(cols) < 2:
+        return
+    labels = [str(r[cols[0]]) for r in data]
+    sizes = [abs(_to_float(r[cols[-1]]) or 0) for r in data]
+    if sum(sizes) == 0:
+        return
+
+    from matplotlib.patches import FancyBboxPatch
+
+    rects = _squarify_rects(sizes)
+    colors = [f"C{i % 10}" for i in range(len(labels))]
+    for (x, y, w, h), label, color in zip(rects, labels, colors):
+        patch = FancyBboxPatch(
+            (x + 0.005, y + 0.005), max(w - 0.01, 0.001), max(h - 0.01, 0.001),
+            linewidth=1, edgecolor="white", facecolor=color, alpha=0.85,
+            boxstyle="round,pad=0",
+        )
+        ax.add_patch(patch)
+        if w > 0.05 and h > 0.03:
+            ax.text(
+                x + w / 2, y + h / 2, label,
+                ha="center", va="center", fontsize=min(8, max(5, int(w * 60))),
+                wrap=True, clip_on=True,
+            )
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    ax.set_title(f"Treemap: {_humanize_column(cols[-1])}")
+
+
+def _render_chart_image(data: list, chart_type: str, csv_path: Path) -> "Path | None":
+    """Render a matplotlib chart from query result data and save as <csv_path>.png.
+
+    Returns the .png Path on success, None on failure (any exception is caught
+    and logged to stderr so the caller can still return the CSV unaffected).
+    Uses the Figure/FigureCanvasAgg API (no pyplot global state) for safe
+    non-interactive server-side rendering.
+    """
+    if not data or not isinstance(data[0], dict):
+        return None
+
+    png_path = csv_path.with_suffix(".png")
+    cols = list(data[0].keys())
+    ct = chart_type.lower()
+
+    try:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(10, 6))
+        FigureCanvasAgg(fig)
+
+        if "stacked bar" in ct:
+            ax = fig.add_subplot(111)
+            _chart_stacked_bar(ax, data, cols)
+        elif "treemap" in ct:
+            _chart_treemap(fig, data, cols)
+        elif "line" in ct:
+            ax = fig.add_subplot(111)
+            _chart_line(ax, data, cols)
+        elif "bar" in ct:
+            ax = fig.add_subplot(111)
+            _chart_bar(ax, data, cols)
+        elif "scatter" in ct:
+            ax = fig.add_subplot(111)
+            _chart_scatter(ax, data, cols)
+        elif "donut" in ct:
+            ax = fig.add_subplot(111)
+            _chart_pie(ax, data, cols, donut=True)
+        elif "pie" in ct:
+            ax = fig.add_subplot(111)
+            _chart_pie(ax, data, cols, donut=False)
+        elif "histogram" in ct:
+            ax = fig.add_subplot(111)
+            _chart_histogram(ax, data, cols)
+        elif "box" in ct:
+            ax = fig.add_subplot(111)
+            _chart_box(ax, data, cols)
+        else:
+            ax = fig.add_subplot(111)
+            _chart_bar(ax, data, cols)
+
+        fig.tight_layout()
+        fig.savefig(str(png_path), dpi=150, bbox_inches="tight")
+        return png_path
+
+    except Exception as exc:
+        import sys as _sys
+        print(
+            f"[chart render] failed for chart_type={chart_type!r}: {type(exc).__name__}: {exc}",
+            file=_sys.stderr,
+        )
+        return None
+
+
 BUILD_VISUALIZATION_SUMMARY_SYSTEM_PROMPT = """You are a data analyst writing a brief \
 interpretive summary of a SQL query result for a chart.
 
@@ -1035,7 +1388,11 @@ def build_visualization(state: SQLAnalystState) -> dict:
     5. Compose final_answer: file(s) produced + chart type + reasoning (if reasoned) + summary.
     """
     # --- Parse result (handles Decimal / datetime from psycopg2 repr) ---
-    result_data = _parse_sql_result(state.sql_query_execution_result)
+    # was_truncated is True when execute_sql capped the result at MAX_RESULT_ROWS —
+    # the chart/CSV below is still built from the real (partial) rows returned, but
+    # the final answer must say so explicitly rather than presenting a sample as if
+    # it were the complete picture.
+    result_data, was_truncated = _parse_sql_result(state.sql_query_execution_result)
 
     # --- Write CSV (always, regardless of export_target) ---
     viz_dir = _PROJECT_ROOT / "outputs" / "visualizations"
@@ -1064,6 +1421,12 @@ def build_visualization(state: SQLAnalystState) -> dict:
     if state.export_target == "tableau":
         hyper_path = _write_hyper_file(result_data, output_path)
 
+    # --- Render chart image (always, regardless of export_target) ---
+    # _render_chart_image catches all exceptions internally; a None return means
+    # rendering failed and we report that honestly in final_answer.
+    chart_png: "Path | None" = _render_chart_image(result_data, state.chart_type, output_path)
+    chart_image_path_str = str(chart_png) if chart_png is not None else ""
+
     # --- Interpretive summary ---
     llm = pick_llm("cheap")
     sample = result_data[:10] if isinstance(result_data, list) else []
@@ -1085,6 +1448,14 @@ def build_visualization(state: SQLAnalystState) -> dict:
     if state.chart_type_source == "reasoned" and state.chart_type_reasoning:
         reasoning_note = f"\nChart type reasoning: {state.chart_type_reasoning}"
 
+    truncation_note = ""
+    if was_truncated:
+        truncation_note = (
+            f"\n\nNote: this query matched more rows than could be retrieved "
+            f"(results are capped at {MAX_RESULT_ROWS} rows) — the chart and CSV "
+            "below are built from only that partial sample, not the full result set."
+        )
+
     if hyper_path is not None:
         files_note = (
             f"Files produced:\n"
@@ -1094,14 +1465,21 @@ def build_visualization(state: SQLAnalystState) -> dict:
     else:
         files_note = f"Visualization data saved to: {output_path}"
 
+    if chart_png is not None:
+        files_note += f"\n  Chart:  {chart_png}"
+        chart_render_note = ""
+    else:
+        chart_render_note = "\nNote: Chart image rendering failed — see stderr for details."
+
     final_answer = (
         f"{files_note}\n"
-        f"Chart type: {state.chart_type}{reasoning_note}\n\n"
+        f"Chart type: {state.chart_type}{reasoning_note}{chart_render_note}{truncation_note}\n\n"
         f"Summary: {summary}"
     )
 
     return {
         "output_file_path": str(output_path),
+        "chart_image_path": chart_image_path_str,
         "final_answer": final_answer,
         "messages": [AIMessage(content=final_answer)],
     }

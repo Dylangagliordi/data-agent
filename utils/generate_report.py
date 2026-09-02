@@ -6,12 +6,16 @@ Every section is built ONLY from real, traceable data — never invented:
 1. Introduction — dataset name, live row/column counts, the actual question asked,
    and which cleaning issues (if any) were found for the relevant table(s).
 2. Data Cleaning — pulled directly from cleaning_log.jsonl for the touched tables;
-   if no cleaning history exists, states that honestly.
+   if no cleaning history exists, states that honestly. Includes a real, live
+   before/after numeric comparison for the most impactful fail-level issue.
 3. Topic Focus — one pick_llm("cheap") call grounded in the actual question + result.
 4. Visualization — ONLY for visualize: entries with chart_type/output_file_path set.
+   Embeds the chart image directly when chart_image_path is present. Derives
+   plain-English "Assumptions" from the real WHERE/HAVING clauses in generated_sql_query.
 5. Summary — one pick_llm("cheap") call synthesizing only from assembled facts.
 """
 
+import base64
 import html
 import json
 import re
@@ -109,6 +113,228 @@ def _cleaning_entries_for_tables(table_names: list) -> dict:
                 original_key = normalized_lookup[tname_normalized]
                 result[original_key] = (entry, file_rec)
     return result
+
+
+# ── Before/after cleaning comparison (Part 3) ────────────────────────────────
+
+def _parse_placeholder_issue(issue_text: str) -> "dict | None":
+    """Parse a placeholder-value issue to extract column, count, and placeholder values.
+
+    Returns {"column": str, "count": int, "placeholders": list[str]} or None.
+    Matches the standard format produced by utils/data_cleaning.py:
+      "Placeholder values: column 'ColName' has N value(s) that look like
+       placeholders standing in for real data (['val1', 'val2']), ..."
+    """
+    m = re.search(
+        r"column\s+'([^']+)'\s+has\s+(\d+)\s+value\(s\).*?\(\[(.+?)\]\)",
+        issue_text, re.DOTALL,
+    )
+    if not m:
+        return None
+    col = m.group(1)
+    count = int(m.group(2))
+    placeholders_raw = m.group(3)
+    placeholders = re.findall(r"'([^']*)'", placeholders_raw)
+    if not placeholders:
+        placeholders = [v.strip() for v in placeholders_raw.split(",") if v.strip()]
+    return {"column": col, "count": count, "placeholders": placeholders}
+
+
+def _biggest_fail_placeholder(file_rec: dict) -> "dict | None":
+    """Return the parsed placeholder issue with the highest affected-value count
+    among all fail-severity issues in file_rec["issues_found"], or None if there
+    is no parseable placeholder issue.
+    """
+    fail_issues = [i for i in file_rec.get("issues_found", []) if i.get("severity") == "fail"]
+    parsed = []
+    for issue in fail_issues:
+        p = _parse_placeholder_issue(issue.get("issue", ""))
+        if p:
+            parsed.append(p)
+    if not parsed:
+        return None
+    return max(parsed, key=lambda p: p["count"])
+
+
+def _compute_before_after(db_table: str, biggest: dict) -> "dict | None":
+    """Run two real COUNT queries against the live table to produce a before/after
+    comparison for the given placeholder issue.
+
+    db_table: the Postgres table name (lowercase, as found in information_schema).
+    biggest:  result of _biggest_fail_placeholder — contains column, count, placeholders.
+
+    Returns a dict with keys: clean, unclean, column, placeholders_str, count,
+    resolved (bool), explanation (str). Returns None if any DB step fails or the
+    column can't be matched.
+
+    Uses only read-only app_reader connections — no writes.
+    """
+    from utils.db import get_app_reader_connection
+
+    col_raw = biggest["column"]
+    placeholders = biggest["placeholders"]
+    affected_count = biggest["count"]
+
+    conn = get_app_reader_connection()
+    try:
+        with conn.cursor() as cur:
+            # Case-insensitive column lookup against information_schema.
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = %s",
+                (db_table,),
+            )
+            db_columns = [row[0] for row in cur.fetchall()]
+
+        matching_col = next(
+            (c for c in db_columns if c.lower() == col_raw.lower()), None
+        )
+        if not matching_col:
+            return None
+
+        ph_str = ", ".join(f"'{p}'" for p in placeholders)
+        placeholders_sql = ", ".join(["%s"] * len(placeholders))
+
+        with conn.cursor() as cur:
+            # Check whether placeholder values still exist in the table.
+            cur.execute(
+                f'SELECT COUNT(*) FROM "{db_table}" '
+                f'WHERE "{matching_col}" IN ({placeholders_sql})',
+                tuple(placeholders),
+            )
+            (existing_count,) = cur.fetchone()
+
+        if existing_count > 0:
+            # Issue unresolved — placeholders still in the table.
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'SELECT COUNT(*) FROM "{db_table}" '
+                    f'WHERE "{matching_col}" IS NOT NULL '
+                    f'AND "{matching_col}" NOT IN ({placeholders_sql})',
+                    tuple(placeholders),
+                )
+                (clean_count,) = cur.fetchone()
+
+                cur.execute(f'SELECT COUNT(*) FROM "{db_table}"')
+                (unclean_count,) = cur.fetchone()
+
+            diff = unclean_count - clean_count
+            explanation = (
+                f"Rows with a valid {col_raw} (excluding placeholder {ph_str}): "
+                f"{clean_count:,}. "
+                f"Total rows including placeholders: {unclean_count:,}. "
+                f"Difference: {diff:,} rows where {col_raw} = {ph_str}."
+            )
+            return {
+                "clean": clean_count,
+                "unclean": unclean_count,
+                "column": col_raw,
+                "placeholders_str": ph_str,
+                "count": affected_count,
+                "resolved": False,
+                "explanation": explanation,
+            }
+        else:
+            # Issue resolved — placeholders removed or replaced with NULL.
+            with conn.cursor() as cur:
+                cur.execute(f'SELECT COUNT(*) FROM "{db_table}"')
+                (clean_count,) = cur.fetchone()
+
+            unclean_sim = clean_count + affected_count
+            explanation = (
+                f"After cleaning: {clean_count:,} rows in {db_table}. "
+                f"Before cleaning: approximately {unclean_sim:,} rows — "
+                f"cleaning removed {affected_count:,} rows where "
+                f"{col_raw} = {ph_str}."
+            )
+            return {
+                "clean": clean_count,
+                "unclean": unclean_sim,
+                "column": col_raw,
+                "placeholders_str": ph_str,
+                "count": affected_count,
+                "resolved": True,
+                "explanation": explanation,
+            }
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+# ── Query assumption extraction (Part 4) ─────────────────────────────────────
+
+# Placeholder-like literal values that signal a non-obvious exclusion filter.
+_PLACEHOLDER_LITERALS = {"-1", "n/a", "na", "unknown", "none", "#n/a", "0", ""}
+
+
+def _extract_query_assumptions(sql_query: str) -> list:
+    """Derive plain-English assumption statements from the real WHERE/HAVING clauses.
+
+    Only surfaces non-obvious filters — placeholder-value exclusions
+    (col <> '-1'), regex/LIKE pattern matches, and HAVING COUNT thresholds.
+    Standard NULL checks (col IS NOT NULL) are considered obvious and omitted.
+
+    All statements are derived mechanically from the actual SQL text; nothing
+    is invented or inferred from context outside the query.
+    """
+    if not sql_query:
+        return []
+
+    assumptions = []
+    seen: set = set()  # dedup
+
+    def add(text: str) -> None:
+        if text not in seen:
+            seen.add(text)
+            assumptions.append(text)
+
+    # 1. Placeholder-value exclusion: col <> 'value' or col != 'value'
+    for col, val in re.findall(
+        r"\b(\w+)\s*(?:<>|!=)\s*'([^']*)'", sql_query, re.IGNORECASE
+    ):
+        if val.lower() in _PLACEHOLDER_LITERALS:
+            add(
+                f"Rows where {col} equals '{val}' (a placeholder value) "
+                f"were excluded from this analysis."
+            )
+
+    # 2. Multi-value NOT IN exclusion with string literals.
+    for col, values_str in re.findall(
+        r"\b(\w+)\s+NOT\s+IN\s*\(([^)]+)\)", sql_query, re.IGNORECASE
+    ):
+        values = re.findall(r"'([^']*)'", values_str)
+        if values:
+            vals_fmt = ", ".join(f"'{v}'" for v in values)
+            add(f"Rows where {col} is {vals_fmt} were excluded.")
+
+    # 3. Regex/pattern match: col ~ 'pattern'
+    for col, pattern in re.findall(
+        r"\b(\w+)\s*~\s*'([^']*)'", sql_query, re.IGNORECASE
+    ):
+        add(
+            f"Only rows where {col} matches the pattern '{pattern}' were included "
+            f"(rows not matching this format were excluded)."
+        )
+
+    # 4. LIKE pattern match
+    for col, pattern in re.findall(
+        r"\b(\w+)\s+LIKE\s+'([^']*)'", sql_query, re.IGNORECASE
+    ):
+        add(f"Only rows where {col} matches the pattern '{pattern}' were included.")
+
+    # 5. HAVING COUNT(*) >= N threshold
+    m = re.search(
+        r"\bHAVING\b.*?\bCOUNT\b\s*\(\s*\*?\s*\)\s*>=?\s*(\d+)",
+        sql_query, re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        add(
+            f"Groups with fewer than {m.group(1)} rows were excluded "
+            f"to ensure statistical reliability."
+        )
+
+    return assumptions
 
 
 # ── HTML helpers ───────────────────────────────────────────────────────────────
@@ -260,6 +486,52 @@ def _section_data_cleaning(cleaning_map: dict) -> str:
             parts.append("<p><strong>Reasoning from generated fix code:</strong></p>")
             parts.append("<pre>" + _esc("\n".join(all_comments)) + "</pre>")
 
+        # ── Real before/after numeric comparison for the biggest fail issue ──
+        parts.append("<h4 style='margin-top:16px'>Before/After Cleaning Impact</h4>")
+        biggest = _biggest_fail_placeholder(file_rec)
+        if biggest is None:
+            parts.append(
+                "<div class='note'>No placeholder-value fail issue was found for this table "
+                "— a concrete before/after numeric comparison cannot be automatically "
+                "computed for other issue types (e.g. column misalignment).</div>"
+            )
+        else:
+            try:
+                comparison = _compute_before_after(tname, biggest)
+            except Exception:
+                comparison = None
+
+            if comparison is None:
+                parts.append(
+                    "<div class='note'>A before/after comparison could not be computed "
+                    f"for the column '{_esc(biggest['column'])}' — the column may not "
+                    "exist in the current table schema.</div>"
+                )
+            else:
+                state_label = (
+                    "Cleaning resolved this issue (placeholder values removed)"
+                    if comparison["resolved"]
+                    else "Issue still unresolved (placeholder values remain in table)"
+                )
+                parts.append(
+                    "<table><thead><tr>"
+                    "<th>Scenario</th><th>Row count</th><th>Note</th>"
+                    "</tr></thead><tbody>"
+                    f"<tr><td>After cleaning (current)</td>"
+                    f"<td>{comparison['clean']:,}</td>"
+                    f"<td>Rows with valid <code>{_esc(comparison['column'])}</code></td></tr>"
+                    f"<tr><td>Before cleaning (simulated)</td>"
+                    f"<td>{comparison['unclean']:,}</td>"
+                    f"<td>Includes {comparison['count']:,} rows where "
+                    f"<code>{_esc(comparison['column'])}</code> = "
+                    f"{_esc(comparison['placeholders_str'])}</td></tr>"
+                    "</tbody></table>"
+                )
+                parts.append(
+                    f"<p class='note'><strong>Impact:</strong> {_esc(comparison['explanation'])} "
+                    f"({_esc(state_label)}.)</p>"
+                )
+
     return "\n".join(parts)
 
 
@@ -296,6 +568,7 @@ def _section_visualization(entry: dict) -> str:
     chart_type_source = entry.get("chart_type_source", "")
     chart_type_reasoning = entry.get("chart_type_reasoning", "")
     output_file_path = entry.get("output_file_path", "")
+    chart_image_path = entry.get("chart_image_path", "")
     generated_sql = entry.get("generated_sql_query", "")
 
     if not chart_type or not output_file_path:
@@ -310,6 +583,28 @@ def _section_visualization(entry: dict) -> str:
     # Only emit reasoning when the chart type was derived by the model, not named by the user.
     if chart_type_source == "reasoned" and chart_type_reasoning:
         lines.append(f"<p><strong>Reasoning:</strong> {_esc(chart_type_reasoning)}</p>")
+
+    # ── Chart image (Part 2) ─────────────────────────────────────────────────
+    if chart_image_path:
+        img_path = Path(chart_image_path)
+        if img_path.exists():
+            b64 = base64.b64encode(img_path.read_bytes()).decode("ascii")
+            lines.append(
+                f'<img src="data:image/png;base64,{b64}" '
+                f'style="max-width:100%;height:auto;border:1px solid #ddd;'
+                f'border-radius:6px;margin:12px 0;display:block" alt="Chart">'
+            )
+        else:
+            lines.append(
+                "<div class='note'>Chart image file was referenced in the log but "
+                "could not be found on disk — it may have been moved or deleted.</div>"
+            )
+    else:
+        lines.append(
+            "<div class='note'>No chart image is available for this entry — "
+            "either it predates automatic image rendering or rendering failed. "
+            "The CSV output file is still available below.</div>"
+        )
 
     if generated_sql:
         lines.append("<p><strong>Generated SQL:</strong></p>")
@@ -327,6 +622,14 @@ def _section_visualization(entry: dict) -> str:
                 f"the right grain for a {chart_type} that plots individual data points."
             )
         lines.append(f"<div class='note'><strong>Query shape:</strong> {_esc(shape_note)}</div>")
+
+        # ── Query assumptions (Part 4) ────────────────────────────────────────
+        assumptions = _extract_query_assumptions(generated_sql)
+        if assumptions:
+            lines.append("<p><strong>Assumptions:</strong></p><ul>")
+            for a in assumptions:
+                lines.append(f"<li>{_esc(a)}</li>")
+            lines.append("</ul>")
 
     lines.append(f"<p><strong>Output file:</strong> <code>{_esc(output_file_path)}</code></p>")
     return "\n".join(lines)

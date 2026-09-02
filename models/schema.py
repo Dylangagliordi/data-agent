@@ -67,6 +67,12 @@ class SQLAnalystState(BaseModel):
     # default "csv" otherwise — detection never guesses from context alone.
     export_target: Literal["csv", "tableau"] = "csv"
 
+    # Set by build_visualization to the .png file path when chart rendering
+    # succeeds; empty string when rendering failed or was not attempted (i.e.
+    # for every non-visualization run). Persisted in query_log.jsonl alongside
+    # chart_type and output_file_path.
+    chart_image_path: str = ""
+
 
 class JudgeSchema(BaseModel):
     """Structured output schema for the safety-judge node only.

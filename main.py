@@ -80,6 +80,7 @@ def log_run(user_question: str, result: dict) -> None:
                 "is_safe": sql_state.get("is_safe", ""),
                 "sql_query_execution_result": sql_state.get("sql_query_execution_result", ""),
                 "output_file_path": sql_state.get("output_file_path", ""),
+                "chart_image_path": sql_state.get("chart_image_path", ""),
                 "final_answer": result.get("final_answer", ""),
             }
         )
