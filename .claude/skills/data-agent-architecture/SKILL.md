@@ -187,6 +187,7 @@ CREATE TABLE _data_quality_status (
 | `_detect_fanout_warnings` | Deterministic fan-out check: live `COUNT(*)/COUNT(DISTINCT)` queries against real data. |
 | `_parse_sql_result` | Parses psycopg2 `str()` repr; handles `Decimal` and `datetime` types via controlled `eval()`. |
 | `_chart_shaping_instruction` | Returns SQL-shaping instructions per chart type for `generate_sql`'s prompt. |
+| `_ranking_convention_disclosure` | Deterministic (no LLM) extractor: pulls the real `HAVING COUNT(*) >= N` minimum-sample threshold and/or a multi-column `ORDER BY` combined ranking straight out of `generated_sql_query` text, returning a plain-English disclosure string (`""` if the query has neither). Appended to `final_answer` by both `represent_final_answer` and `build_visualization` whenever non-empty — mandatory, not prompt-dependent. Added after a real inconsistency where "which industry maximizes both salary and satisfaction" produced different top results across runs (`generate_sql` picked a different sample-size threshold and sort order each call). `GENERATE_SQL_SYSTEM_PROMPT` also now states a FIXED convention (`HAVING COUNT(*) >= 5`) for any per-category ranking by an averaged/rate metric. See `tests/test_ranking_consistency.py`. |
 
 **SQL analyst graph wiring:**
 ```

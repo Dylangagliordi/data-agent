@@ -595,9 +595,26 @@ column (e.g. `'Gold' AS loyalty_tier`) that pretends the action happened. Write 
 that answers whatever part of the question is genuinely a read (e.g. "which customers spent \
 the most"), and leave it at that — do not invent columns representing an action never executed.
 - Do not return unbounded full-table results when the question implies a small, specific \
-answer (e.g. "the top customer(s)", "which category", "how many") — use LIMIT, aggregation, \
+answer (e.g. the top customer(s), which category, how many) — use LIMIT, aggregation, \
 or WHERE clauses so the result set is reasonably sized. Only omit a LIMIT if the question \
 genuinely calls for every matching row.
+- Minimum sample size for per-category ranking (FIXED PROJECT CONVENTION — do not pick your \
+own number): whenever a question asks you to rank, compare, or identify the best/top/ \
+highest category by an averaged or rate-based metric (e.g. which industry has the best \
+X, which state has the highest average Y), you MUST add HAVING COUNT(*) >= 5 (using \
+whatever the grouped row-count actually represents — job postings, orders, customers, etc.) \
+unless the question itself states a different minimum explicitly. This value is fixed at 5 \
+project-wide specifically so the same question produces the same included/excluded categories \
+every time it's asked — it is NOT a judgment call to make fresh per query. A category with \
+only 1-4 underlying rows is one anecdote, not a reliable average, and letting it in or out \
+inconsistently is exactly the kind of silent variance this rule exists to prevent.
+- Combined-metric ranking transparency: when a question asks to optimize for more than one \
+metric at once (e.g. maximize both salary and job satisfaction), you must use a real, \
+explicit ORDER BY over both metrics (e.g. ORDER BY primary_metric DESC, secondary_metric \
+DESC) — never silently pick only one metric to sort by while mentioning the other only in \
+prose. Put what you consider the primary metric first in the ORDER BY; this ordering is \
+extracted mechanically from your SQL afterward and disclosed to the user automatically, so it \
+must genuinely reflect the ranking logic you used, not just look plausible.
 - Fan-out / grain check: before writing an aggregation (SUM, AVG, COUNT, etc.) that spans \
 more than one table, consider whether any joined table could have more than one row per the \
 unit you are measuring (e.g. more than one row per order, per product, per customer). Joining \
@@ -658,6 +675,110 @@ def _strip_sql_formatting(text: str) -> str:
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
     return cleaned
+
+
+# ── Deterministic ranking-convention disclosure ─────────────────────────────
+#
+# Root cause of the "Video Games appears in one run but not the other" bug: a
+# question like "which industry should I pursue to maximize both salary and job
+# satisfaction" has no single obvious SQL translation — there is no fixed answer
+# to "what's the minimum sample size per industry?" or "how do you combine two
+# separate metrics into one ranking?" generate_sql is an LLM making that judgment
+# call fresh on every single invocation, with nothing constraining it to answer
+# the same way twice. One run used HAVING COUNT(*) >= 5 (excluding Video Games,
+# which only has 3 job postings); a second run used HAVING COUNT(*) >= 3
+# (including it) and also sorted by a different primary metric.
+#
+# The fix has two parts:
+# 1. GENERATE_SQL_SYSTEM_PROMPT now states a FIXED convention (>= 5) so this
+#    specific class of query stops varying between runs (see the prompt rule
+#    above this function).
+# 2. Even fixing the convention doesn't guarantee zero variance forever (a new
+#    question shape, a future prompt edit, a different model) — so, following
+#    the same lesson already applied to fan-out detection and truncation
+#    handling elsewhere in this file, the actual threshold and combination
+#    method the executed query relied on are extracted MECHANICALLY from the
+#    real SQL text (never re-asked of an LLM, never left to a summarizer's
+#    discretion) and appended to final_answer deterministically, every time —
+#    so even if some variance remains, the user is never misled about what
+#    "top"/"best" specifically meant for that particular run.
+_MIN_SAMPLE_HAVING_RE = re.compile(
+    r"\bHAVING\b.*?\bCOUNT\s*\(\s*\*?\s*\)\s*>=?\s*(\d+)", re.IGNORECASE | re.DOTALL
+)
+_ORDER_BY_CLAUSE_RE = re.compile(
+    r"\bORDER BY\b(.*?)(?=\bLIMIT\b|;|$)", re.IGNORECASE | re.DOTALL
+)
+
+
+def _split_top_level_commas(text: str) -> list:
+    """Split a SQL expression list on commas that are not inside parentheses."""
+    parts, depth, current = [], 0, []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _ranking_convention_disclosure(sql_query: str) -> str:
+    """Mechanically derive a plain-English disclosure of any unstated judgment call
+    baked into the executed SQL: a minimum-sample-size threshold (HAVING COUNT(*) >=
+    N) and/or a multi-column combined ranking (ORDER BY col1, col2, ...).
+
+    Returns "" when the query contains neither pattern — most queries don't make
+    either judgment call, and this function must never invent a disclosure for
+    a query that doesn't actually have one. When it does find one or both, the
+    wording is built only from what's literally in the SQL text (column names,
+    the actual threshold number, actual sort directions) — nothing inferred or
+    guessed about intent.
+    """
+    if not sql_query:
+        return ""
+
+    notes = []
+
+    having_match = _MIN_SAMPLE_HAVING_RE.search(sql_query)
+    if having_match:
+        n = having_match.group(1)
+        notes.append(
+            f"Only groups with at least {n} underlying rows were included in this "
+            f"ranking (smaller groups were excluded to avoid basing an average on "
+            f"too little data)."
+        )
+
+    order_match = _ORDER_BY_CLAUSE_RE.search(sql_query)
+    if order_match:
+        raw_cols = _split_top_level_commas(order_match.group(1))
+        # Only worth disclosing when the ranking actually combines 2+ criteria —
+        # a single-column ORDER BY needs no special explanation.
+        if len(raw_cols) >= 2:
+            parsed = []
+            for col_expr in raw_cols:
+                direction = "descending"
+                m = re.match(r"^(.*?)\s+(ASC|DESC)$", col_expr, re.IGNORECASE)
+                if m:
+                    col_expr, direction = m.group(1).strip(), m.group(2).lower()
+                    direction = "descending" if direction == "desc" else "ascending"
+                # Use the last identifier-like token as a human label (handles
+                # "table.col" and simple expressions reasonably).
+                label_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", col_expr)
+                label = _humanize_column(label_match.group(1)) if label_match else col_expr
+                parsed.append((label, direction))
+            primary, *rest = parsed
+            desc = f"ranked primarily by {primary[0]} ({primary[1]})"
+            for label, direction in rest:
+                desc += f", then by {label} ({direction})"
+            notes.append(f"This result is {desc}.")
+
+    return " ".join(notes)
 
 
 _CHART_SQL_SHAPING: dict = {
@@ -1039,6 +1160,16 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
         ]
     )
     final_answer = _extract_text(response.content).strip()
+
+    # Deterministic, mandatory transparency — not just a prompt instruction, since
+    # prompt instructions alone have already proven unreliable in this project
+    # (see the truncation-fabrication and question-paraphrasing bugs). Any
+    # minimum-sample threshold or multi-metric ranking baked into the executed
+    # SQL is extracted mechanically from the real query text and appended here
+    # every time it's present — the LLM summarizer cannot omit or reword it away.
+    disclosure = _ranking_convention_disclosure(state.generated_sql_query)
+    if disclosure:
+        final_answer = f"{final_answer}\n\nHow this ranking was computed: {disclosure}"
 
     return {
         "final_answer": final_answer,
@@ -1471,10 +1602,15 @@ def build_visualization(state: SQLAnalystState) -> dict:
     else:
         chart_render_note = "\nNote: Chart image rendering failed — see stderr for details."
 
+    # Deterministic, mandatory transparency (same rationale as represent_final_answer):
+    # extracted mechanically from the real executed SQL, never left to the summary LLM.
+    disclosure = _ranking_convention_disclosure(state.generated_sql_query)
+    disclosure_note = f"\n\nHow this ranking was computed: {disclosure}" if disclosure else ""
+
     final_answer = (
         f"{files_note}\n"
         f"Chart type: {state.chart_type}{reasoning_note}{chart_render_note}{truncation_note}\n\n"
-        f"Summary: {summary}"
+        f"Summary: {summary}{disclosure_note}"
     )
 
     return {
