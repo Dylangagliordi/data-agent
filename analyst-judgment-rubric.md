@@ -132,6 +132,44 @@ non-read-only query from execution.
 
 ---
 
+### Rule 12 — Duplicate-row transparency
+When the query removes duplicate rows via `SELECT DISTINCT`, this is disclosed in the
+answer. `SELECT DISTINCT` silently assumes repeated identical rows are data-entry
+artefacts (true duplicates), not legitimate repeated observations (e.g. a customer
+placing two identical orders). The assumption is often correct but is never obvious
+from the result alone.
+
+**Disclosure trigger:** `SELECT DISTINCT` detected in executed SQL.
+
+---
+
+### Rule 13 — Composite-value splitting
+When a column in the schema encodes two or more logically distinct values in one
+field (e.g. a `city, state` combined string, a `80000-100000` salary range, a job
+title with seniority appended), and the question asks about one component, the query
+must extract that component using `SPLIT_PART`, `SUBSTRING`, `REGEXP_REPLACE`, or
+a `CASE WHEN` expression — not GROUP BY the combined field as an opaque string.
+
+**Enforcement:** SQL-generation prompt rule (no post-execution extraction; the
+composite structure must be visible in the schema sample rows).
+
+---
+
+### Note on Rule 8 — Causal language rewrite (not just disclaimer)
+`_apply_causal_correction` uses a two-pass approach:
+1. Unambiguously causal phrases (`leads to`, `causes`, `caused by`, `results in`,
+   `responsible for`, `driven by`, `explains why`, `because of`, `due to`) are
+   **replaced in-place** with associative equivalents (`is associated with`,
+   `alongside`, etc.).
+2. Ambiguous verbs (`drives`, `affects`, `impacts`) that survive pass 1 trigger
+   the association disclaimer as a fallback — replacing these risks breaking
+   legitimate non-causal uses.
+
+This is a rewrite, not just a disclaimer bolted on: a reader who stops reading
+early should not still see the false causal claim.
+
+---
+
 ## Out of scope
 
 The following are explicitly not handled by the SQL analyst and no rubric rule

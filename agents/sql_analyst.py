@@ -675,7 +675,14 @@ group with an average for another in the same result.
 - Time-filter literalness: when filtering on a date/time column, the date boundaries \
 must appear as literal values in the SQL text (string literals, BETWEEN constants, \
 date_trunc or EXTRACT expressions) — not hidden inside a subquery — so the time \
-range can be read back out of the executed SQL and disclosed to the user automatically."""
+range can be read back out of the executed SQL and disclosed to the user automatically.
+- Composite-value splitting: when a column in the schema encodes two or more logically \
+distinct values in a single field (e.g. a city+state combined as "São Paulo, SP", a \
+salary range encoded as "80000-100000", a job title with seniority level appended), and \
+the question asks about one component separately, extract that component in the query \
+using SPLIT_PART, SUBSTRING, REGEXP_REPLACE, or a CASE WHEN expression rather than \
+treating the combined string as one opaque value. Never GROUP BY a combined field when \
+the question is about a sub-part of that field."""
 
 
 def _strip_sql_formatting(text: str) -> str:
@@ -760,10 +767,25 @@ _CAUSAL_PHRASES = re.compile(
     r"drives?|driven by|because of|due to|impact(?:s|ed)? (?:the|on)|affect(?:s|ed)?)\b",
     re.IGNORECASE,
 )
+# Ordered list of (pattern, replacement) for clear-cut causal phrases.
+# Ambiguous verbs (drives, affects) are intentionally omitted — they have too many
+# legitimate non-causal uses and are handled by the disclaimer fallback instead.
+_CAUSAL_SUBS = [
+    (re.compile(r"\bleads?\s+to\b", re.IGNORECASE), "is associated with"),
+    (re.compile(r"\bcauses?\b", re.IGNORECASE), "is associated with"),
+    (re.compile(r"\bcaused\s+by\b", re.IGNORECASE), "associated with"),
+    (re.compile(r"\bresults?\s+in\b", re.IGNORECASE), "is associated with"),
+    (re.compile(r"\bresponsible\s+for\b", re.IGNORECASE), "associated with"),
+    (re.compile(r"\bdriven\s+by\b", re.IGNORECASE), "associated with"),
+    (re.compile(r"\bexplains?\s+why\b", re.IGNORECASE), "is associated with"),
+    (re.compile(r"\bbecause\s+of\b", re.IGNORECASE), "alongside"),
+    (re.compile(r"\bdue\s+to\b", re.IGNORECASE), "alongside"),
+]
 _ASSOCIATION_DISCLAIMER = (
     "Note: this result shows a statistical association only — "
     "the data cannot establish that one variable caused another."
 )
+_SELECT_DISTINCT_RE = re.compile(r"\bSELECT\s+DISTINCT\b", re.IGNORECASE)
 
 
 def _extract_null_exclusion_disclosures(sql_query: str) -> list:
@@ -940,6 +962,11 @@ def _analyst_judgment_disclosure(sql_query: str, result_data=None) -> str:
     if time_note:
         notes.append(time_note)
 
+    # Rule 12: deduplication transparency
+    dedup_note = _extract_deduplication_disclosure(sql_query)
+    if dedup_note:
+        notes.append(dedup_note)
+
     # Rules 5 & 6: outlier and group-size checks (require parsed result data)
     if result_data:
         outlier_note = _outlier_sensitivity_note(result_data)
@@ -952,16 +979,47 @@ def _analyst_judgment_disclosure(sql_query: str, result_data=None) -> str:
     return " ".join(notes)
 
 
-def _apply_causal_correction(final_answer: str, _sql_query: str) -> str:
-    """Append the association disclaimer when the final answer uses causal language.
+def _extract_deduplication_disclosure(sql_query: str) -> str:
+    """Disclose when the query removes duplicate rows via SELECT DISTINCT.
 
-    The check is on the answer text (not the SQL) because the summarizer LLM
-    occasionally uses causal verbs even when the data is purely observational.
-    _sql_query is accepted but unused — kept in signature for future extension.
+    SELECT DISTINCT silently assumes that repeated identical rows are true
+    duplicates (data-entry artefacts) rather than legitimate repeated
+    observations (e.g. a customer placing two identical orders). That
+    assumption is correct in many cases but is never obvious from the result
+    alone, so it is disclosed here when the pattern is present in the SQL.
     """
-    if _CAUSAL_PHRASES.search(final_answer) and _ASSOCIATION_DISCLAIMER not in final_answer:
-        return f"{final_answer}\n\n{_ASSOCIATION_DISCLAIMER}"
-    return final_answer
+    if not sql_query:
+        return ""
+    if _SELECT_DISTINCT_RE.search(sql_query):
+        return (
+            "Duplicate rows were removed from this result (SELECT DISTINCT was used) — "
+            "this assumes repeated identical rows are true duplicates, not legitimate "
+            "repeated observations."
+        )
+    return ""
+
+
+def _apply_causal_correction(final_answer: str, _sql_query: str) -> str:
+    """Rewrite causal language in the final answer to associative language.
+
+    Two-pass approach:
+    1. Replace unambiguously causal phrases in-place with associative equivalents
+       (e.g. 'leads to' → 'is associated with'). Ambiguous verbs ('drives',
+       'affects') are left for the fallback because they have too many
+       legitimate non-causal uses.
+    2. If any causal phrase remains after rewriting (the ambiguous cases),
+       append the association disclaimer as a fallback.
+
+    This is intentionally a rewrite, not just a disclaimer bolted on: leaving
+    causal phrasing in the answer while appending a correction below it means
+    a reader who stops reading early still sees the false claim.
+    """
+    text = final_answer
+    for pattern, replacement in _CAUSAL_SUBS:
+        text = pattern.sub(replacement, text)
+    if _CAUSAL_PHRASES.search(text) and _ASSOCIATION_DISCLAIMER not in text:
+        text = f"{text}\n\n{_ASSOCIATION_DISCLAIMER}"
+    return text
 
 
 _CHART_SQL_SHAPING: dict = {
