@@ -660,7 +660,22 @@ columns unpivoted into rows):
     UNION ALL
     SELECT 'cost'    AS metric, cost    AS value FROM summary
     ORDER BY metric;
-  Adjust source columns, table names, and label strings to match the actual schema."""
+  Adjust source columns, table names, and label strings to match the actual schema.
+- Null handling: never substitute 0 for a genuinely missing value. Aggregate \
+functions (SUM, AVG, COUNT(col)) already skip NULLs — do not wrap a metric column \
+in COALESCE(col, 0) unless the question explicitly asks to treat missing as zero. \
+When you filter NULLs out (e.g. WHERE col IS NOT NULL), the filter appears literally \
+in the SQL text, which is how it gets extracted and disclosed automatically.
+- Unit normalization: when comparing a total or summed metric across groups of \
+different sizes (e.g. total revenue by region), prefer a per-unit metric (AVG revenue \
+per order) unless the question explicitly asks for totals. Never mix total for one \
+group with an average for another in the same result.
+- Descriptive aliases only: never use a SQL column alias that implies causation \
+(e.g. AS caused_by, AS leads_to). Use factual, descriptive names only.
+- Time-filter literalness: when filtering on a date/time column, the date boundaries \
+must appear as literal values in the SQL text (string literals, BETWEEN constants, \
+date_trunc or EXTRACT expressions) — not hidden inside a subquery — so the time \
+range can be read back out of the executed SQL and disclosed to the user automatically."""
 
 
 def _strip_sql_formatting(text: str) -> str:
@@ -728,23 +743,165 @@ def _split_top_level_commas(text: str) -> list:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _ranking_convention_disclosure(sql_query: str) -> str:
-    """Mechanically derive a plain-English disclosure of any unstated judgment call
-    baked into the executed SQL: a minimum-sample-size threshold (HAVING COUNT(*) >=
-    N) and/or a multi-column combined ranking (ORDER BY col1, col2, ...).
+# ── New rubric helpers ────────────────────────────────────────────────────────
 
-    Returns "" when the query contains neither pattern — most queries don't make
-    either judgment call, and this function must never invent a disclosure for
-    a query that doesn't actually have one. When it does find one or both, the
-    wording is built only from what's literally in the SQL text (column names,
-    the actual threshold number, actual sort directions) — nothing inferred or
-    guessed about intent.
+_NULL_EXCLUSION_COL_RE = re.compile(r"\b(\w+)\s+IS\s+NOT\s+NULL\b", re.IGNORECASE)
+_BETWEEN_DATE_RE = re.compile(
+    r"\bBETWEEN\s+'([\d\-T: ]+?)'\s+AND\s+'([\d\-T: ]+?)'",
+    re.IGNORECASE,
+)
+_DATE_LITERAL_RE = re.compile(r"'(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?)'")
+_DATE_TRUNC_RE = re.compile(r"\bdate_trunc\s*\(\s*'(\w+)'", re.IGNORECASE)
+_COUNT_COL_RE = re.compile(
+    r"^(?:n|count|num\w*|sample_size|total_count|\w+_count)$", re.IGNORECASE
+)
+_CAUSAL_PHRASES = re.compile(
+    r"\b(?:causes?|caused by|leads? to|results? in|explains? why|responsible for|"
+    r"drives?|driven by|because of|due to|impact(?:s|ed)? (?:the|on)|affect(?:s|ed)?)\b",
+    re.IGNORECASE,
+)
+_ASSOCIATION_DISCLAIMER = (
+    "Note: this result shows a statistical association only — "
+    "the data cannot establish that one variable caused another."
+)
+
+
+def _extract_null_exclusion_disclosures(sql_query: str) -> list:
+    """Return one disclosure string per column that appears in a 'col IS NOT NULL' filter."""
+    if not sql_query:
+        return []
+    seen: set = set()
+    disclosures = []
+    for col in _NULL_EXCLUSION_COL_RE.findall(sql_query):
+        cl = col.lower()
+        if cl not in seen:
+            seen.add(cl)
+            disclosures.append(
+                f"Rows where {col.replace('_', ' ').title()} is missing (NULL) "
+                f"were excluded from this result."
+            )
+    return disclosures
+
+
+def _extract_time_framing_disclosure(sql_query: str) -> str:
+    """Return a disclosure when the query filters data to a specific time window."""
+    if not sql_query:
+        return ""
+    m = _BETWEEN_DATE_RE.search(sql_query)
+    if m:
+        return f"This result covers the period from {m.group(1).strip()} to {m.group(2).strip()}."
+    literals = _DATE_LITERAL_RE.findall(sql_query)
+    if len(literals) >= 2:
+        return f"This result is filtered to the period from {literals[0]} to {literals[-1]}."
+    if len(literals) == 1:
+        return f"This result is filtered to data around {literals[0]}."
+    trunc_m = _DATE_TRUNC_RE.search(sql_query)
+    if trunc_m:
+        return f"This result is grouped by {trunc_m.group(1)}."
+    return ""
+
+
+def _outlier_sensitivity_note(result_data: list) -> str:
+    """Note when one group's metric value is more than 3× the median of the rest.
+
+    Uses _to_float and _humanize_column, which are defined later in this module —
+    both are resolved at call time (not import time), so forward references are safe.
+    """
+    if not result_data or len(result_data) < 3 or not isinstance(result_data[0], dict):
+        return ""
+    cols = list(result_data[0].keys())
+    metric_cols = [c for c in cols[1:] if _to_float(result_data[0].get(c)) is not None]  # type: ignore[name-defined]
+    if not metric_cols:
+        return ""
+    mc = metric_cols[0]
+    vals = sorted(
+        v for v in (_to_float(r.get(mc)) for r in result_data) if v is not None  # type: ignore[name-defined]
+    )
+    if len(vals) < 3:
+        return ""
+    median_val = vals[len(vals) // 2]
+    max_val = vals[-1]
+    if median_val > 0 and max_val > 3 * median_val:
+        label = mc.replace("_", " ").title()
+        return (
+            f"Note: one or more groups have a {label} value substantially higher than "
+            f"the typical group — verify these are not driven by a single extreme data point."
+        )
+    return ""
+
+
+def _group_size_imbalance_note(result_data: list) -> str:
+    """Note when the largest group has 10× or more rows than the smallest."""
+    if not result_data or len(result_data) < 2 or not isinstance(result_data[0], dict):
+        return ""
+    cols = list(result_data[0].keys())
+    count_col = next((c for c in cols if _COUNT_COL_RE.match(c)), None)
+    if count_col is None:
+        return ""
+    counts = [
+        _to_float(r.get(count_col)) for r in result_data  # type: ignore[name-defined]
+        if _to_float(r.get(count_col)) is not None  # type: ignore[name-defined]
+    ]
+    if len(counts) < 2 or min(counts) == 0:
+        return ""
+    ratio = max(counts) / min(counts)
+    if ratio >= 10:
+        return (
+            f"Note: group sizes range from {int(min(counts))} to {int(max(counts))} — "
+            f"comparing averages across groups this unevenly sized may underweight "
+            f"smaller groups."
+        )
+    return ""
+
+
+def _rubric_applicable_instructions(question: str) -> str:
+    """Return extra prompt instructions for generate_sql based on keywords in the question.
+
+    These supplement the fixed system-prompt rules with question-specific reminders,
+    appended to generate_sql's human_content. Only fires when the question explicitly
+    invokes the relevant pattern — most questions get nothing added.
+    """
+    q = question.lower()
+    notes = []
+
+    if re.search(r"\b(why|cause|causes|because|explain|reason|lead|result|impact|effect|affect)\b", q):
+        notes.append(
+            "RUBRIC NOTE: this question implies a causal relationship. SQL results show "
+            "association only — use purely descriptive language in column aliases and comments."
+        )
+
+    if re.search(r"\b(average|avg|mean|highest|lowest|best|worst|top|bottom|rate|per )\b", q):
+        notes.append(
+            "RUBRIC NOTE: this question compares metrics across categories. Apply "
+            "HAVING COUNT(*) >= 5 when ranking by an average or rate. Prefer per-unit "
+            "metrics (avg per entity) over raw totals when groups have different sizes."
+        )
+
+    if re.search(r"\b(since|between|from \d|in \d{4}|year|month|quarter|recent|last \d)\b", q):
+        notes.append(
+            "RUBRIC NOTE: this question implies a time scope. Any date filter must appear "
+            "literally in the SQL WHERE clause so the time range can be disclosed automatically."
+        )
+
+    return "\n\n".join(notes)
+
+
+def _analyst_judgment_disclosure(sql_query: str, result_data=None) -> str:
+    """Unified, mechanically-derived disclosure of every judgment call baked into the
+    executed SQL. Replaces _ranking_convention_disclosure() and extends it with four
+    additional categories (null exclusion, time framing, outlier sensitivity, group
+    size imbalance).
+
+    Returns "" when no disclosure applies — most queries don't trigger any rule.
+    Built entirely from the real SQL text and parsed result rows; never re-asked of
+    an LLM and never invented when the pattern is absent.
     """
     if not sql_query:
         return ""
 
     notes = []
 
+    # Rule 1: minimum sample threshold
     having_match = _MIN_SAMPLE_HAVING_RE.search(sql_query)
     if having_match:
         n = having_match.group(1)
@@ -754,11 +911,10 @@ def _ranking_convention_disclosure(sql_query: str) -> str:
             f"too little data)."
         )
 
+    # Rule 2: combined-metric ranking (only disclose when 2+ ORDER BY columns)
     order_match = _ORDER_BY_CLAUSE_RE.search(sql_query)
     if order_match:
         raw_cols = _split_top_level_commas(order_match.group(1))
-        # Only worth disclosing when the ranking actually combines 2+ criteria —
-        # a single-column ORDER BY needs no special explanation.
         if len(raw_cols) >= 2:
             parsed = []
             for col_expr in raw_cols:
@@ -767,10 +923,8 @@ def _ranking_convention_disclosure(sql_query: str) -> str:
                 if m:
                     col_expr, direction = m.group(1).strip(), m.group(2).lower()
                     direction = "descending" if direction == "desc" else "ascending"
-                # Use the last identifier-like token as a human label (handles
-                # "table.col" and simple expressions reasonably).
                 label_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", col_expr)
-                label = _humanize_column(label_match.group(1)) if label_match else col_expr
+                label = _humanize_column(label_match.group(1)) if label_match else col_expr  # type: ignore[name-defined]
                 parsed.append((label, direction))
             primary, *rest = parsed
             desc = f"ranked primarily by {primary[0]} ({primary[1]})"
@@ -778,7 +932,36 @@ def _ranking_convention_disclosure(sql_query: str) -> str:
                 desc += f", then by {label} ({direction})"
             notes.append(f"This result is {desc}.")
 
+    # Rule 3: null exclusions
+    notes.extend(_extract_null_exclusion_disclosures(sql_query))
+
+    # Rule 4: time framing
+    time_note = _extract_time_framing_disclosure(sql_query)
+    if time_note:
+        notes.append(time_note)
+
+    # Rules 5 & 6: outlier and group-size checks (require parsed result data)
+    if result_data:
+        outlier_note = _outlier_sensitivity_note(result_data)
+        if outlier_note:
+            notes.append(outlier_note)
+        imbalance_note = _group_size_imbalance_note(result_data)
+        if imbalance_note:
+            notes.append(imbalance_note)
+
     return " ".join(notes)
+
+
+def _apply_causal_correction(final_answer: str, _sql_query: str) -> str:
+    """Append the association disclaimer when the final answer uses causal language.
+
+    The check is on the answer text (not the SQL) because the summarizer LLM
+    occasionally uses causal verbs even when the data is purely observational.
+    _sql_query is accepted but unused — kept in signature for future extension.
+    """
+    if _CAUSAL_PHRASES.search(final_answer) and _ASSOCIATION_DISCLAIMER not in final_answer:
+        return f"{final_answer}\n\n{_ASSOCIATION_DISCLAIMER}"
+    return final_answer
 
 
 _CHART_SQL_SHAPING: dict = {
@@ -888,6 +1071,10 @@ def generate_sql(state: SQLAnalystState) -> dict:
             f"\n\nThis query will supply data for a {state.chart_type} chart. "
             f"Shape the query accordingly: {shaping}"
         )
+
+    rubric_notes = _rubric_applicable_instructions(state.curated_question)
+    if rubric_notes:
+        human_content += f"\n\n{rubric_notes}"
 
     if state.sql_query_execution_result:
         human_content += (
@@ -1163,13 +1350,14 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
 
     # Deterministic, mandatory transparency — not just a prompt instruction, since
     # prompt instructions alone have already proven unreliable in this project
-    # (see the truncation-fabrication and question-paraphrasing bugs). Any
-    # minimum-sample threshold or multi-metric ranking baked into the executed
-    # SQL is extracted mechanically from the real query text and appended here
-    # every time it's present — the LLM summarizer cannot omit or reword it away.
-    disclosure = _ranking_convention_disclosure(state.generated_sql_query)
+    # (see the truncation-fabrication and question-paraphrasing bugs). Every
+    # triggered rubric rule is extracted mechanically from the real query text and
+    # parsed result data — the LLM summarizer cannot omit or reword it away.
+    result_data, _ = _parse_sql_result(state.sql_query_execution_result)
+    disclosure = _analyst_judgment_disclosure(state.generated_sql_query, result_data)
     if disclosure:
-        final_answer = f"{final_answer}\n\nHow this ranking was computed: {disclosure}"
+        final_answer = f"{final_answer}\n\nHow this answer was computed: {disclosure}"
+    final_answer = _apply_causal_correction(final_answer, state.generated_sql_query)
 
     return {
         "final_answer": final_answer,
@@ -1603,15 +1791,16 @@ def build_visualization(state: SQLAnalystState) -> dict:
         chart_render_note = "\nNote: Chart image rendering failed — see stderr for details."
 
     # Deterministic, mandatory transparency (same rationale as represent_final_answer):
-    # extracted mechanically from the real executed SQL, never left to the summary LLM.
-    disclosure = _ranking_convention_disclosure(state.generated_sql_query)
-    disclosure_note = f"\n\nHow this ranking was computed: {disclosure}" if disclosure else ""
+    # extracted mechanically from the real executed SQL and parsed result data.
+    disclosure = _analyst_judgment_disclosure(state.generated_sql_query, result_data)
+    disclosure_note = f"\n\nHow this answer was computed: {disclosure}" if disclosure else ""
 
     final_answer = (
         f"{files_note}\n"
         f"Chart type: {state.chart_type}{reasoning_note}{chart_render_note}{truncation_note}\n\n"
         f"Summary: {summary}{disclosure_note}"
     )
+    final_answer = _apply_causal_correction(final_answer, state.generated_sql_query)
 
     return {
         "output_file_path": str(output_path),

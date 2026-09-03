@@ -23,12 +23,12 @@ Fix under test (two parts):
    question states a different minimum explicitly. This test confirms the
    real, live generate_sql node actually applies that threshold consistently
    across repeated real invocations of this exact question.
-2. _ranking_convention_disclosure() deterministically (no LLM) extracts the
+2. _analyst_judgment_disclosure() deterministically (no LLM) extracts the
    real threshold and combined-ranking method from whatever SQL was actually
    executed, so even if some variance in the threshold ever creeps back in,
    the disclosure line makes it visible rather than silent.
 
-Test 1 (unit, no LLM/DB): _ranking_convention_disclosure() extracts a known
+Test 1 (unit, no LLM/DB): _analyst_judgment_disclosure() extracts a known
   HAVING threshold and a known multi-column ORDER BY correctly, and returns
   "" for queries with neither.
 Test 2 (live, real LLM + real DB): calls generate_sql on the exact regression
@@ -39,7 +39,7 @@ Test 2 (live, real LLM + real DB): calls generate_sql on the exact regression
 """
 
 from agents.sql_analyst import (
-    _ranking_convention_disclosure,
+    _analyst_judgment_disclosure,
     add_context,
     generate_sql,
     represent_final_answer,
@@ -53,7 +53,7 @@ REGRESSION_QUESTION = (
 
 # ── Test 1: unit test of the deterministic extractor ─────────────────────────
 print("=" * 70)
-print("TEST 1: _ranking_convention_disclosure extracts threshold + combined ranking")
+print("TEST 1: _analyst_judgment_disclosure extracts threshold + combined ranking")
 print("=" * 70)
 
 sql_with_both = """
@@ -63,7 +63,7 @@ GROUP BY industry
 HAVING COUNT(*) >= 5
 ORDER BY avg_salary DESC, avg_job_satisfaction DESC;
 """
-disclosure = _ranking_convention_disclosure(sql_with_both)
+disclosure = _analyst_judgment_disclosure(sql_with_both)
 print(f"Disclosure: {disclosure!r}")
 assert "5" in disclosure, "must mention the real threshold value (5)"
 assert "avg salary" in disclosure.lower() or "Avg Salary" in disclosure, (
@@ -75,7 +75,7 @@ assert "avg job satisfaction" in disclosure.lower() or "Avg Job Satisfaction" in
 print("PASS: threshold and combined ranking both extracted.\n")
 
 sql_no_judgment_calls = "SELECT COUNT(*) FROM olist_orders_dataset;"
-disclosure_empty = _ranking_convention_disclosure(sql_no_judgment_calls)
+disclosure_empty = _analyst_judgment_disclosure(sql_no_judgment_calls)
 assert disclosure_empty == "", (
     f"must NOT fabricate a disclosure for a query with no threshold/combined ranking, "
     f"got: {disclosure_empty!r}"
@@ -83,7 +83,7 @@ assert disclosure_empty == "", (
 print("PASS: no disclosure fabricated for a plain query with no judgment call.\n")
 
 sql_single_order = "SELECT a, b FROM t GROUP BY a ORDER BY b DESC;"
-disclosure_single = _ranking_convention_disclosure(sql_single_order)
+disclosure_single = _analyst_judgment_disclosure(sql_single_order)
 assert disclosure_single == "", (
     "a single-column ORDER BY needs no combined-ranking disclosure, "
     f"got: {disclosure_single!r}"
@@ -110,7 +110,7 @@ for i in range(3):
     print(f"\n--- Run {i + 1} generated SQL ---")
     print(sql)
 
-    disclosure = _ranking_convention_disclosure(sql)
+    disclosure = _analyst_judgment_disclosure(sql)
     print(f"Run {i + 1} disclosure: {disclosure!r}")
 
     import re as _re
@@ -134,7 +134,7 @@ for i in range(3):
     )
     answer_result = represent_final_answer(answer_state)
     final_answer = answer_result["final_answer"]
-    assert "How this ranking was computed:" in final_answer, (
+    assert "How this answer was computed" in final_answer, (
         f"Run {i + 1}: final_answer must explicitly disclose the threshold/ranking method, "
         f"got: {final_answer!r}"
     )
