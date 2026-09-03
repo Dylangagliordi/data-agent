@@ -6,13 +6,16 @@ Every section is built ONLY from real, traceable data — never invented:
 1. Introduction — dataset name, live row/column counts, the actual question asked,
    and which cleaning issues (if any) were found for the relevant table(s).
 2. Data Cleaning — pulled directly from cleaning_log.jsonl for the touched tables;
-   if no cleaning history exists, states that honestly. Includes a real, live
-   before/after numeric comparison for the most impactful fail-level issue.
-3. Topic Focus — one pick_llm("cheap") call grounded in the actual question + result.
+   narrates the real sequence of what was checked, found, and decided. If no
+   cleaning history exists, states that honestly.
+3. Topic Focus — one pick_llm("cheap") call grounded in the actual question + result
+   + cleaning context, explaining why the question matters AND why cleaning was
+   necessary before the result could be trusted.
 4. Visualization — ONLY for visualize: entries with chart_type/output_file_path set.
    Embeds the chart image directly when chart_image_path is present. Derives
    plain-English "Assumptions" from the real WHERE/HAVING clauses in generated_sql_query.
-5. Summary — one pick_llm("cheap") call synthesizing only from assembled facts.
+5. Summary — one pick_llm("cheap") call synthesizing only from assembled facts,
+   narrating the full process from data quality check to final answer.
 """
 
 import base64
@@ -115,7 +118,7 @@ def _cleaning_entries_for_tables(table_names: list) -> dict:
     return result
 
 
-# ── Before/after cleaning comparison (Part 3) ────────────────────────────────
+# ── Before/after cleaning comparison ─────────────────────────────────────────
 
 def _parse_placeholder_issue(issue_text: str) -> "dict | None":
     """Parse a placeholder-value issue to extract column, count, and placeholder values.
@@ -262,7 +265,7 @@ def _compute_before_after(db_table: str, biggest: dict) -> "dict | None":
         conn.close()
 
 
-# ── Query assumption extraction (Part 4) ─────────────────────────────────────
+# ── Query assumption extraction ───────────────────────────────────────────────
 
 # Placeholder-like literal values that signal a non-obvious exclusion filter.
 _PLACEHOLDER_LITERALS = {"-1", "n/a", "na", "unknown", "none", "#n/a", "0", ""}
@@ -337,6 +340,50 @@ def _extract_query_assumptions(sql_query: str) -> list:
     return assumptions
 
 
+# ── Cleaning narrative helpers ─────────────────────────────────────────────────
+
+def _issue_category(issue_text: str) -> str:
+    """Return the broad category label for an issue string."""
+    for prefix in [
+        "Placeholder values",
+        "Column misalignment",
+        "Column header issues",
+        "Duplicate rows",
+        "Duplicate values",
+        "Invalid values",
+        "Currency/unit symbols",
+    ]:
+        if issue_text.startswith(prefix):
+            return prefix
+    return "Other issues"
+
+
+def _cleaning_context_text(cleaning_map: dict) -> str:
+    """Build a plain-text cleaning summary for LLM prompt context.
+
+    Only includes tables that actually have cleaning history.
+    """
+    parts = []
+    for tname, rec in cleaning_map.items():
+        if rec is None:
+            continue
+        entry_meta, file_rec = rec
+        issues = file_rec.get("issues_found", [])
+        resolved = file_rec.get("issues_resolved", [])
+        unresolved = file_rec.get("issues_still_unresolved", [])
+        fc = sum(1 for i in issues if i.get("severity") == "fail")
+        wc = sum(1 for i in issues if i.get("severity") == "warn")
+        fail_cats = sorted({_issue_category(i.get("issue", "")) for i in issues if i.get("severity") == "fail"})
+        warn_cats = sorted({_issue_category(i.get("issue", "")) for i in issues if i.get("severity") == "warn"})
+        parts.append(
+            f"Table '{tname}': {len(issues)} issues found "
+            f"({fc} critical — {', '.join(fail_cats) or 'none'}; "
+            f"{wc} advisory — {', '.join(warn_cats) or 'none'}). "
+            f"{len(resolved)} resolved, {len(unresolved)} still unresolved."
+        )
+    return " | ".join(parts)
+
+
 # ── HTML helpers ───────────────────────────────────────────────────────────────
 
 def _esc(s) -> str:
@@ -361,6 +408,8 @@ pre{font-family:'SFMono-Regular',Consolas,monospace;background:#f6f8fa;padding:1
 .bad{color:#c62828;font-weight:600}
 ul{margin:8px 0;padding-left:22px}
 li{margin:3px 0}
+.issue-block{border-left:3px solid #c62828;background:#fff8f8;padding:10px 14px;margin:12px 0;border-radius:3px}
+.resolved-block{border-left:3px solid #2e7d32;background:#f8fff8;padding:10px 14px;margin:12px 0;border-radius:3px}
 """
 
 
@@ -409,6 +458,12 @@ def _section_introduction(entry: dict, table_meta: list) -> str:
 
 
 def _section_data_cleaning(cleaning_map: dict) -> str:
+    """Narrative data cleaning section.
+
+    Tells the story in order: what was audited → what was found (by severity) →
+    what was decided for each critical issue → advisory fixes → numeric impact.
+    Same real data as before; restructured as a process, not a flat list.
+    """
     parts = ["<h2>Data Cleaning</h2>"]
 
     if not cleaning_map:
@@ -436,58 +491,116 @@ def _section_data_cleaning(cleaning_map: dict) -> str:
         ra = file_rec.get("row_count_after")
         row_loss = file_rec.get("row_loss_flagged", False)
 
+        issues_found = file_rec.get("issues_found", [])
+        fail_issues_found = [i for i in issues_found if i.get("severity") == "fail"]
+        warn_issues_found = [i for i in issues_found if i.get("severity") == "warn"]
+        fc = len(fail_issues_found)
+        wc = len(warn_issues_found)
+        total = len(issues_found)
+
+        # ── Step 1: What was audited ──────────────────────────────────────────
+        if total == 0:
+            parts.append(
+                f"<p>The dataset was scanned for data quality issues "
+                f"(trigger: <em>{_esc(trigger)}</em>, {_esc(ts)}). "
+                f"No issues were detected — the data loaded cleanly.</p>"
+            )
+            continue
+
+        issue_summary_parts = []
+        if fc:
+            issue_summary_parts.append(f"<span class='bad'>{fc} critical (fail-level)</span>")
+        if wc:
+            issue_summary_parts.append(f"{wc} advisory (warn-level)")
+
         parts.append(
-            f"<p><strong>Trigger:</strong> {_esc(trigger)} &nbsp;|&nbsp; "
-            f"<strong>Cleaned at:</strong> {_esc(ts)} &nbsp;|&nbsp; "
-            f"<strong>Status:</strong> {_esc(status)}</p>"
+            f"<p>The dataset was scanned for data quality issues "
+            f"(trigger: <em>{_esc(trigger)}</em>, {_esc(ts)}). "
+            f"The scanner found <strong>{total} issue{'s' if total != 1 else ''}</strong>: "
+            f"{' and '.join(issue_summary_parts)}. "
+            f"Critical issues were addressed first because they can silently corrupt "
+            f"aggregated results; advisory issues were resolved afterward.</p>"
         )
 
-        # Before / after row counts.
-        if rb is not None and ra is not None:
+        # ── Step 2: Critical issues — checked and decided in order ────────────
+        if fail_issues_found:
             parts.append(
-                "<table><thead><tr><th>Before cleaning</th><th>After cleaning</th><th>Note</th></tr></thead><tbody>"
+                "<h4 style='margin-top:18px'>Critical Issues — Checked and Resolved in Sequence</h4>"
+            )
+
+            # Build a lookup from issue text → fail_issues detail record.
+            fail_detail_map = {fi["issue"]: fi for fi in file_rec.get("fail_issues", [])}
+            resolved_set = set(file_rec.get("issues_resolved", []))
+
+            for idx, iss in enumerate(fail_issues_found, 1):
+                issue_text = iss.get("issue", "")
+                detail = fail_detail_map.get(issue_text, {})
+                is_resolved = issue_text in resolved_set
+                reasoning = detail.get("reasoning_comments", [])
+
+                outcome_label = (
+                    "<span class='ok'>&#x2713; Resolved</span>"
+                    if is_resolved
+                    else "<span class='bad'>&#x2717; Unresolved</span>"
+                )
+                block_cls = "resolved-block" if is_resolved else "issue-block"
+
+                parts.append(f"<div class='{block_cls}'>")
+                parts.append(
+                    f"<p><strong>Issue {idx}:</strong> {_esc(issue_text)}</p>"
+                    f"<p><strong>Outcome:</strong> {outcome_label}</p>"
+                )
+                if reasoning:
+                    clean_comments = "\n".join(
+                        re.sub(r"^#\s*", "", c) for c in reasoning
+                    ).strip()
+                    if clean_comments:
+                        parts.append(
+                            f"<p><strong>Fix reasoning:</strong></p>"
+                            f"<pre>{_esc(clean_comments)}</pre>"
+                        )
+                parts.append("</div>")
+
+        # ── Step 3: Advisory issues — handled after critical fixes ─────────────
+        if warn_issues_found:
+            parts.append(
+                "<h4 style='margin-top:18px'>Advisory Issues — Addressed After Critical Fixes</h4>"
+            )
+            resolved_set = set(file_rec.get("issues_resolved", []))
+            parts.append("<ul>")
+            for iss in warn_issues_found:
+                issue_text = iss.get("issue", "")
+                is_resolved = issue_text in resolved_set
+                marker = "<span class='ok'>&#x2713;</span>" if is_resolved else "&#x25cb;"
+                parts.append(f"<li>{marker} {_esc(issue_text)}</li>")
+            parts.append("</ul>")
+
+            wb = file_rec.get("warn_batch") or {}
+            warn_reasoning = wb.get("reasoning_comments", [])
+            if warn_reasoning:
+                clean_warn = "\n".join(
+                    re.sub(r"^#\s*", "", c) for c in warn_reasoning
+                ).strip()
+                if clean_warn:
+                    parts.append(
+                        f"<p><strong>Fix reasoning:</strong></p>"
+                        f"<pre>{_esc(clean_warn)}</pre>"
+                    )
+
+        # ── Step 4: Row counts before / after ─────────────────────────────────
+        if rb is not None and ra is not None:
+            parts.append("<h4 style='margin-top:18px'>Row Count: Before vs After</h4>")
+            parts.append(
+                "<table><thead><tr>"
+                "<th>Before cleaning</th><th>After cleaning</th><th>Note</th>"
+                "</tr></thead><tbody>"
                 f"<tr><td>{rb:,} rows</td><td>{ra:,} rows</td>"
                 f"<td>{'<span class=\"bad\">Row loss flagged (&ge;20%)</span>' if row_loss else 'Within acceptable range'}</td>"
                 f"</tr></tbody></table>"
             )
 
-        # Issues found.
-        issues_found = file_rec.get("issues_found", [])
-        if issues_found:
-            parts.append("<p><strong>Issues found:</strong></p><ul>")
-            for iss in issues_found:
-                sev = iss.get("severity", "")
-                css = "bad" if sev == "fail" else ""
-                parts.append(f"<li><span class='{css}'>[{_esc(sev)}]</span> {_esc(iss.get('issue', ''))}</li>")
-            parts.append("</ul>")
-
-        # Resolved / unresolved.
-        resolved = file_rec.get("issues_resolved", [])
-        unresolved = file_rec.get("issues_still_unresolved", [])
-        if resolved:
-            parts.append("<p><strong>Resolved:</strong></p><ul>")
-            for i in resolved:
-                parts.append(f"<li class='ok'>&#x2713; {_esc(i)}</li>")
-            parts.append("</ul>")
-        if unresolved:
-            parts.append("<p><strong>Still unresolved:</strong></p><ul>")
-            for i in unresolved:
-                parts.append(f"<li class='bad'>&#x2717; {_esc(i)}</li>")
-            parts.append("</ul>")
-
-        # Reasoning comments from generated fix code.
-        all_comments = []
-        for fi in file_rec.get("fail_issues", []):
-            all_comments.extend(fi.get("reasoning_comments", []))
-        wb = file_rec.get("warn_batch") or {}
-        all_comments.extend(wb.get("reasoning_comments", []))
-
-        if all_comments:
-            parts.append("<p><strong>Reasoning from generated fix code:</strong></p>")
-            parts.append("<pre>" + _esc("\n".join(all_comments)) + "</pre>")
-
-        # ── Real before/after numeric comparison for the biggest fail issue ──
-        parts.append("<h4 style='margin-top:16px'>Before/After Cleaning Impact</h4>")
+        # ── Step 5: Concrete before/after impact for the biggest fail issue ───
+        parts.append("<h4 style='margin-top:18px'>Before/After Cleaning Impact</h4>")
         biggest = _biggest_fail_placeholder(file_rec)
         if biggest is None:
             parts.append(
@@ -535,18 +648,30 @@ def _section_data_cleaning(cleaning_map: dict) -> str:
     return "\n".join(parts)
 
 
-def _section_topic_focus(entry: dict, llm) -> str:
+def _section_topic_focus(entry: dict, llm, cleaning_context: str = "") -> str:
     question = entry.get("user_question") or entry.get("curated_question") or ""
     result_snippet = (entry.get("sql_query_execution_result") or "")[:500]
     final_answer = (entry.get("final_answer") or "")[:800]
+
+    cleaning_clause = ""
+    if cleaning_context:
+        cleaning_clause = (
+            f"Before the analysis, the following data quality issues were found and addressed: "
+            f"{cleaning_context}\n\n"
+            f"Explain why each of those cleaning steps was necessary before this specific "
+            f"analysis could be trusted — which issues, if left uncleaned, would have "
+            f"distorted or invalidated this result.\n\n"
+        )
 
     prompt = (
         f"A data analyst asked this question: \"{question}\"\n\n"
         f"The query returned: {result_snippet}\n\n"
         f"The final answer given was: {final_answer}\n\n"
+        f"{cleaning_clause}"
         f"In 2-4 sentences, explain why this is a meaningful question to ask of this dataset. "
         f"Be specific and grounded in what the data actually showed — do not invent "
-        f"business context or mention anything not directly present in the question and result above. "
+        f"business context or mention anything not directly present in the question, result, "
+        f"and cleaning context above. "
         f"Write plain prose only — no markdown headers, no bullet points, no formatting symbols."
     )
     explanation = llm.invoke([("human", prompt)]).content
@@ -584,7 +709,6 @@ def _section_visualization(entry: dict) -> str:
     if chart_type_source == "reasoned" and chart_type_reasoning:
         lines.append(f"<p><strong>Reasoning:</strong> {_esc(chart_type_reasoning)}</p>")
 
-    # ── Chart image (Part 2) ─────────────────────────────────────────────────
     if chart_image_path:
         img_path = Path(chart_image_path)
         if img_path.exists():
@@ -623,7 +747,6 @@ def _section_visualization(entry: dict) -> str:
             )
         lines.append(f"<div class='note'><strong>Query shape:</strong> {_esc(shape_note)}</div>")
 
-        # ── Query assumptions (Part 4) ────────────────────────────────────────
         assumptions = _extract_query_assumptions(generated_sql)
         if assumptions:
             lines.append("<p><strong>Assumptions:</strong></p><ul>")
@@ -636,7 +759,8 @@ def _section_visualization(entry: dict) -> str:
 
 
 def _section_summary(intro_html: str, cleaning_html: str, topic_html: str,
-                     viz_html: str, entry: dict, llm) -> str:
+                     viz_html: str, entry: dict, llm,
+                     cleaning_context: str = "") -> str:
     question = entry.get("user_question") or entry.get("curated_question") or ""
     final_answer = (entry.get("final_answer") or "")[:1000]
     route = entry.get("route_response", "")
@@ -646,15 +770,20 @@ def _section_summary(intro_html: str, cleaning_html: str, topic_html: str,
         f"Run type: {route}\n"
         f"Final answer: {final_answer}\n"
     )
+    if cleaning_context:
+        facts += f"Data cleaning performed: {cleaning_context}\n"
     if entry.get("chart_type"):
         facts += f"Chart type produced: {entry['chart_type']}\n"
     if entry.get("output_file_path"):
         facts += f"Output file: {entry['output_file_path']}\n"
 
     prompt = (
-        f"Write a 3-5 sentence summary for a data report. "
+        f"Write a 3-5 sentence summary for a data report, narrating the full analytical "
+        f"process in sequence: what data quality issues were found and why they mattered, "
+        f"how they were resolved, and what the analysis ultimately showed. "
         f"Synthesize ONLY from the facts listed below — do not introduce any number, "
         f"claim, or interpretation not directly traceable to these facts. "
+        f"If no cleaning was performed, focus on the analysis result. "
         f"Write plain prose only — no markdown headers, no bullet points, no formatting symbols.\n\n"
         f"Facts:\n{facts}"
     )
@@ -684,7 +813,7 @@ def generate_report(entry: dict) -> str:
     try:
         known_tables = _all_table_names()
         touched_tables = _detect_tables_in_sql(sql, known_tables) if sql else []
-    except Exception as e:
+    except Exception:
         known_tables = []
         touched_tables = []
 
@@ -700,13 +829,16 @@ def generate_report(entry: dict) -> str:
     except Exception:
         cleaning_map = {t: None for t in touched_tables}
 
+    # Plain-text cleaning context for LLM sections.
+    cleaning_context = _cleaning_context_text(cleaning_map)
+
     llm = pick_llm("cheap")
 
     intro = _section_introduction(entry, table_meta)
     cleaning = _section_data_cleaning(cleaning_map)
-    topic = _section_topic_focus(entry, llm)
+    topic = _section_topic_focus(entry, llm, cleaning_context)
     viz = _section_visualization(entry)
-    summary = _section_summary(intro, cleaning, topic, viz, entry, llm)
+    summary = _section_summary(intro, cleaning, topic, viz, entry, llm, cleaning_context)
 
     body_parts = [intro, cleaning, topic]
     if viz:

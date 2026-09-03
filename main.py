@@ -153,6 +153,33 @@ def main() -> None:
             print(f'Open with: open "{report_path}"')
         return
 
+    # present last — no re-run, pull the most recent query_log entry and build a slideshow.
+    if raw.strip().lower() == "present last":
+        from utils.generate_presentation import generate_presentation
+        from utils.generate_report import last_query_log_entry
+        entry = last_query_log_entry()
+        if entry is None:
+            print("No entries found in logs/query_log.jsonl — run a query first.", file=sys.stderr)
+            sys.exit(1)
+        pres_path = generate_presentation(entry)
+        print(f"Presentation: {pres_path}")
+        print(f'Open with: open "{pres_path}"')
+        return
+
+    # present: <question> — run the question fresh, then build a slideshow from that run.
+    if raw.startswith("present: "):
+        from utils.generate_presentation import generate_presentation
+        from utils.generate_report import last_query_log_entry
+        question = raw[len("present: "):].strip()
+        result = _run_question(question)
+        print(result["final_answer"])
+        entry = last_query_log_entry()
+        if entry is not None:
+            pres_path = generate_presentation(entry)
+            print(f"\nPresentation: {pres_path}")
+            print(f'Open with: open "{pres_path}"')
+        return
+
     # Normal question — run through the graph and print the answer.
     result = _run_question(raw)
     print(result["final_answer"])
