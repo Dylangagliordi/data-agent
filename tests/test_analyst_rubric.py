@@ -396,6 +396,58 @@ assert _group_size_imbalance_note(balanced) == "", "Should not fire for similar 
 print("PASS: no imbalance note for similar group sizes.\n")
 
 
+# ── Test 10 (live — DB + LLM): composite-value splitting ─────────────────────
+print("=" * 70)
+print("TEST 10 (live): composite-value splitting on a real composite column")
+print("=" * 70)
+print("NOTE: requires Postgres connection + Anthropic API call")
+
+from agents.sql_analyst import add_context, generate_sql
+from models.schema import SQLAnalystState
+
+# uncleaned_ds_jobs.location has real composite values: "New York, NY",
+# "Albany, NY", "San Francisco, CA", etc.  A question about "New York state"
+# must extract the trailing state abbreviation from the composite, not exact-
+# match the full field as "New York".
+COMPOSITE_QUESTION = "How many data science jobs are based in New York state?"
+
+state10 = SQLAnalystState(
+    user_question=COMPOSITE_QUESTION,
+    curated_question=COMPOSITE_QUESTION,
+)
+ctx10 = add_context(state10)
+state10 = state10.model_copy(update=ctx10)
+sql10 = generate_sql(state10)["generated_sql_query"]
+print(f"Generated SQL:\n{sql10}\n")
+
+# The naive wrong approach: exact-match the composite field against the bare
+# city/state name rather than extracting the state abbreviation component.
+assert "location = 'New York'" not in sql10 and "location='New York'" not in sql10, (
+    f"Must not exact-match composite location as bare 'New York': {sql10!r}"
+)
+assert "location = 'New York state'" not in sql10, (
+    f"Must not match composite field against 'New York state': {sql10!r}"
+)
+
+# The LLM must reference the state abbreviation 'NY' — the actual component
+# value in the composite "city, state" field — not just "New York" as a string.
+assert "NY" in sql10, (
+    f"SQL must reference the state abbreviation 'NY' extracted from the composite "
+    f"location field; got: {sql10!r}"
+)
+
+# Must use a string operation to extract the state component.
+uses_string_op = any(kw in sql10.upper() for kw in [
+    "LIKE", "ILIKE", "SPLIT_PART", "SUBSTRING", "RIGHT(", "REGEXP", " ~ ", "~*",
+])
+assert uses_string_op, (
+    f"Must apply a string operation (LIKE, SPLIT_PART, SUBSTRING, RIGHT, REGEXP) "
+    f"to extract the state from the composite location field; got: {sql10!r}"
+)
+
+print("PASS: composite-value splitting — SQL correctly extracts state from location.\n")
+
+
 print("=" * 70)
 print("ALL ANALYST RUBRIC TESTS PASSED")
 print("=" * 70)

@@ -24,3 +24,7 @@ These apply to every task in this project, not just the current one.
 - Commit to git after each verified piece of work, with a message naming what changed.
 - If something fails after a few real attempts to fix it, stop and report the issue rather than
   continuing to guess or silently working around it.
+- After completing any spec that changes real code structure — new functions, new schema fields,
+  new file locations, new established patterns — update
+  `.claude/skills/data-agent-architecture/SKILL.md` to reflect the change before considering
+  the task finished. This applies every time, automatically, without needing to be asked.

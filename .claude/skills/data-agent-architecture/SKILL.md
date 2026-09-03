@@ -187,7 +187,14 @@ CREATE TABLE _data_quality_status (
 | `_detect_fanout_warnings` | Deterministic fan-out check: live `COUNT(*)/COUNT(DISTINCT)` queries against real data. |
 | `_parse_sql_result` | Parses psycopg2 `str()` repr; handles `Decimal` and `datetime` types via controlled `eval()`. |
 | `_chart_shaping_instruction` | Returns SQL-shaping instructions per chart type for `generate_sql`'s prompt. |
-| `_ranking_convention_disclosure` | Deterministic (no LLM) extractor: pulls the real `HAVING COUNT(*) >= N` minimum-sample threshold and/or a multi-column `ORDER BY` combined ranking straight out of `generated_sql_query` text, returning a plain-English disclosure string (`""` if the query has neither). Appended to `final_answer` by both `represent_final_answer` and `build_visualization` whenever non-empty — mandatory, not prompt-dependent. Added after a real inconsistency where "which industry maximizes both salary and satisfaction" produced different top results across runs (`generate_sql` picked a different sample-size threshold and sort order each call). `GENERATE_SQL_SYSTEM_PROMPT` also now states a FIXED convention (`HAVING COUNT(*) >= 5`) for any per-category ranking by an averaged/rate metric. See `tests/test_ranking_consistency.py`. |
+| `_analyst_judgment_disclosure(sql, result_data=None)` | Unified deterministic disclosure (replaced `_ranking_convention_disclosure`). Covers: HAVING threshold (Rule 1), combined ORDER BY (Rule 2), NULL exclusions (Rule 3), time framing (Rule 4), outlier sensitivity (Rule 5), group size imbalance (Rule 6), SELECT DISTINCT deduplication (Rule 12). Returns `""` when no rule fires. Appended as `"How this answer was computed: ..."` by `represent_final_answer` and `build_visualization`. |
+| `_apply_causal_correction(answer, sql)` | Two-pass rewrite: clear causal phrases (`leads to`, `causes`, `because of`, etc.) are replaced in-place with associative equivalents; ambiguous verbs (`drives`, `affects`) trigger the association disclaimer as fallback. Rule 8. |
+| `_rubric_applicable_instructions(question)` | Keyword-based: returns extra RUBRIC NOTE strings for `generate_sql`'s human_content when the question implies causal language, per-category averages, or a time scope. Appended to human_content (not system prompt) in `generate_sql`. |
+| `_extract_null_exclusion_disclosures(sql)` | Returns one disclosure per `col IS NOT NULL` filter found in the SQL. |
+| `_extract_time_framing_disclosure(sql)` | Returns a disclosure when the SQL contains BETWEEN dates, date literals, or date_trunc. |
+| `_outlier_sensitivity_note(result_data)` | Fires when one group's metric value is > 3× the median of all groups. |
+| `_group_size_imbalance_note(result_data)` | Fires when max/min count-column ratio ≥ 10 in result_data. Requires a count-like column name in the result (n, count, num*, sample_size, total_count, *_count). |
+| `_extract_deduplication_disclosure(sql)` | Fires when `SELECT DISTINCT` is present; discloses duplicate-removal assumption. Rule 12. |
 
 **SQL analyst graph wiring:**
 ```
@@ -276,6 +283,24 @@ build_visualization → END
 
 ---
 
+### `utils/generate_presentation.py` — HTML slideshow generator
+
+Public API: `generate_presentation(entry: dict) -> str` (returns path to written `.html`).
+
+Writes vanilla-JS slideshows to `presentations/<slug>_<timestamp>.html`. Slide set is determined by `route_response` in the log entry:
+- Always present: Title, "What are we exploring?", Summary ("Key Takeaways")
+- sql_analyst entries: Question slide added
+- Cleaning history present: Uncleaned Data + Issue/Solution + Cleaned Data slides (omitted entirely when no cleaning history exists for the queried tables)
+- visualize entries: Visualization slide with chart embedded as base64 `<img>`; "Why this chart type" section added when `chart_type_source == "reasoned"`
+
+JS navigation: `show(n)`, ArrowRight/ArrowLeft keyboard support, `show(0)` on load. HTML attribute IDs use double quotes (`id="prev"`, `id="next"`, `id="counter"`).
+
+**CLI triggers** (in `main.py`):
+- `python main.py "present last"` — builds slideshow from most recent `query_log.jsonl` entry without re-running the query.
+- `python main.py "present: <question>"` — runs the question fresh, then builds a slideshow from that run's log entry.
+
+---
+
 ### `utils/generate_report.py` — HTML report generator
 
 Public API: `generate_report(entry: dict) -> str` (returns path to written `.html`). `last_query_log_entry() -> dict | None`.
@@ -310,9 +335,12 @@ Key internal functions:
 **Severity mapping location:** `utils/data_cleaning.py` — `FAIL_LEVEL_PREFIXES` and `WARN_LEVEL_PREFIXES` tuples at module level (lines 177–208). `compute_quality_status` in `utils/load_data.py` calls `_issue_severity` imported from `data_cleaning.py` — same mapping, one source of truth.
 
 **Output directories:**
-- `outputs/visualizations/` — CSV and PNG files from `build_visualization`. Naming: `{40-char-slug}_{YYYYMMDD_HHMMSS}.{csv,png}`.
-- `reports/` — HTML reports from `generate_report`.
+- `outputs/visualizations/` — CSV and PNG files from `build_visualization`. Naming: `{40-char-slug}_{YYYYMMDD_HHMMSS}.{csv,png}`. Tableau also writes a `.hyper` file alongside the CSV.
+- `reports/` — HTML reports from `generate_report`. Naming: `{40-char-slug}_{YYYYMMDD_HHMMSS}.html`.
+- `presentations/` — HTML slideshows from `generate_presentation`. Same naming convention.
 - `logs/` — `query_log.jsonl` and `cleaning_log.jsonl`.
+
+**Analyst judgment rubric:** `analyst-judgment-rubric.md` at the project root documents all 13 rules enforced by `GENERATE_SQL_SYSTEM_PROMPT` and the disclosure helpers. Rules 1–8 and 12 have post-execution disclosure via `_analyst_judgment_disclosure`; Rules 9–11 and 13 are prompt-only enforcement.
 
 ---
 
