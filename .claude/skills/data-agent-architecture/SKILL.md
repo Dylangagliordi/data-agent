@@ -255,6 +255,10 @@ build_visualization → END
 | `CleaningResult` | Dataclass: `folder_path`, `cleaned_dir`, `cleaned_files`, `skipped_files`, `untouched_files`. |
 | `FileCleaningRecord` | Dataclass: per-file result including `file_name`, `status`, `issues`, `remaining_issues`, `fail_issue_records`, `warn_batch`, `row_count_before/after`, `row_loss_flagged`. |
 | `_clean_issue_group` | Generates and executes fix code for a batch of issues. Calls `_request_approval` for interactive approval gate. |
+| `_describe_file_for_prompt(file_path, df=None)` | Builds sample-rows + column context block for the code-gen prompt. Accepts optional pre-loaded `df` to avoid reading the CSV twice. |
+| `_issue_guidance(issue, df=None)` | Appends deterministic guidance under a single issue line. For "Missing values" issues under the 20% ceiling, also calls `_categorical_fill_advice` when `df` is provided to recommend mode vs. `'Unknown'`. |
+| `_categorical_fill_advice(df, col)` | Returns a fill-value recommendation for a categorical column: mode when top category ≥ 40% share, `'Unknown'` when distribution is roughly even. Returns `""` for numeric or high-cardinality columns. |
+| `_CATEGORICAL_DOMINANT_THRESHOLD` | `0.40` — top-category share at or above this → mode is a safe fill value; below → `'Unknown'`. |
 
 **`FAIL_LEVEL_PREFIXES`** (issues that produce `status="fail"` in `_data_quality_status`):
 `"Duplicate rows:"`, `"Duplicate values:"`, `"Wrong data type:"`, `"Invalid values:"`, `"Encoding problem:"`, `"Structural issue:"`, `"Placeholder values:"`, `"Lost leading zeros:"`, `"Locale-specific number formatting:"`, `"Spreadsheet artifacts:"`, `"Column misalignment:"`, `"Header row duplicated mid-file:"`, `"Byte-order-mark:"`, `"Dangling references:"`

@@ -1238,8 +1238,9 @@ Special reasoning required for two specific issue categories, when they appear b
 
 MISSING VALUES: each such issue states the real percentage of that column that's missing. Your \
 chosen strategy must be proportional to that real number, not a reflexive default:
-- Under ~20% missing: imputing is reasonable (mean/median for a numeric column, mode for a \
-categorical one).
+- Under ~20% missing: imputing is reasonable (mean/median for a numeric column; for a \
+categorical column, use the mode when one category clearly dominates, or 'Unknown' when the \
+distribution is roughly even across categories — per-column guidance is provided below).
 - ~20% or more missing: do NOT silently impute — imputing most of a column risks inventing data \
 that was never there. Prefer dropping the column, dropping the affected rows, or leaving the \
 values null with a clear flag column, whichever fits the file best.
@@ -1257,10 +1258,12 @@ you are genuinely unsure whether a value in this category is an error, leave it 
 say so explicitly in a code comment rather than guessing."""
 
 
-def _describe_file_for_prompt(file_path: Path) -> str:
+def _describe_file_for_prompt(file_path: Path, df=None) -> str:
     """Build a real-sample-rows + real-column/dtype context block for one file, the same
-    principle generate_sql's schema context uses: concrete data, not a generic instruction."""
-    df = _read_csv_robust(file_path)
+    principle generate_sql's schema context uses: concrete data, not a generic instruction.
+    Pass df when the caller has already loaded it to avoid reading the file twice."""
+    if df is None:
+        df = _read_csv_robust(file_path)
     col_info = "\n".join(f"  - {c}" for c in df.columns)
     sample = df.head(5)
     sample_lines = "\n".join(str(row.to_dict()) for _, row in sample.iterrows())
@@ -1273,13 +1276,46 @@ def _describe_file_for_prompt(file_path: Path) -> str:
 MISSING_VALUE_IMPUTE_CEILING = 0.20
 
 _MISSING_PCT_RE = re.compile(r"is (\d+(?:\.\d+)?)% missing")
+_MISSING_COL_RE = re.compile(r"column '([^']+)'")
+# Top-category value-count share at or above this → mode is a safe fill; below → "Unknown"
+_CATEGORICAL_DOMINANT_THRESHOLD = 0.40
 
 
-def _issue_guidance(issue: str) -> str:
-    """Extra, deterministic guidance appended under one issue line in the code-gen prompt —
-    currently only fires for "Missing values" issues, where the real percentage is parsed
-    straight out of check_rubric's own issue string (the same number, not a re-guess) so the
-    LLM is pointed at a concrete number rather than left to eyeball the threshold itself."""
+def _categorical_fill_advice(df: pd.DataFrame, col: str) -> str:
+    """Return a fill-value recommendation for one categorical column.
+
+    Returns a short sentence (no leading space) that is appended inside the per-column
+    guidance note in the code-gen prompt.  Returns "" when the column is numeric or has
+    too-high cardinality to be categorical, so the caller can skip it cleanly."""
+    if col not in df.columns:
+        return ""
+    series = df[col].dropna()
+    if series.empty or pd.api.types.is_numeric_dtype(series):
+        return ""
+    n_unique = series.nunique()
+    if n_unique == 0 or n_unique / len(series) > 0.5:
+        return ""
+    counts = series.value_counts(normalize=True)
+    top_share = float(counts.iloc[0])
+    top_value = counts.index[0]
+    if top_share >= _CATEGORICAL_DOMINANT_THRESHOLD:
+        return (
+            f" One category dominates ('{top_value}' = {top_share:.0%} of non-null values) "
+            f"— fill with the mode ('{top_value}')."
+        )
+    return (
+        f" Distribution is roughly even (top category '{top_value}' is only {top_share:.0%}) "
+        f"— use 'Unknown' instead of the mode to avoid manufacturing a false majority."
+    )
+
+
+def _issue_guidance(issue: str, df=None) -> str:
+    """Extra, deterministic guidance appended under one issue line in the code-gen prompt.
+
+    Fires for "Missing values" issues: parses the real percentage from check_rubric's own
+    issue string so the LLM gets a concrete number.  When df is provided and the column is
+    categorical, also appends a fill-value recommendation (mode vs 'Unknown') based on the
+    actual value distribution."""
     if not issue.startswith("Missing values:"):
         return ""
     match = _MISSING_PCT_RE.search(issue)
@@ -1287,10 +1323,18 @@ def _issue_guidance(issue: str) -> str:
         return ""
     pct = float(match.group(1))
     if pct < MISSING_VALUE_IMPUTE_CEILING * 100:
-        return (
+        note = (
             f"    (This column is {pct:.1f}% missing — under the "
-            f"{MISSING_VALUE_IMPUTE_CEILING:.0%} ceiling, so imputing is reasonable here.)"
+            f"{MISSING_VALUE_IMPUTE_CEILING:.0%} ceiling, so imputing is reasonable here."
         )
+        if df is not None:
+            col_match = _MISSING_COL_RE.search(issue)
+            if col_match:
+                advice = _categorical_fill_advice(df, col_match.group(1))
+                if advice:
+                    note += advice
+        note += ")"
+        return note
     return (
         f"    (This column is {pct:.1f}% missing — at or above the "
         f"{MISSING_VALUE_IMPUTE_CEILING:.0%} ceiling, so do NOT silently impute; prefer "
@@ -1308,11 +1352,12 @@ def _generate_cleaning_code(
     """One LLM call producing a cleaning script targeting this file's specific issues.
     If previous_code/previous_error are given (a retry after a real execution failure),
     both are included so the model can see exactly what it tried and what broke."""
-    file_context = _describe_file_for_prompt(file_path)
+    df = _read_csv_robust(file_path)
+    file_context = _describe_file_for_prompt(file_path, df=df)
     issue_lines_parts = []
     for issue in issues:
         issue_lines_parts.append(f"- {issue}")
-        guidance = _issue_guidance(issue)
+        guidance = _issue_guidance(issue, df=df)
         if guidance:
             issue_lines_parts.append(guidance)
     issue_lines = "\n".join(issue_lines_parts)
