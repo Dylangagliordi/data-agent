@@ -8,6 +8,24 @@ These apply to every task in this project, not just the current one.
   uses. The admin/superuser connection is only ever used by `utils/load_data.py`. Never widen
   `app_reader`'s permissions to make something work — that defeats its purpose.
 
+## Database Role Invariant — app_reader is enforced read-only at the DB level
+
+`app_reader` must only hold SELECT on public tables and USAGE on the public schema.
+The LLM safety judge (`is_safe`) is a UX/policy layer — the real security boundary is the
+database itself. The following grants must never be re-added:
+
+```sql
+-- Run once as superuser to establish (or re-establish after any accidental grant):
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public FROM app_reader;
+REVOKE CREATE ON SCHEMA public FROM app_reader;
+-- Ensure future tables are also covered:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLES FROM app_reader;
+```
+
+If `app_reader` can INSERT/UPDATE/DELETE/TRUNCATE any table, that is a misconfiguration —
+fix it immediately by running the REVOKE commands above as superuser.
+
 ## Secrets
 - All credentials live in `.env`, never hardcoded in source files.
 - Never print, log, or include a secret in test output — including database passwords, not

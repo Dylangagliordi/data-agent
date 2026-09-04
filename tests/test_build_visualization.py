@@ -9,19 +9,18 @@ Confirms:
 """
 
 import csv
+import json
 from pathlib import Path
 
 from agents.sql_analyst import build_visualization
 from models.schema import SQLAnalystState
 
-# Synthetic execution result (same format execute_sql produces)
-FAKE_RESULT = str([
-    {"customer_state": "SP", "order_count": 41746},
-    {"customer_state": "RJ", "order_count": 12852},
-    {"customer_state": "MG", "order_count": 11635},
-    {"customer_state": "RS", "order_count": 5466},
-    {"customer_state": "PR", "order_count": 5045},
-])
+# Synthetic execution result in the structured JSON format execute_sql now produces.
+FAKE_RESULT = json.dumps({
+    "columns": ["customer_state", "order_count"],
+    "rows": [["SP", 41746], ["RJ", 12852], ["MG", 11635], ["RS", 5466], ["PR", 5045]],
+    "truncated": False,
+})
 
 print("=" * 70)
 print("CASE 1: reasoned chart type -> reasoning in final_answer, CSV correct")
@@ -77,13 +76,11 @@ state2 = SQLAnalystState(
     chart_type="pie chart",
     chart_type_source="explicit",
     chart_type_reasoning="",
-    sql_query_execution_result=str([
-        {"customer_state": "SP", "order_count": 41746},
-        {"customer_state": "RJ", "order_count": 12852},
-        {"customer_state": "MG", "order_count": 11635},
-        {"customer_state": "RS", "order_count": 5466},
-        {"customer_state": "PR", "order_count": 5045},
-    ]),
+    sql_query_execution_result=json.dumps({
+        "columns": ["customer_state", "order_count"],
+        "rows": [["SP", 41746], ["RJ", 12852], ["MG", 11635], ["RS", 5466], ["PR", 5045]],
+        "truncated": False,
+    }),
 )
 result2 = build_visualization(state2)
 print("output_file_path:", result2["output_file_path"])

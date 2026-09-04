@@ -145,7 +145,8 @@ def ask(question: str) -> tuple:
     # wiring, not real execution — a hand-built plausible execution_result is enough
     # for represent_final_answer to produce a real natural-language answer that either
     # does or doesn't mention data quality.
-    state = state.model_copy(update={"sql_query_execution_result": "[{'n': 8}]"})
+    import json as _j
+    state = state.model_copy(update={"sql_query_execution_result": _j.dumps({"columns": ["n"], "rows": [[8]], "truncated": False})})
 
     final_result = represent_final_answer(state)
     return final_result["final_answer"], state.prompt_query_context

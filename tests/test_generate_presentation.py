@@ -187,11 +187,12 @@ print("=" * 70)
 from agents.sql_analyst import build_visualization
 from models.schema import SQLAnalystState
 
-FAKE_RESULT = str([
-    {"customer_state": "SP", "order_count": 41746},
-    {"customer_state": "RJ", "order_count": 12852},
-    {"customer_state": "MG", "order_count": 11635},
-])
+import json as _json_pres
+FAKE_RESULT = _json_pres.dumps({
+    "columns": ["customer_state", "order_count"],
+    "rows": [["SP", 41746], ["RJ", 12852], ["MG", 11635]],
+    "truncated": False,
+})
 
 state5 = SQLAnalystState(
     wants_visualization=True,

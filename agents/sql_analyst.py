@@ -2,10 +2,12 @@
 SQL analyst sub-agent: LangGraph node definitions.
 """
 
-import ast
 import csv
 import datetime as _dt
+import decimal as _decimal
+import json
 import re
+import statistics
 from pathlib import Path
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -19,71 +21,27 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Result parsing ────────────────────────────────────────────────────────────
 
-_DECIMAL_RE = re.compile(r"Decimal\('([^']+)'\)")
-
-
-def _strip_truncation_marker(result_str: str) -> tuple[str, bool]:
-    """Split execute_sql's truncation note off the front of a result string, if present.
-
-    execute_sql prepends a human-readable bracketed note (starting with
-    _TRUNCATION_MARKER, containing an em-dash and free text — not valid Python) when
-    a query matched more than MAX_RESULT_ROWS rows. That note is followed by
-    "]\\n" and then the actual list-of-dicts repr. Without stripping it first,
-    _parse_sql_result's eval() hits a SyntaxError on the note text and silently
-    returns [] — which build_visualization then can't distinguish from a query that
-    genuinely returned zero rows, producing a false "no data" answer over a result
-    that actually had 200+ real rows.
-
-    Returns (actual_list_repr, was_truncated). When no marker is present, returns
-    (result_str, False) unchanged.
-    """
-    if not result_str.startswith(_TRUNCATION_MARKER):
-        return result_str, False
-    idx = result_str.find("]\n")
-    if idx == -1:
-        # Marker present but the expected closing "]\n" wasn't found — nothing safe
-        # to strip; let the caller's eval fail loudly rather than guess at a split.
-        return result_str, True
-    return result_str[idx + 2:], True
-
 
 def _parse_sql_result(result_str: str) -> tuple[list, bool]:
-    """Parse execute_sql's str() repr of a list of dicts.
+    """Parse execute_sql's JSON result string into a list of row dicts.
 
-    ast.literal_eval alone cannot handle two psycopg2 types that commonly
-    appear in query results:
-    - Decimal('1.23') — produced for NUMERIC/DECIMAL columns and aggregates
-      like SUM/AVG over numeric columns; replaced with the bare float literal
-      before parsing.
-    - datetime.datetime / datetime.date — produced for timestamp and date
-      columns; requires a controlled eval() with the datetime module available.
+    execute_sql serializes rows as {"columns": [...], "rows": [[...], ...], "truncated": bool}.
+    Decimal values are stored as floats and datetime values as ISO strings at
+    serialization time, so no regex reconstruction or eval is needed here.
 
-    Uses eval() with a restricted namespace (no __builtins__) rather than
-    ast.literal_eval so these types resolve. The input is always the str()
-    repr of our own database execution result — not user-supplied text — and
-    the SQL that produced it was already cleared by the is_safe judge, so
-    the controlled-eval approach is safe here.
-
-    Also strips execute_sql's truncation note (see _strip_truncation_marker) before
-    parsing, so a truncated-but-nonempty result still parses into real data instead
-    of silently becoming []. Returns (parsed_rows, was_truncated) — callers must
-    check was_truncated to disclose a partial result rather than presenting it as
-    complete.
+    Returns (rows_as_list_of_dicts, was_truncated).
+    Returns ([], False) for error strings (SQL_EXECUTION_ERROR: prefix) or any
+    unparseable input — callers treat that as "no data".
     """
-    stripped, was_truncated = _strip_truncation_marker(result_str)
-    cleaned = _DECIMAL_RE.sub(r"\1", stripped)
-    namespace = {
-        "__builtins__": {},
-        "datetime": _dt,
-        "Decimal": float,
-    }
+    if not result_str or result_str.startswith(_SQL_ERROR_PREFIX):
+        return [], False
     try:
-        result = eval(cleaned, namespace)  # noqa: S307
-        if isinstance(result, list):
-            return result, was_truncated
-        return [], was_truncated
+        data = json.loads(result_str)
+        cols = data["columns"]
+        rows = [dict(zip(cols, row)) for row in data["rows"]]
+        return rows, bool(data.get("truncated", False))
     except Exception:
-        return [], was_truncated
+        return [], False
 
 _ID_COLUMN_RE = re.compile(r"_id$")
 
@@ -841,7 +799,7 @@ def _outlier_sensitivity_note(result_data: list) -> str:
     )
     if len(vals) < 3:
         return ""
-    median_val = vals[len(vals) // 2]
+    median_val = statistics.median(vals)
     max_val = vals[-1]
     if median_val > 0 and max_val > 3 * median_val:
         label = mc.replace("_", " ").title()
@@ -1195,7 +1153,21 @@ def route_after_safety_check(state: SQLAnalystState) -> str:
 MAX_SQL_ATTEMPTS = 5
 _SQL_ERROR_PREFIX = "SQL_EXECUTION_ERROR: "
 MAX_RESULT_ROWS = 200
-_TRUNCATION_MARKER = "[TRUNCATED TO FIRST"
+# Statement timeout applied on every app_reader connection before executing user SQL.
+# Guards against queries that must fully execute before returning any rows — the
+# MAX_RESULT_ROWS cap alone cannot stop those. Units: milliseconds.
+_STATEMENT_TIMEOUT_MS = 30_000
+
+
+class _ResultEncoder(json.JSONEncoder):
+    """Serialize psycopg2 result types that are not native JSON."""
+
+    def default(self, obj):
+        if isinstance(obj, _decimal.Decimal):
+            return float(obj)
+        if isinstance(obj, (_dt.datetime, _dt.date)):
+            return obj.isoformat()
+        return super().default(obj)
 
 
 def execute_sql(state: SQLAnalystState) -> dict:
@@ -1208,17 +1180,22 @@ def execute_sql(state: SQLAnalystState) -> dict:
     route back to generate_sql with that error, capped at MAX_SQL_ATTEMPTS total
     attempts across the whole cycle.
 
-    Result rows are capped at MAX_RESULT_ROWS: an unbounded query (e.g. one with
-    no LIMIT that matches a huge fraction of a table) produced a multi-megabyte
-    result string in practice, which the summarizer node could not actually see
-    in full and ended up fabricating invented statistics over. Truncation is
-    reported explicitly in the result string so downstream nodes never mistake
-    a partial result for the complete answer.
+    Result rows are capped at MAX_RESULT_ROWS and serialized as structured JSON
+    {"columns": [...], "rows": [[...], ...], "truncated": bool}, with Decimal and
+    datetime values converted at serialization time so downstream parsing requires
+    only json.loads — no eval(), no regex reconstruction.
+
+    A statement_timeout is set on every connection as a hard resource safeguard:
+    a query that must fully execute before returning any rows cannot be stopped
+    by the row cap alone, so we bound its wall-clock time at the database level.
     """
     attempts = state.sql_attempts + 1
     conn = get_app_reader_connection()
     try:
         with conn.cursor() as cur:
+            # Hard resource guard: kill the query if it runs longer than the timeout.
+            # SET LOCAL applies for the current transaction only.
+            cur.execute("SET LOCAL statement_timeout = %s", (_STATEMENT_TIMEOUT_MS,))
             # generated_sql_query is model-authored SQL text, not a value to bind —
             # there is no placeholder mechanism for "run this arbitrary statement";
             # safety here is enforced upstream by the is_safe judge gate, not by
@@ -1230,17 +1207,17 @@ def execute_sql(state: SQLAnalystState) -> dict:
                 truncated = len(rows) > MAX_RESULT_ROWS
                 if truncated:
                     rows = rows[:MAX_RESULT_ROWS]
-                result_str = str([dict(zip(col_names, r)) for r in rows])
-                if truncated:
-                    result_str = (
-                        f"{_TRUNCATION_MARKER} {MAX_RESULT_ROWS} ROWS — the query matched more "
-                        f"rows than this; the full result set was NOT retrieved, so do not "
-                        f"compute counts/averages/min/max over \"all\" rows from this data]\n"
-                        f"{result_str}"
-                    )
+                result_payload = {
+                    "columns": col_names,
+                    "rows": [list(r) for r in rows],
+                    "truncated": truncated,
+                }
+                result_str = json.dumps(result_payload, cls=_ResultEncoder)
             else:
                 result_str = "(query executed, no rows returned)"
-        conn.commit()
+        # Read-only connection: roll back the implicit transaction cleanly rather
+        # than committing (there is nothing to commit on a SELECT).
+        conn.rollback()
         return {"sql_query_execution_result": result_str, "sql_attempts": attempts}
     except Exception as e:
         conn.rollback()
@@ -1307,13 +1284,6 @@ entirely. Never claim, imply, or hint that any change, update, or write happened
 raw execution result itself explicitly reflects it. If the question asked for an action \
 that clearly did not occur, say plainly that only the requested data was retrieved and no \
 change was made — do not agree that it happened just because the user asked for it.
-- If the execution result starts with "[TRUNCATED TO FIRST", it means the database matched \
-more rows than were actually retrieved — you are only seeing a partial slice, not the whole \
-result set. In that case, do NOT compute or state any count, average, min, max, or other \
-aggregate as if it covers "all" matching rows — that would be fabricated from incomplete data. \
-Instead say plainly that the result was too large to fully summarize and describe only the \
-partial sample you can actually see (e.g. a few example rows), or suggest the question be \
-narrowed (e.g. add a LIMIT or filter) to get a complete answer.
 - Data-quality note: if the "Data quality notes" section below is non-empty, it means at \
 least one table this query actually touched either has no recorded data-quality check, or \
 has an unresolved critical (fail-level) data-quality issue. State this plainly but briefly \
@@ -1368,13 +1338,16 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
             "messages": [AIMessage(content=state.final_answer)],
         }
 
+    # Parse once; use result_data for both the LLM content and the disclosure helpers.
+    result_data, was_truncated = _parse_sql_result(state.sql_query_execution_result)
+
     # Deterministic guard, not just a prompt instruction: a small local model was
     # observed (live, reproduced in tests/test_result_truncation.py) to fabricate
     # counts/averages/min/max over a truncated result anyway, despite an explicit
     # system-prompt rule not to. Rather than trust the LLM to comply, skip the LLM
     # summarization entirely when the result is truncated and report the
     # limitation directly — this cannot be talked out of by the model.
-    if state.sql_query_execution_result.startswith(_TRUNCATION_MARKER):
+    if was_truncated:
         final_answer = (
             "This query matched more rows than could be retrieved in full "
             f"(results are capped at {MAX_RESULT_ROWS} rows), so I can't give you a complete "
@@ -1395,7 +1368,7 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
     human_content = (
         f"Original question: {state.user_question}\n\n"
         f"The SQL query that was actually executed:\n{state.generated_sql_query}\n\n"
-        f"Raw SQL execution result: {state.sql_query_execution_result}\n\n"
+        f"Raw SQL execution result: {result_data}\n\n"
         f"Data quality notes for tables this query touched:\n{data_quality_section}"
     )
     response = llm.invoke(
@@ -1411,7 +1384,6 @@ def represent_final_answer(state: SQLAnalystState) -> dict:
     # (see the truncation-fabrication and question-paraphrasing bugs). Every
     # triggered rubric rule is extracted mechanically from the real query text and
     # parsed result data — the LLM summarizer cannot omit or reword it away.
-    result_data, _ = _parse_sql_result(state.sql_query_execution_result)
     disclosure = _analyst_judgment_disclosure(state.generated_sql_query, result_data)
     if disclosure:
         final_answer = f"{final_answer}\n\nHow this answer was computed: {disclosure}"

@@ -30,11 +30,12 @@ print("=" * 70)
 from agents.sql_analyst import build_visualization
 from models.schema import SQLAnalystState
 
-FAKE_RESULT = str([
-    {"customer_state": "SP", "order_count": 41746},
-    {"customer_state": "RJ", "order_count": 12852},
-    {"customer_state": "MG", "order_count": 11635},
-])
+import json as _json_fmt
+FAKE_RESULT = _json_fmt.dumps({
+    "columns": ["customer_state", "order_count"],
+    "rows": [["SP", 41746], ["RJ", 12852], ["MG", 11635]],
+    "truncated": False,
+})
 
 state = SQLAnalystState(
     wants_visualization=True,
@@ -71,11 +72,11 @@ for ct in ["line chart", "scatter plot", "pie chart", "donut chart",
         chart_type=ct,
         chart_type_source="explicit",
         chart_type_reasoning="",
-        sql_query_execution_result=str([
-            {"category": "A", "value": 10},
-            {"category": "B", "value": 20},
-            {"category": "C", "value": 30},
-        ]),
+        sql_query_execution_result=_json_fmt.dumps({
+            "columns": ["category", "value"],
+            "rows": [["A", 10], ["B", 20], ["C", 30]],
+            "truncated": False,
+        }),
     )
     r = build_visualization(s)
     # chart_image_path may be empty for chart types where data shape doesn't fit

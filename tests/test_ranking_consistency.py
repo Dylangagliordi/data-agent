@@ -125,10 +125,15 @@ for i in range(3):
 
     # Simulate real execution result so represent_final_answer's disclosure can be
     # checked without a live DB round trip inside this loop — feed a fake sample.
-    fake_result = str([
-        {"industry": "Staffing & Outsourcing", "avg_job_satisfaction": 4.15, "avg_salary": 128153, "n": 36},
-        {"industry": "Computer Hardware & Software", "avg_job_satisfaction": 4.24, "avg_salary": 120219, "n": 57},
-    ])
+    import json as _json
+    fake_result = _json.dumps({
+        "columns": ["industry", "avg_job_satisfaction", "avg_salary", "n"],
+        "rows": [
+            ["Staffing & Outsourcing", 4.15, 128153, 36],
+            ["Computer Hardware & Software", 4.24, 120219, 57],
+        ],
+        "truncated": False,
+    })
     answer_state = state.model_copy(
         update={"sql_query_execution_result": fake_result, "generated_sql_query": sql}
     )

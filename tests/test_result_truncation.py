@@ -38,13 +38,18 @@ if __name__ == "__main__":
     exec_result = execute_sql(unbounded_state)
     raw_result = exec_result["sql_query_execution_result"]
 
+    import json as _json
     print("result length (chars):", len(raw_result))
-    print("starts with truncation marker?:", raw_result.startswith("[TRUNCATED TO FIRST"))
-    print("first 200 chars:", raw_result[:200])
+    parsed = _json.loads(raw_result)
+    print("truncated field:", parsed.get("truncated"))
+    print("row count in payload:", len(parsed.get("rows", [])))
 
-    assert raw_result.startswith("[TRUNCATED TO FIRST"), (
+    assert parsed.get("truncated") is True, (
         "expected the result to be marked truncated — this query is known to match "
         "~96,096 rows, far more than MAX_RESULT_ROWS"
+    )
+    assert len(parsed["rows"]) == MAX_RESULT_ROWS, (
+        f"expected exactly {MAX_RESULT_ROWS} rows in payload, got {len(parsed['rows'])}"
     )
     # Sanity: the capped result should be small (KB), not the ~10MB blob seen before the fix.
     assert len(raw_result) < 100_000, f"result is still huge ({len(raw_result)} chars) — cap did not work"

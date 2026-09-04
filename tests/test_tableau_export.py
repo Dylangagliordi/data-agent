@@ -16,11 +16,12 @@ from pathlib import Path
 from agents.sql_analyst import _detect_export_target, build_visualization, determine_chart_type
 from models.schema import SQLAnalystState
 
-FAKE_RESULT = str([
-    {"customer_state": "SP", "order_count": 41746},
-    {"customer_state": "RJ", "order_count": 12852},
-    {"customer_state": "MG", "order_count": 11635},
-])
+import json as _json
+FAKE_RESULT = _json.dumps({
+    "columns": ["customer_state", "order_count"],
+    "rows": [["SP", 41746], ["RJ", 12852], ["MG", 11635]],
+    "truncated": False,
+})
 
 # ── Unit test: export-target detection ────────────────────────────────────────
 print("=" * 70)

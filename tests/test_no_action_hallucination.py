@@ -21,11 +21,16 @@ REAL_SQL = (
     "ORDER BY total_spent DESC\n"
     "LIMIT 10;"
 )
-REAL_RESULT = (
-    "[{'customer_unique_id': '0a0a92112bd4c708ca5fde585afaa872', 'total_spent': 13664.08}, "
-    "{'customer_unique_id': '46450c74a0d8c5ca9395da1daac6c120', 'total_spent': 9553.02}, "
-    "{'customer_unique_id': 'da122df9eeddfedc1dc1f5349a1a690c', 'total_spent': 7571.63}]"
-)
+import json as _j
+REAL_RESULT = _j.dumps({
+    "columns": ["customer_unique_id", "total_spent"],
+    "rows": [
+        ["0a0a92112bd4c708ca5fde585afaa872", 13664.08],
+        ["46450c74a0d8c5ca9395da1daac6c120", 9553.02],
+        ["da122df9eeddfedc1dc1f5349a1a690c", 7571.63],
+    ],
+    "truncated": False,
+})
 
 FORBIDDEN_PHRASES = [
     "has been updated",

@@ -4,10 +4,11 @@ from agents.sql_analyst import represent_final_answer
 from models.schema import SQLAnalystState
 
 if __name__ == "__main__":
-    # Case 1: real success result
+    # Case 1: real success result (JSON format produced by execute_sql)
+    import json as _j
     success_state = SQLAnalystState(
         user_question="How many total orders have been recorded in the database?",
-        sql_query_execution_result="[{'n': 99441}]",
+        sql_query_execution_result=_j.dumps({"columns": ["n"], "rows": [[99441]], "truncated": False}),
     )
     result1 = represent_final_answer(success_state)
     print("--- success case ---")

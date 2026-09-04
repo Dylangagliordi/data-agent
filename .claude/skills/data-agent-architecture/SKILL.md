@@ -28,7 +28,7 @@ Shared state threaded through every node of the SQL analyst LangGraph.
 | `generated_sql_query` | `str` | SQL text produced by generate_sql (may be updated on retry) |
 | `is_safe` | `Literal["yes","no"]` | Safety judge verdict |
 | `comments` | `str` | Safety judge reasoning text |
-| `sql_query_execution_result` | `str` | Raw `str()` repr of query results, or error string prefixed `SQL_EXECUTION_ERROR:`, or truncation-marked string |
+| `sql_query_execution_result` | `str` | Structured JSON `{"columns":[...],"rows":[[...],...],"truncated":bool}` for successful queries, or error string prefixed `SQL_EXECUTION_ERROR:` |
 | `final_answer` | `str` | Plain-English answer (set by represent_final_answer, cancel_sql, or build_visualization) |
 | `data_quality_warnings` | `list` | List of `{"table": str, "warning": str}` dicts for fail-level or no-record tables |
 | `sql_attempts` | `int` | Count of generate→execute cycles; capped at `MAX_SQL_ATTEMPTS = 5` |
@@ -101,7 +101,7 @@ output_file_path, chart_image_path, final_answer
 timestamp, route_response, route_comments, user_question, final_answer
 ```
 
-`sql_query_execution_result` is the raw `str()` repr of a list-of-dicts from psycopg2. Truncated results are prefixed with `[TRUNCATED TO FIRST {N} ROWS — ...]`. Errors are prefixed with `SQL_EXECUTION_ERROR:`.
+`sql_query_execution_result` is a structured JSON string `{"columns":[...],"rows":[[...],...],"truncated":bool}` for successful queries (Decimal serialized as float, datetime as ISO string). Errors are an unquoted string prefixed `SQL_EXECUTION_ERROR:`. Old log entries (pre-security-hardening commit) may contain the legacy `str()` repr or `[TRUNCATED TO FIRST …]` format.
 
 **Written by:** `main.py:log_run()`. SQL/visualize internal fields come from `agents/router.py:LAST_SQL_ANALYST_STATE` side-channel (module-level dict set by `sql_node` / `visualize_node` after every graph invocation).
 
@@ -176,7 +176,7 @@ CREATE TABLE _data_quality_status (
 | `determine_chart_type` | Node (visualization path only): classifies chart type via `ChartTypeSchema` with `pick_llm("cheap")`. |
 | `generate_sql` | Node 3: writes one SQL query. Uses `pick_llm("high")`. Extended with chart-shaping instructions on visualization path. |
 | `is_safe` | Node 4: read-only safety gate via `JudgeSchema` with `pick_llm("cheap")`. |
-| `execute_sql` | Node 6: runs SQL via `app_reader`, caps results at `MAX_RESULT_ROWS = 200`, handles errors and retry counting. |
+| `execute_sql` | Node 6: runs SQL via `app_reader`, sets `SET LOCAL statement_timeout` before every query, caps results at `MAX_RESULT_ROWS = 200`, serializes to JSON via `_ResultEncoder` (Decimal/datetime safe), handles errors and retry counting. Uses `conn.rollback()` (never `conn.commit()`) — read-only connection. |
 | `cancel_sql` | Node 7: writes final_answer explaining blocked query. |
 | `represent_final_answer` | Node 8: plain-English summarization via `pick_llm("cheap")`. Bypassed deterministically for truncated results. |
 | `build_visualization` | Visualization terminal node: writes CSV (always), `.hyper` (if Tableau), renders `.png` via `_render_chart_image`, produces final_answer. |
@@ -185,7 +185,9 @@ CREATE TABLE _data_quality_status (
 | `_render_chart_image` | Renders a matplotlib `.png` for the given chart_type. Uses `Figure`/`FigureCanvasAgg` (no global pyplot). Catches all exceptions; returns `None` on failure. |
 | `_squarify_rects` | Internal treemap layout (no squarify dependency). |
 | `_detect_fanout_warnings` | Deterministic fan-out check: live `COUNT(*)/COUNT(DISTINCT)` queries against real data. |
-| `_parse_sql_result` | Parses psycopg2 `str()` repr; handles `Decimal` and `datetime` types via controlled `eval()`. |
+| `_parse_sql_result` | Parses execute_sql's JSON `{"columns":[...],"rows":[...],"truncated":bool}` string into a list of dicts. Returns `([], False)` for error strings or unparseable input. No eval(), no regex — Decimal/datetime are serialized at source. |
+| `_ResultEncoder` | `json.JSONEncoder` subclass used by `execute_sql`: converts `decimal.Decimal` → float, `datetime.datetime`/`datetime.date` → ISO string at serialization time. |
+| `_STATEMENT_TIMEOUT_MS` | Module constant (default 30 000 ms). Applied as `SET LOCAL statement_timeout` inside every `execute_sql` call to kill runaway queries at the DB level. |
 | `_chart_shaping_instruction` | Returns SQL-shaping instructions per chart type for `generate_sql`'s prompt. |
 | `_analyst_judgment_disclosure(sql, result_data=None)` | Unified deterministic disclosure (replaced `_ranking_convention_disclosure`). Covers: HAVING threshold (Rule 1), combined ORDER BY (Rule 2), NULL exclusions (Rule 3), time framing (Rule 4), outlier sensitivity (Rule 5), group size imbalance (Rule 6), SELECT DISTINCT deduplication (Rule 12). Returns `""` when no rule fires. Appended as `"How this answer was computed: ..."` by `represent_final_answer` and `build_visualization`. |
 | `_apply_causal_correction(answer, sql)` | Two-pass rewrite: clear causal phrases (`leads to`, `causes`, `because of`, etc.) are replaced in-place with associative equivalents; ambiguous verbs (`drives`, `affects`) trigger the association disclaimer as fallback. Rule 8. |
@@ -333,7 +335,7 @@ Key internal functions:
 ## 4. Database Structure
 
 **Two-role setup:**
-- `app_reader` — read-only. All graph runtime queries use this role (`utils/db.py:get_app_reader_connection()`). Never write to this role's grants to make something work.
+- `app_reader` — DB-enforced read-only (SELECT + USAGE only; INSERT/UPDATE/DELETE/TRUNCATE/CREATE revoked at the database level — see AGENTS.md invariant). All graph runtime queries use this role (`utils/db.py:get_app_reader_connection()`). Never re-add write grants — the LLM safety judge is a UX layer, not the security boundary.
 - Admin/superuser — write access. Used exclusively by `utils/load_data.py:get_admin_connection()`. Also used by `clean_and_reload` node (which calls `load_data.py` functions).
 
 **Severity mapping location:** `utils/data_cleaning.py` — `FAIL_LEVEL_PREFIXES` and `WARN_LEVEL_PREFIXES` tuples at module level (lines 177–208). `compute_quality_status` in `utils/load_data.py` calls `_issue_severity` imported from `data_cleaning.py` — same mapping, one source of truth.
