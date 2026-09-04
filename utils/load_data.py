@@ -40,6 +40,7 @@ were never checked or still have an unresolved fail-level issue.
 
 import csv
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -65,6 +66,141 @@ def get_admin_connection():
         user=os.environ["PG_ADMIN_USER"],
         # local trust auth for the admin user: no password needed/stored
     )
+
+
+_ID_COLUMN_RE = re.compile(r"_id$")
+
+
+def _is_id_like_column(col: str) -> bool:
+    """True for 'id' or any column ending in '_id' — same logic as in sql_analyst.py."""
+    return col == "id" or bool(_ID_COLUMN_RE.search(col))
+
+
+def ensure_fanout_status_table(conn) -> None:
+    """Create _fanout_status if it doesn't already exist, and grant SELECT to app_reader.
+
+    Table identifiers below are fixed literals from this source file, not runtime/user
+    input — same rationale as ensure_data_quality_status_table (DDL identifiers can't
+    use %s placeholders in any SQL dialect).
+    """
+    app_reader = os.environ.get("PG_APP_READER_USER", "app_reader")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _fanout_status (
+                table_name   TEXT NOT NULL,
+                column_name  TEXT NOT NULL,
+                is_likely_fk BOOLEAN NOT NULL,
+                has_fanout   BOOLEAN NOT NULL,
+                source       TEXT NOT NULL,
+                checked_at   TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (table_name, column_name)
+            );
+            """
+        )
+        cur.execute(f'GRANT SELECT ON _fanout_status TO "{app_reader}";')
+    conn.commit()
+
+
+def compute_and_write_fanout_status(conn, table_name: str) -> None:
+    """Compute fan-out metadata for id-like columns in table_name and persist to
+    _fanout_status. Called once after each table load.
+
+    Three-tier logic (checked in order):
+    1. Declared PRIMARY KEY: not a FK, no fan-out. source='declared_pk'
+    2. Declared FOREIGN KEY: is a FK; cardinality determines has_fanout. source='declared_fk'
+    3. Id-like column with no declared constraint: cardinality heuristic.
+       - Unique within own table -> inferred PK (is_likely_fk=False). source='cardinality_heuristic'
+       - Non-unique -> inferred FK with fan-out (is_likely_fk=True). source='cardinality_heuristic'
+
+    Replaces any existing _fanout_status rows for this table so a reload always reflects
+    current data, not stale pre-reload cardinality.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON kcu.constraint_name = tc.constraint_name
+               AND kcu.table_schema   = tc.table_schema
+               AND kcu.table_name     = tc.table_name
+            WHERE tc.table_schema = 'public'
+              AND tc.table_name   = %s
+              AND tc.constraint_type = 'PRIMARY KEY'
+            """,
+            (table_name,),
+        )
+        declared_pks = {row[0] for row in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON kcu.constraint_name = tc.constraint_name
+               AND kcu.table_schema   = tc.table_schema
+               AND kcu.table_name     = tc.table_name
+            WHERE tc.table_schema = 'public'
+              AND tc.table_name   = %s
+              AND tc.constraint_type = 'FOREIGN KEY'
+            """,
+            (table_name,),
+        )
+        declared_fks = {row[0] for row in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name   = %s
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        )
+        all_columns = [row[0] for row in cur.fetchall()]
+
+    covered = declared_pks | declared_fks
+    id_like_uncovered = [c for c in all_columns if _is_id_like_column(c) and c not in covered]
+
+    def cardinality(col):
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT COUNT(*), COUNT(DISTINCT "{col}") FROM "{table_name}"'
+            )
+            return cur.fetchone()
+
+    rows_to_insert = []
+
+    for col in declared_pks:
+        rows_to_insert.append((table_name, col, False, False, "declared_pk"))
+
+    for col in declared_fks:
+        if col in declared_pks:
+            continue
+        total, distinct = cardinality(col)
+        rows_to_insert.append((table_name, col, True, total > distinct, "declared_fk"))
+
+    for col in id_like_uncovered:
+        total, distinct = cardinality(col)
+        if total == distinct:
+            rows_to_insert.append((table_name, col, False, False, "cardinality_heuristic"))
+        else:
+            rows_to_insert.append((table_name, col, True, True, "cardinality_heuristic"))
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM _fanout_status WHERE table_name = %s", (table_name,))
+        if rows_to_insert:
+            cur.executemany(
+                """
+                INSERT INTO _fanout_status
+                    (table_name, column_name, is_likely_fk, has_fanout, source, checked_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                """,
+                rows_to_insert,
+            )
+    conn.commit()
 
 
 def ensure_data_quality_status_table(conn) -> None:
@@ -292,6 +428,7 @@ def main() -> None:
     conn = get_admin_connection()
     try:
         ensure_data_quality_status_table(conn)
+        ensure_fanout_status_table(conn)
         for load_path, original_name in load_plan:
             table_name, row_count = load_csv_to_table(conn, load_path)
             source_note = " (cleaned)" if original_name in cleaned_names else ""
@@ -311,6 +448,8 @@ def main() -> None:
                 source_folder=str(folder),
             )
             print(f"  -> data quality status: {status} ({len(issues_found)} unresolved issue(s))")
+            compute_and_write_fanout_status(conn, table_name)
+            print(f"  -> fan-out status computed for '{table_name}'")
     finally:
         conn.close()
 

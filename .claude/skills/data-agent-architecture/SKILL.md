@@ -161,7 +161,32 @@ CREATE TABLE _data_quality_status (
 );
 ```
 
-`status` is set by `utils/load_data.py:compute_quality_status()` which calls `_issue_severity()` from `utils/data_cleaning.py`. The table is excluded from `information_schema` queries in `add_context` (filtered by `table_name != '_data_quality_status'`). Only `fail`-status tables inject WARNING lines into `generate_sql`'s context; `warn`-status tables are silently ignored.
+`status` is set by `utils/load_data.py:compute_quality_status()` which calls `_issue_severity()` from `utils/data_cleaning.py`. The table is excluded from `information_schema` queries in `add_context` (filtered by `table_name NOT IN ('_data_quality_status', '_fanout_status')`). Only `fail`-status tables inject WARNING lines into `generate_sql`'s context; `warn`-status tables are silently ignored.
+
+---
+
+### `_fanout_status` Postgres Table
+
+Created and maintained by `utils/load_data.py:ensure_fanout_status_table()`. Written by `compute_and_write_fanout_status()` after every table load. Read by `add_context` via `_read_fanout_from_metadata()` in `agents/sql_analyst.py`.
+
+```sql
+CREATE TABLE _fanout_status (
+    table_name   TEXT NOT NULL,
+    column_name  TEXT NOT NULL,
+    is_likely_fk BOOLEAN NOT NULL,
+    has_fanout   BOOLEAN NOT NULL,
+    source       TEXT NOT NULL,    -- 'declared_pk', 'declared_fk', 'cardinality_heuristic'
+    checked_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (table_name, column_name)
+);
+```
+
+One row per id-like column per table. `source` indicates how the determination was made:
+- `'declared_pk'`: column appears in an `information_schema` PRIMARY KEY constraint — not a FK, no fan-out.
+- `'declared_fk'`: column appears in an `information_schema` FOREIGN KEY constraint — is a FK; cardinality checked for `has_fanout`.
+- `'cardinality_heuristic'`: no declared constraint; id-like column checked via `COUNT(*)/COUNT(DISTINCT)`. Unique → inferred PK (is_likely_fk=False). Non-unique → inferred FK (is_likely_fk=True, has_fanout=True).
+
+`add_context` reads precomputed rows instead of running live cardinality scans per question. Tables not in `_fanout_status` fall back to live `_detect_fanout_warnings` and log a message to stderr. SELECT granted to `app_reader` by `ensure_fanout_status_table`.
 
 ---
 
@@ -180,11 +205,12 @@ CREATE TABLE _data_quality_status (
 | `cancel_sql` | Node 7: writes final_answer explaining blocked query. |
 | `represent_final_answer` | Node 8: plain-English summarization via `pick_llm("cheap")`. Bypassed deterministically for truncated results. |
 | `build_visualization` | Visualization terminal node: writes CSV (always), `.hyper` (if Tableau), renders `.png` via `_render_chart_image`, produces final_answer. |
-| `clean_and_reload` | Auto-clean redirect node: calls `clean_dataset()` → `load_csv_to_table()` → updates `_data_quality_status`. Accepts `_llm=` for test injection. |
+| `clean_and_reload` | Auto-clean redirect node: calls `clean_dataset()` → `load_csv_to_table()` → updates `_data_quality_status` and `_fanout_status`. Accepts `_llm=` for test injection. |
 | `build_sql_analyst_graph` | Compiles and returns the compiled LangGraph `StateGraph`. |
 | `_render_chart_image` | Renders a matplotlib `.png` for the given chart_type. Uses `Figure`/`FigureCanvasAgg` (no global pyplot). Catches all exceptions; returns `None` on failure. |
 | `_squarify_rects` | Internal treemap layout (no squarify dependency). |
-| `_detect_fanout_warnings` | Deterministic fan-out check: live `COUNT(*)/COUNT(DISTINCT)` queries against real data. |
+| `_read_fanout_from_metadata(conn, table_names)` | Reads precomputed fan-out data from `_fanout_status`. Returns `(warnings, uncovered_tables)`. Source labels: `'declared_fk'` → "declared foreign key"; `'cardinality_heuristic'` → "inferred from data distribution". |
+| `_detect_fanout_warnings(conn, tables, warn_only_for=None)` | Live `COUNT(*)/COUNT(DISTINCT)` fallback. `warn_only_for` restricts processing to named tables (used by `add_context` for uncovered tables only). Warning label: "inferred from data distribution". |
 | `_parse_sql_result` | Parses execute_sql's JSON `{"columns":[...],"rows":[...],"truncated":bool}` string into a list of dicts. Returns `([], False)` for error strings or unparseable input. No eval(), no regex — Decimal/datetime are serialized at source. |
 | `_ResultEncoder` | `json.JSONEncoder` subclass used by `execute_sql`: converts `decimal.Decimal` → float, `datetime.datetime`/`datetime.date` → ISO string at serialization time. |
 | `_STATEMENT_TIMEOUT_MS` | Module constant (default 30 000 ms). Applied as `SET LOCAL statement_timeout` inside every `execute_sql` call to kill runaway queries at the DB level. |
@@ -276,6 +302,9 @@ build_visualization → END
 |---|---|
 | `get_admin_connection()` | Opens psycopg2 connection as admin/superuser. **Only file that uses this.** No password needed (local trust auth). Env vars: `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_ADMIN_USER`. |
 | `ensure_data_quality_status_table(conn)` | Creates `_data_quality_status` if missing; runs `ADD COLUMN IF NOT EXISTS source_folder` migration idempotently. |
+| `ensure_fanout_status_table(conn)` | Creates `_fanout_status` if missing; GRANTs SELECT to `app_reader`. Called by `main()` and `clean_and_reload`. |
+| `compute_and_write_fanout_status(conn, table_name)` | Computes fan-out metadata for all id-like columns in `table_name` (using declared PK/FK constraints first, cardinality heuristic as fallback) and writes rows to `_fanout_status`. DELETEs old rows first so a reload always reflects current data. Called after every `load_csv_to_table`. |
+| `_is_id_like_column(col)` | Returns True for `'id'` or any column ending in `'_id'`. Used by `compute_and_write_fanout_status`. |
 | `compute_quality_status(unresolved_issues)` | Returns `(status, issues_found_payload)` using `_issue_severity` from `data_cleaning.py`. Status: `"fail"` > `"warn"` > `"pass"`. |
 | `write_data_quality_status(conn, table_name, status, issues_found, was_cleaned, source_folder=None)` | Upserts one row in `_data_quality_status`. |
 | `load_csv_to_table(conn, csv_path, sample_rows_for_typing=500)` | Loads a CSV into Postgres via COPY, dropping and recreating the table. |

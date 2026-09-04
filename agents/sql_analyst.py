@@ -55,7 +55,62 @@ exports) name keys."""
     return column_name == "id" or bool(_ID_COLUMN_RE.search(column_name))
 
 
-def _detect_fanout_warnings(conn, tables: dict) -> list:
+def _read_fanout_from_metadata(conn, table_names: list) -> tuple:
+    """Read precomputed fan-out metadata from _fanout_status for the given tables.
+
+    Returns (warnings, uncovered_tables) where:
+    - warnings: list of warning strings for (is_likely_fk=True AND has_fanout=True) rows
+    - uncovered_tables: table names with no rows in _fanout_status (need live fallback)
+
+    If the _fanout_status table doesn't exist at all (e.g. fresh DB before any load),
+    all table_names are returned as uncovered so the caller falls back to live checks.
+    """
+    if not table_names:
+        return [], []
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", ("public._fanout_status",))
+        (table_exists,) = cur.fetchone()
+        if not table_exists:
+            return [], list(table_names)
+
+        placeholders = ", ".join(["%s"] * len(table_names))
+        cur.execute(
+            f"SELECT DISTINCT table_name FROM _fanout_status WHERE table_name IN ({placeholders})",
+            tuple(table_names),
+        )
+        covered = {row[0] for row in cur.fetchall()}
+        uncovered = [t for t in table_names if t not in covered]
+
+        if not covered:
+            return [], uncovered
+
+        covered_ph = ", ".join(["%s"] * len(covered))
+        cur.execute(
+            f"""
+            SELECT table_name, column_name, source
+            FROM _fanout_status
+            WHERE table_name IN ({covered_ph})
+              AND is_likely_fk = TRUE
+              AND has_fanout   = TRUE
+            """,
+            tuple(covered),
+        )
+        fanout_rows = cur.fetchall()
+
+    _source_labels = {
+        "declared_fk": "declared foreign key",
+        "cardinality_heuristic": "inferred from data distribution",
+    }
+    warnings = [
+        f"WARNING: {tbl} has multiple rows per {col} "
+        f"(fan-out risk — {_source_labels.get(src, 'inferred from data distribution')}; "
+        "aggregate before joining)."
+        for tbl, col, src in fanout_rows
+    ]
+    return warnings, uncovered
+
+
+def _detect_fanout_warnings(conn, tables: dict, warn_only_for: "set | None" = None) -> list:
     """Live, deterministic fan-out check against whatever tables/columns actually exist.
 
     For every id-like column in every table, ask Postgres directly (via a real
@@ -79,6 +134,9 @@ def _detect_fanout_warnings(conn, tables: dict) -> list:
          relationship relative to whatever it references, which is exactly the risk
          generate_sql's prompt warns about (payments per order, reviews per product, etc.).
     """
+    if warn_only_for is not None:
+        tables = {t: cols for t, cols in tables.items() if t in warn_only_for}
+
     uniqueness_cache: dict = {}
 
     def total_and_distinct(table: str, column: str):
@@ -121,7 +179,7 @@ def _detect_fanout_warnings(conn, tables: dict) -> list:
             if total > distinct:
                 warnings.append(
                     f"WARNING: {table} has multiple rows per {column} "
-                    "(fan-out risk — aggregate before joining)."
+                    "(fan-out risk — inferred from data distribution; aggregate before joining)."
                 )
     return warnings
 
@@ -295,10 +353,11 @@ def add_context(state: SQLAnalystState) -> dict:
                 """
                 SELECT table_name, column_name, data_type
                 FROM information_schema.columns
-                WHERE table_schema = %s AND table_name != %s
+                WHERE table_schema = %s
+                  AND table_name NOT IN (%s, %s)
                 ORDER BY table_name, ordinal_position
                 """,
-                ("public", "_data_quality_status"),
+                ("public", "_data_quality_status", "_fanout_status"),
             )
             rows = cur.fetchall()
 
@@ -307,7 +366,15 @@ def add_context(state: SQLAnalystState) -> dict:
         for table_name, column_name, data_type in rows:
             tables.setdefault(table_name, []).append((column_name, data_type))
 
-        fanout_warnings = _detect_fanout_warnings(conn, tables)
+        fanout_warnings, uncovered = _read_fanout_from_metadata(conn, list(tables.keys()))
+        if uncovered:
+            import sys as _sys
+            print(
+                f"[fan-out] no _fanout_status entry for {uncovered}; falling back to live check",
+                file=_sys.stderr,
+            )
+            live_warnings = _detect_fanout_warnings(conn, tables, warn_only_for=set(uncovered))
+            fanout_warnings = fanout_warnings + live_warnings
 
         status_by_table = _fetch_data_quality_status(conn, list(tables.keys()))
         data_quality_warnings = []
@@ -1877,8 +1944,10 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
 
     from utils.data_cleaning import clean_dataset, unresolved_issues_for_record
     from utils.load_data import (
+        compute_and_write_fanout_status,
         compute_quality_status,
         ensure_data_quality_status_table,
+        ensure_fanout_status_table,
         get_admin_connection,
         load_csv_to_table,
         sanitize_identifier,
@@ -1897,6 +1966,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
     conn = get_admin_connection()
     try:
         ensure_data_quality_status_table(conn)
+        ensure_fanout_status_table(conn)
 
         for source_folder, table_names in folder_to_tables.items():
             folder_path = Path(source_folder)
@@ -1939,6 +2009,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
                     conn, table_name, status, issues_found, was_cleaned,
                     source_folder=source_folder,
                 )
+                compute_and_write_fanout_status(conn, table_name)
                 newly_attempted.append(table_name)
     finally:
         conn.close()
