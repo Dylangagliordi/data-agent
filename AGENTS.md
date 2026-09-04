@@ -36,6 +36,38 @@ fix it immediately by running the REVOKE commands above as superuser.
   every query in the codebase, including internal schema-introspection queries, not just
   user-facing ones.
 
+## Auto-Cleaning/Reload Workflow — the one feature that mutates real, live data
+
+`clean_and_reload` (`agents/sql_analyst.py`) is the only part of this project that can
+change what's actually in the database in response to a user's question. It's hardened
+as follows — do not weaken any of this without deliberately re-reviewing why it's here:
+
+- **Source checksum tracking.** `_data_quality_status.source_checksum` holds the real
+  SHA-256 of a table's raw source file at the time it was last processed
+  (`utils/load_data.py:compute_file_checksum` / `check_source_freshness`). Both the
+  auto-clean redirect and `load_data.py`'s manual re-clean compare the file's current
+  bytes against this before cleaning runs, and log explicitly when they differ — not as
+  a gate (cleaning always re-examines the file's real current content regardless), but
+  so a changed source is never mistaken for a stale, already-seen result.
+- **Versioned cleaned artifacts.** `utils/data_cleaning.py:_clone_file` keeps exactly
+  one generation of history: `cleaned/<file>` is the current clone, `cleaned/<file>.previous`
+  is the one before it. Bounded, not unlimited.
+- **Atomic table replacement.** `utils/load_data.py:load_csv_to_table` never mutates a
+  live table in place. It builds a staging table, and only once that fully succeeds
+  swaps it into place with `ALTER TABLE ... RENAME` inside one transaction — atomic DDL
+  in Postgres, so the real table is never observably missing or half-populated. If the
+  staging build fails, the existing table is untouched.
+- **Real rollback, one generation.** The swap renames the table being replaced to
+  `<table>_previous` instead of dropping it. `utils/load_data.py:rollback_table(conn,
+  table_name)` swaps it back. This is a MANUAL, deliberate action — nothing in this
+  codebase calls it automatically.
+- **Reload coverage semantics (#21):** one `clean_dataset()` call covers every CSV in a
+  source folder, but `clean_and_reload` only reloads the tables that were actually in
+  `state.tables_to_clean` (the ones with an originally-flagged fail-level status row) —
+  not every file that call happened to touch. See the docstring on `clean_and_reload`
+  for why: reloading a table that was never flagged as needing it would be redundant
+  work, not a correctness fix.
+
 ## Workflow
 - After building or changing any node or component, write a small test, run it, and show real
   output before moving on to the next piece.

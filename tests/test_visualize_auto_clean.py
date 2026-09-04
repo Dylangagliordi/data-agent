@@ -61,6 +61,9 @@ def _setup_fail_table(conn):
 def _cleanup(conn):
     with conn.cursor() as cur:
         cur.execute(f'DROP TABLE IF EXISTS "{FAIL_TABLE}" CASCADE')
+        # load_csv_to_table's atomic swap (Tier 4 hardening) can leave a
+        # <table>_previous behind — drop it too so repeated runs don't accumulate it.
+        cur.execute(f'DROP TABLE IF EXISTS "{FAIL_TABLE}_previous" CASCADE')
         cur.execute("DELETE FROM _data_quality_status WHERE table_name = %s", (FAIL_TABLE,))
     conn.commit()
 

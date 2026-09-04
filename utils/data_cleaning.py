@@ -1196,9 +1196,19 @@ class CleaningResult:
 
 def _clone_file(file_path: Path, cleaned_dir: Path) -> Path:
     """Copy file_path into cleaned_dir (creating it if needed) and return the clone's
-    path. The raw file at file_path is never opened for writing anywhere in this module."""
+    path. The raw file at file_path is never opened for writing anywhere in this module.
+
+    Bounded, two-generation versioning (architecture review point #20): if a clone
+    from a previous cleaning run already exists at this path, it's rotated to
+    <file>.previous BEFORE being overwritten with a fresh copy of the raw source —
+    one generation of history, enough to inspect or recover the prior cleaned result
+    if a new cleaning run produces something wrong, without keeping unbounded history.
+    """
     cleaned_dir.mkdir(parents=True, exist_ok=True)
     dest = cleaned_dir / file_path.name
+    previous = cleaned_dir / f"{file_path.name}.previous"
+    if dest.exists():
+        shutil.copy2(dest, previous)
     shutil.copy2(file_path, dest)
     return dest
 

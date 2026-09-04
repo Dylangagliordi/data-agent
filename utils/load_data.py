@@ -7,8 +7,13 @@ Usage:
 Notes:
 - Uses the Postgres ADMIN connection only (never app_reader, which must stay read-only).
 - Table name is derived from each CSV's filename (stem), lowercased.
-- If a table with that name already exists, it is dropped first so a completely
-  different dataset can be loaded cleanly without old tables lingering.
+- Loading is ATOMIC (see load_csv_to_table): new data is built in a staging table
+  first, and only swapped into place — via a single-transaction ALTER TABLE ...
+  RENAME — once that staging load fully succeeds. An existing table of the same name
+  is never dropped outright; it's renamed to <table>_previous (one generation of
+  rollback — see rollback_table) rather than deleted, so a completely different
+  dataset can still be loaded cleanly without old tables lingering under their
+  original name, while a bad reload remains recoverable.
 - This script is intentionally NOT part of the LangGraph graph — it's a manual,
   reusable utility you run whenever you want to (re)load a dataset folder.
 
@@ -30,15 +35,19 @@ shouldn't exist for later querying.
 
 Data-quality tracking: after loading each table, this writes/updates one row for it in
 _data_quality_status (table_name text PK, last_loaded_at timestamp, status "pass"/
-"warn"/"fail", issues_found jsonb, was_cleaned bool). status/issues_found reflect
-whichever of the table's ORIGINAL check_rubric() issues are still actually unresolved
-after clean_dataset() finished (see utils.data_cleaning.unresolved_issues_for_record),
-classified with the existing _issue_severity() mapping — never a new/parallel severity
-scheme. agents/sql_analyst.py's add_context reads this table to warn about tables that
-were never checked or still have an unresolved fail-level issue.
+"warn"/"fail", issues_found jsonb, was_cleaned bool, source_folder text,
+source_checksum text). status/issues_found reflect whichever of the table's ORIGINAL
+check_rubric() issues are still actually unresolved after clean_dataset() finished
+(see utils.data_cleaning.unresolved_issues_for_record), classified with the existing
+_issue_severity() mapping — never a new/parallel severity scheme. agents/sql_analyst.py's
+add_context reads this table to warn about tables that were never checked or still
+have an unresolved fail-level issue. source_checksum is the raw source file's real
+SHA-256 at the time it was processed (see compute_file_checksum /
+check_source_freshness) — a source-drift detection signal, not a load gate.
 """
 
 import csv
+import hashlib
 import os
 import re
 import sys
@@ -234,6 +243,16 @@ def ensure_data_quality_status_table(conn) -> None:
             ADD COLUMN IF NOT EXISTS source_folder TEXT;
             """
         )
+        # source_checksum added for source-freshness tracking (architecture review
+        # point #20) — same idempotent-migration pattern as source_folder above.
+        # Existing rows will have source_checksum = NULL (treated as "no baseline
+        # yet"; see check_source_freshness).
+        cur.execute(
+            """
+            ALTER TABLE _data_quality_status
+            ADD COLUMN IF NOT EXISTS source_checksum TEXT;
+            """
+        )
     conn.commit()
 
 
@@ -268,27 +287,85 @@ def write_data_quality_status(
     issues_found: list,
     was_cleaned: bool,
     source_folder: str | None = None,
+    source_checksum: str | None = None,
 ) -> None:
     """Insert or update table_name's row in _data_quality_status. All values are bound
     as real placeholders — only last_loaded_at uses the server-side now() function.
     source_folder is the folder path load_data.py (or clean_and_reload) loaded this
-    table from; NULL means unknown (table loaded before this column was added)."""
+    table from; NULL means unknown (table loaded before this column was added).
+    source_checksum is the SHA-256 hex digest of the raw source file's bytes at the
+    time it was processed (see compute_file_checksum / check_source_freshness); NULL
+    means no baseline recorded yet (table loaded before checksum tracking existed, or
+    caller didn't pass one)."""
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO _data_quality_status
-                (table_name, last_loaded_at, status, issues_found, was_cleaned, source_folder)
-            VALUES (%s, now(), %s, %s, %s, %s)
+                (table_name, last_loaded_at, status, issues_found, was_cleaned,
+                 source_folder, source_checksum)
+            VALUES (%s, now(), %s, %s, %s, %s, %s)
             ON CONFLICT (table_name) DO UPDATE SET
                 last_loaded_at = EXCLUDED.last_loaded_at,
                 status = EXCLUDED.status,
                 issues_found = EXCLUDED.issues_found,
                 was_cleaned = EXCLUDED.was_cleaned,
-                source_folder = EXCLUDED.source_folder
+                source_folder = EXCLUDED.source_folder,
+                source_checksum = EXCLUDED.source_checksum
             """,
-            (table_name, status, psycopg2.extras.Json(issues_found), was_cleaned, source_folder),
+            (
+                table_name, status, psycopg2.extras.Json(issues_found), was_cleaned,
+                source_folder, source_checksum,
+            ),
         )
     conn.commit()
+
+
+def compute_file_checksum(path) -> str:
+    """Real SHA-256 hex digest of path's actual bytes, streamed in chunks so this
+    works for arbitrarily large files without loading them fully into memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_stored_checksum(conn, table_name: str) -> str | None:
+    """Return the source_checksum last recorded for table_name in _data_quality_status,
+    or None if there's no row yet for this table, or the column is NULL (a row written
+    before checksum tracking existed) — both cases mean "no baseline to compare"."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT source_checksum FROM _data_quality_status WHERE table_name = %s",
+            (table_name,),
+        )
+        row = cur.fetchone()
+    # Commit immediately so this read-only SELECT doesn't hold a lock across whatever
+    # the caller does next (e.g. an ALTER TABLE during the same admin session) — same
+    # pattern used elsewhere in this codebase for exactly this reason.
+    conn.commit()
+    return row[0] if row else None
+
+
+def check_source_freshness(conn, table_name: str, csv_path) -> tuple:
+    """Compare csv_path's CURRENT sha256 against the checksum stored for table_name.
+
+    Returns (source_changed, current_checksum). source_changed is True ONLY when a
+    prior checksum already exists for table_name AND it differs from the file's
+    current bytes — i.e. the raw source file has genuinely been modified on disk
+    since table_name was last processed. A table with no stored checksum yet (first
+    time it's ever been processed) is NOT reported as "changed" — there's nothing to
+    compare it against.
+
+    This is a detection/audit signal, not a gate: whatever calls clean_dataset()
+    afterward always re-examines the file's real, current content regardless of this
+    result — see the callers in clean_and_reload and load_data.py's main() for why
+    that distinction matters (avoiding a silent, stale-looking reuse of an old result).
+    """
+    current_checksum = compute_file_checksum(csv_path)
+    stored_checksum = get_stored_checksum(conn, table_name)
+    source_changed = stored_checksum is not None and stored_checksum != current_checksum
+    return source_changed, current_checksum
 
 
 def infer_pg_type(values):
@@ -329,9 +406,16 @@ def sanitize_identifier(name: str) -> str:
     return ident or "col"
 
 
-def load_csv_to_table(conn, csv_path: Path, sample_rows_for_typing: int = 500):
-    table_name = sanitize_identifier(csv_path.stem)
+def _create_and_populate_table(conn, table_name: str, csv_path: Path, sample_rows_for_typing: int = 500) -> int:
+    """Create table_name fresh and load every row of csv_path into it. Returns the
+    row count loaded. Raises on any failure (malformed row, type mismatch, etc.) —
+    callers are responsible for conn.rollback() on exception; this function never
+    commits, so an aborted call leaves nothing durable behind.
 
+    This is the low-level create+populate primitive shared by load_csv_to_table's
+    staging-table step (see below) and anything else that wants a plain table build
+    without the atomic-swap machinery.
+    """
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader)
@@ -352,6 +436,10 @@ def load_csv_to_table(conn, csv_path: Path, sample_rows_for_typing: int = 500):
         # targets in any SQL dialect) — but table_name is derived from the local
         # filename and sanitized above, not user/network input, so building it into
         # the identifier here is safe as opposed to unsanitized SQL construction.
+        # DROP-then-CREATE here is only a self-heal for a leftover staging table from
+        # a prior crashed load (same deterministic staging name reused) — it never
+        # touches the real, live table, which always keeps its own separate name until
+        # the atomic swap in load_csv_to_table renames this one into place.
         cur.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE;')
 
         col_defs = ", ".join(f'"{c}" {t}' for c, t in zip(columns, col_types))
@@ -380,8 +468,117 @@ def load_csv_to_table(conn, csv_path: Path, sample_rows_for_typing: int = 500):
             if batch:
                 cur.executemany(insert_sql, batch)
 
+    return row_count
+
+
+def _swap_table_atomically(conn, staging_name: str, table_name: str) -> None:
+    """Atomically replace table_name's content with staging_name's, entirely within
+    the caller's still-open transaction (no commit happens here — load_csv_to_table
+    commits once, after this returns, so table population and the swap live in one
+    all-or-nothing transaction).
+
+    Any existing table_name is renamed to table_name_previous — kept as one
+    generation of rollback (see rollback_table) rather than dropped — before
+    staging_name is renamed into table_name's place. ALTER TABLE ... RENAME is atomic
+    DDL in Postgres, so a concurrent reader querying table_name never observes it
+    missing or half-populated: it sees either the complete old table (pre-commit) or
+    the complete new one (post-commit), never a gap.
+    """
+    previous_name = f"{table_name}_previous"
+    with conn.cursor() as cur:
+        # Table/staging names here are derived from sanitize_identifier() output plus
+        # fixed literal suffixes — not user/network input — same rationale as the
+        # identifier-building elsewhere in this module.
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table_name,))
+        table_exists = cur.fetchone()[0]
+
+        cur.execute(f'DROP TABLE IF EXISTS "{previous_name}" CASCADE;')
+        if table_exists:
+            cur.execute(f'ALTER TABLE "{table_name}" RENAME TO "{previous_name}";')
+        cur.execute(f'ALTER TABLE "{staging_name}" RENAME TO "{table_name}";')
+
+
+def load_csv_to_table(conn, csv_path: Path, sample_rows_for_typing: int = 500):
+    """Load csv_path into Postgres as table sanitize_identifier(csv_path.stem),
+    replacing any existing table of that name ATOMICALLY (architecture review point
+    #20 — Tier 4 hardening of the one workflow in this project that mutates real, live
+    data).
+
+    Two-phase, crash-safe design, all inside ONE transaction (single conn.commit() at
+    the very end):
+      1. Build and fully populate a distinctly-named STAGING table
+         (_create_and_populate_table). If anything goes wrong here — a malformed row,
+         a type mismatch, any exception — the whole transaction is rolled back below:
+         no staging table is left behind, and the real target table (if it already
+         exists) was never touched at all, so it stays completely intact and
+         queryable throughout.
+      2. Only once phase 1 fully succeeds, atomically swap the staging table into
+         place (_swap_table_atomically): the existing table_name (if any) becomes
+         table_name_previous — one generation of rollback, see rollback_table() —
+         and the staging table becomes table_name.
+
+    Returns (table_name, row_count) — same public contract as before this change.
+    """
+    table_name = sanitize_identifier(csv_path.stem)
+    # Deterministic (not random) staging name: a distinctive, unlikely-to-collide
+    # prefix rather than a uuid, so a staging table orphaned by a crash mid-load is
+    # automatically cleaned up by the next load's own DROP-then-CREATE (see
+    # _create_and_populate_table) instead of accumulating garbage tables forever.
+    # This project only ever runs one load of a given table at a time (a manual
+    # script run, or one clean_and_reload node execution) — concurrent loads of the
+    # SAME table were never a supported scenario this needs to guard against.
+    staging_name = f"__reload_staging__{table_name}"
+
+    try:
+        row_count = _create_and_populate_table(conn, staging_name, csv_path, sample_rows_for_typing)
+        _swap_table_atomically(conn, staging_name, table_name)
+    except Exception:
+        conn.rollback()
+        raise
+
     conn.commit()
     return table_name, row_count
+
+
+def rollback_table(conn, table_name: str) -> bool:
+    """Restore table_name from table_name_previous — the one generation of rollback
+    kept by load_csv_to_table's atomic swap (_swap_table_atomically).
+
+    This is a MANUAL, deliberate recovery action for use after a problem is
+    discovered in a freshly-reloaded table. Nothing in this codebase calls it
+    automatically — it exists to be run by hand (e.g. from a REPL or a one-off
+    script) once someone has decided the current table is wrong and the prior
+    version should come back.
+
+    Performs a genuine SWAP (not a destructive overwrite): table_name and
+    table_name_previous trade places using a temporary holding name, all inside one
+    transaction. This means the just-rolled-back-from table isn't lost either — it
+    becomes the new table_name_previous, so a second rollback_table() call would
+    swap back again.
+
+    Returns True if a rollback was performed, False if there was no table_name_previous
+    to roll back to (nothing changes in that case).
+    """
+    previous_name = f"{table_name}_previous"
+    holding_name = f"{table_name}_rollback_tmp"
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (previous_name,))
+        previous_exists = cur.fetchone()[0]
+        if not previous_exists:
+            conn.rollback()
+            return False
+
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table_name,))
+        current_exists = cur.fetchone()[0]
+
+        cur.execute(f'DROP TABLE IF EXISTS "{holding_name}" CASCADE;')
+        if current_exists:
+            cur.execute(f'ALTER TABLE "{table_name}" RENAME TO "{holding_name}";')
+        cur.execute(f'ALTER TABLE "{previous_name}" RENAME TO "{table_name}";')
+        if current_exists:
+            cur.execute(f'ALTER TABLE "{holding_name}" RENAME TO "{previous_name}";')
+    conn.commit()
+    return True
 
 
 def main() -> None:
@@ -403,33 +600,53 @@ def main() -> None:
         print(f"ERROR: no CSV files found in {folder}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Checking {folder} against the cleaning rubric before loading...")
-    cleaning_result = clean_dataset(folder)
-    print(cleaning_result.summary())
-
-    # Every file loads regardless of cleaning outcome now — see module docstring.
-    # cleaned_names: cleaning fully resolved every original issue -> load from cleaned/.
-    # attempted_names: cleaning was attempted but declined or left something unresolved
-    # -> still load from cleaned/ (the clone always exists once issues were found, even
-    # if some/all of the generated fixes were declined or didn't stick).
-    records_by_name = {rec.file_name: rec for rec in cleaning_result.cleaned_files}
-    records_by_name.update({rec.file_name: rec for rec in cleaning_result.skipped_files})
-    cleaned_names = {rec.file_name for rec in cleaning_result.cleaned_files}
-    attempted_names = set(records_by_name.keys())
-
-    load_plan = []  # list[(csv_path_to_actually_load, original_name)]
-    for csv_path in csv_files:
-        if csv_path.name in attempted_names:
-            load_plan.append((Path(cleaning_result.cleaned_dir) / csv_path.name, csv_path.name))
-        else:
-            load_plan.append((csv_path, csv_path.name))
-
-    print(f"\nLoading {len(load_plan)} file(s) into Postgres...")
     conn = get_admin_connection()
     try:
         ensure_data_quality_status_table(conn)
         ensure_fanout_status_table(conn)
-        for load_path, original_name in load_plan:
+
+        # Source-checksum freshness check (architecture review point #20): before
+        # this manual re-clean runs, compare each file's CURRENT raw bytes against the
+        # checksum recorded the last time its table was processed. clean_dataset()
+        # below always re-examines the file's real, current content regardless of
+        # this result — this is a deliberate detection/audit step, so a maintainer
+        # re-running this script never mistakes what's about to happen for a stale,
+        # reused result when the source file has actually changed since it was last
+        # loaded.
+        for csv_path in csv_files:
+            table_name = sanitize_identifier(csv_path.stem)
+            changed, _current_checksum = check_source_freshness(conn, table_name, csv_path)
+            if changed:
+                print(
+                    f"[checksum] source file for '{table_name}' ({csv_path}) has "
+                    f"changed since it was last processed — running a genuinely "
+                    f"fresh clean, not reusing a stale prior result.",
+                    file=sys.stderr,
+                )
+
+        print(f"Checking {folder} against the cleaning rubric before loading...")
+        cleaning_result = clean_dataset(folder)
+        print(cleaning_result.summary())
+
+        # Every file loads regardless of cleaning outcome now — see module docstring.
+        # cleaned_names: cleaning fully resolved every original issue -> load from cleaned/.
+        # attempted_names: cleaning was attempted but declined or left something unresolved
+        # -> still load from cleaned/ (the clone always exists once issues were found, even
+        # if some/all of the generated fixes were declined or didn't stick).
+        records_by_name = {rec.file_name: rec for rec in cleaning_result.cleaned_files}
+        records_by_name.update({rec.file_name: rec for rec in cleaning_result.skipped_files})
+        cleaned_names = {rec.file_name for rec in cleaning_result.cleaned_files}
+        attempted_names = set(records_by_name.keys())
+
+        load_plan = []  # list[(csv_path_to_actually_load, original_name, raw_csv_path)]
+        for csv_path in csv_files:
+            if csv_path.name in attempted_names:
+                load_plan.append((Path(cleaning_result.cleaned_dir) / csv_path.name, csv_path.name, csv_path))
+            else:
+                load_plan.append((csv_path, csv_path.name, csv_path))
+
+        print(f"\nLoading {len(load_plan)} file(s) into Postgres...")
+        for load_path, original_name, raw_csv_path in load_plan:
             table_name, row_count = load_csv_to_table(conn, load_path)
             source_note = " (cleaned)" if original_name in cleaned_names else ""
             print(f"Loaded {original_name}{source_note} -> table '{table_name}' ({row_count} rows)")
@@ -443,9 +660,13 @@ def main() -> None:
                 unresolved_issues = unresolved_issues_for_record(rec)
                 was_cleaned = True
             status, issues_found = compute_quality_status(unresolved_issues)
+            # Checksum is always computed from the RAW source file (never the
+            # cleaned/ clone) — it tracks whether the source has changed, not
+            # whether cleaning changed its output.
             write_data_quality_status(
                 conn, table_name, status, issues_found, was_cleaned,
                 source_folder=str(folder),
+                source_checksum=compute_file_checksum(raw_csv_path),
             )
             print(f"  -> data quality status: {status} ({len(issues_found)} unresolved issue(s))")
             compute_and_write_fanout_status(conn, table_name)

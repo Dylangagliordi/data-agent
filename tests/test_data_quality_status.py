@@ -116,6 +116,9 @@ def load_and_track(conn, folder: str, csv_name: str, llm=None) -> tuple:
 def cleanup_table(conn, table_name: str) -> None:
     with conn.cursor() as cur:
         cur.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE;')
+        # load_csv_to_table's atomic swap (Tier 4 hardening) can leave a
+        # <table>_previous behind — drop it too so repeated runs don't accumulate it.
+        cur.execute(f'DROP TABLE IF EXISTS "{table_name}_previous" CASCADE;')
         cur.execute("DELETE FROM _data_quality_status WHERE table_name = %s", (table_name,))
     conn.commit()
 

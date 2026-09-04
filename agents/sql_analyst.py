@@ -1981,6 +1981,16 @@ def route_after_add_context(state: SQLAnalystState) -> str:
     return "generate_sql"
 
 
+def _find_source_csv(folder_path, table_name: str, sanitize_identifier):
+    """Reverse-map table_name back to its raw CSV file in folder_path by sanitized
+    stem, or None if no CSV in the folder matches. sanitize_identifier is passed in
+    rather than imported here so callers can keep their existing local import."""
+    for csv_path in sorted(folder_path.glob("*.csv")):
+        if sanitize_identifier(csv_path.stem) == table_name:
+            return csv_path
+    return None
+
+
 def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
     """Node: for each fail-level table that has a known source_folder, run
     clean_dataset() against that folder, then reload the table and update its
@@ -1996,12 +2006,27 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
 
     _llm is a test-only injection point: when None (always in production) clean_dataset
     uses its own real LLM. Tests pass a deterministic fake to keep cleaning predictable.
+
+    IMPORTANT — reload coverage semantics (architecture review point #21): clean_dataset()
+    below is called ONCE per source_folder and processes EVERY CSV in that folder, not
+    just the ones that triggered this redirect. But only the tables actually listed in
+    state.tables_to_clean (the ones with an originally-flagged fail-level status row)
+    get reloaded into Postgres afterward, in the per-table loop below. A folder can
+    contain other CSVs that also get cleaned/cloned as a side effect of that one
+    clean_dataset() call (e.g. files with only warn-level issues, or files that were
+    already passing but still had something cosmetic flagged) — those cleaned outputs
+    land in cleaned/ like any other, but are deliberately NOT reloaded here, to avoid
+    redundant reload work for tables that were never flagged as needing it in the
+    first place. Do not assume every file clean_dataset() touches gets a fresh table
+    in the database — only the tables in state.tables_to_clean do.
     """
     from pathlib import Path
 
     from utils.data_cleaning import clean_dataset, unresolved_issues_for_record
     from utils.load_data import (
+        check_source_freshness,
         compute_and_write_fanout_status,
+        compute_file_checksum,
         compute_quality_status,
         ensure_data_quality_status_table,
         ensure_fanout_status_table,
@@ -2027,18 +2052,37 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
 
         for source_folder, table_names in folder_to_tables.items():
             folder_path = Path(source_folder)
+
+            # Source-checksum freshness check (architecture review point #20): before
+            # running clean_dataset for this folder, compare each targeted table's
+            # CURRENT raw source file against the checksum recorded the last time it
+            # was processed. clean_dataset() below always re-examines the file's
+            # real, current bytes regardless of this check's outcome — this is a
+            # deliberate detection/audit step, not a gate, so a maintainer never
+            # mistakes what's about to happen for a stale, reused result when the
+            # source has actually changed underneath the table since it was last
+            # cleaned.
+            for table_name in table_names:
+                target_csv = _find_source_csv(folder_path, table_name, sanitize_identifier)
+                if target_csv is None:
+                    continue
+                changed, _current_checksum = check_source_freshness(conn, table_name, target_csv)
+                if changed:
+                    import sys as _sys
+                    print(
+                        f"[checksum] source file for '{table_name}' ({target_csv}) has "
+                        f"changed since it was last processed — running a genuinely "
+                        f"fresh clean, not reusing a stale prior result.",
+                        file=_sys.stderr,
+                    )
+
             cleaning_result = clean_dataset(folder_path, llm=_llm, trigger="auto_redirect")
 
             all_records = {rec.file_name: rec for rec in cleaning_result.cleaned_files}
             all_records.update({rec.file_name: rec for rec in cleaning_result.skipped_files})
 
             for table_name in table_names:
-                # Reverse-map table_name back to its CSV file by sanitized stem.
-                target_csv = None
-                for csv_path in sorted(folder_path.glob("*.csv")):
-                    if sanitize_identifier(csv_path.stem) == table_name:
-                        target_csv = csv_path
-                        break
+                target_csv = _find_source_csv(folder_path, table_name, sanitize_identifier)
 
                 if target_csv is None:
                     # CSV not found in folder — mark attempted, skip reload.
@@ -2062,9 +2106,13 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
                     was_cleaned = True
 
                 status, issues_found = compute_quality_status(unresolved)
+                # Checksum is always computed from the RAW source file (target_csv),
+                # never the cleaned/ clone — it tracks whether the source has
+                # changed, not whether cleaning changed its output.
                 write_data_quality_status(
                     conn, table_name, status, issues_found, was_cleaned,
                     source_folder=source_folder,
+                    source_checksum=compute_file_checksum(target_csv),
                 )
                 compute_and_write_fanout_status(conn, table_name)
                 newly_attempted.append(table_name)

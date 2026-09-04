@@ -135,6 +135,9 @@ def _cleanup(conn, *table_names) -> None:
     with conn.cursor() as cur:
         for t in table_names:
             cur.execute(f'DROP TABLE IF EXISTS "{t}" CASCADE')
+            # load_csv_to_table's atomic swap (Tier 4 hardening) can leave a
+            # <table>_previous behind — drop it too so repeated runs don't accumulate it.
+            cur.execute(f'DROP TABLE IF EXISTS "{t}_previous" CASCADE')
             cur.execute("DELETE FROM _data_quality_status WHERE table_name = %s", (t,))
     conn.commit()
 

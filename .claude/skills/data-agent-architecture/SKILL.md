@@ -157,11 +157,14 @@ CREATE TABLE _data_quality_status (
     status       TEXT NOT NULL,          -- "pass", "warn", or "fail"
     issues_found JSONB NOT NULL,         -- list of {"issue": str, "severity": str}
     was_cleaned  BOOLEAN NOT NULL,
-    source_folder TEXT                   -- added after initial schema; NULL = can't auto-redirect
+    source_folder TEXT,                  -- added after initial schema; NULL = can't auto-redirect
+    source_checksum TEXT                 -- added for source-freshness tracking; NULL = no baseline
 );
 ```
 
 `status` is set by `utils/load_data.py:compute_quality_status()` which calls `_issue_severity()` from `utils/data_cleaning.py`. The table is excluded from `information_schema` queries in `add_context` (filtered by `table_name NOT IN ('_data_quality_status', '_fanout_status')`). Only `fail`-status tables inject WARNING lines into `generate_sql`'s context; `warn`-status tables are silently ignored.
+
+`source_checksum` is the raw source file's real SHA-256 hex digest at the time it was last processed (`utils/load_data.py:compute_file_checksum`). Compared against the file's current bytes by `check_source_freshness()` before both the auto-clean redirect and a manual `load_data.py` re-clean, to detect (and log) when a source file has genuinely changed since it was last processed — a detection/audit signal, not a gate. See "Auto-cleaning/reload hardening" below.
 
 ---
 
@@ -205,7 +208,8 @@ One row per id-like column per table. `source` indicates how the determination w
 | `cancel_sql` | Node 7: writes final_answer explaining blocked query. |
 | `represent_final_answer` | Node 8: plain-English summarization via `pick_llm("cheap")`. Bypassed deterministically for truncated results. |
 | `build_visualization` | Visualization terminal node: writes CSV (always), `.hyper` (if Tableau), renders `.png` via `_render_chart_image`, produces final_answer. |
-| `clean_and_reload` | Auto-clean redirect node: calls `clean_dataset()` → `load_csv_to_table()` → updates `_data_quality_status` and `_fanout_status`. Accepts `_llm=` for test injection. |
+| `clean_and_reload` | Auto-clean redirect node: for each targeted table, runs `check_source_freshness()` (logs a `[checksum] ...` stderr line when the raw source changed since last processed) → calls `clean_dataset()` once per `source_folder` → `load_csv_to_table()` (atomic) → updates `_data_quality_status` (with `source_checksum`) and `_fanout_status`. Accepts `_llm=` for test injection. **Reload coverage is partial by design**: `clean_dataset()` processes every CSV in the folder, but only tables listed in `state.tables_to_clean` (the originally-flagged fail-level ones) get reloaded into Postgres — see the function's docstring and architecture review point #21. |
+| `_find_source_csv(folder_path, table_name, sanitize_identifier)` | Reverse-maps `table_name` back to its raw CSV in `folder_path` by sanitized stem, or `None`. Shared helper used twice in `clean_and_reload` (freshness check + reload loop) to avoid duplicating the reverse-mapping logic. |
 | `build_sql_analyst_graph` | Compiles and returns the compiled LangGraph `StateGraph`. |
 | `_render_chart_image` | Renders a matplotlib `.png` for the given chart_type. Uses `Figure`/`FigureCanvasAgg` (no global pyplot). Catches all exceptions; returns `None` on failure. |
 | `_squarify_rects` | Internal treemap layout (no squarify dependency). |
@@ -289,6 +293,7 @@ build_visualization → END
 | `CleaningResult` | Dataclass: `folder_path`, `cleaned_dir`, `cleaned_files`, `skipped_files`, `untouched_files`. |
 | `FileCleaningRecord` | Dataclass: per-file result including `file_name`, `status`, `issues`, `remaining_issues`, `fail_issue_records`, `warn_batch`, `row_count_before/after`, `row_loss_flagged`. |
 | `_clean_issue_group` | Generates and executes fix code for a batch of issues. Calls `_request_approval` for interactive approval gate. |
+| `_clone_file(file_path, cleaned_dir)` | Copies `file_path` into `cleaned_dir` as `<file>`. Bounded two-generation versioning (architecture review point #20): if `<file>` already exists from a prior cleaning run, it's rotated to `<file>.previous` first — one generation of history, not unlimited. Only called for files with real issues (untouched files get no clone at all). |
 | `_describe_file_for_prompt(file_path, df=None)` | Builds sample-rows + column context block for the code-gen prompt. Accepts optional pre-loaded `df` to avoid reading the CSV twice. |
 | `_issue_guidance(issue, df=None)` | Appends deterministic guidance under a single issue line. For "Missing values" issues under the 20% ceiling, also calls `_categorical_fill_advice` when `df` is provided to recommend mode vs. `'Unknown'`. |
 | `_categorical_fill_advice(df, col)` | Returns a fill-value recommendation for a categorical column: mode when top category ≥ 40% share, `'Unknown'` when distribution is roughly even. Returns `""` for numeric or high-cardinality columns. |
@@ -307,13 +312,19 @@ build_visualization → END
 | Function | Role |
 |---|---|
 | `get_admin_connection()` | Opens psycopg2 connection as admin/superuser. **Only file that uses this.** No password needed (local trust auth). Env vars: `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_ADMIN_USER`. |
-| `ensure_data_quality_status_table(conn)` | Creates `_data_quality_status` if missing; runs `ADD COLUMN IF NOT EXISTS source_folder` migration idempotently. |
+| `ensure_data_quality_status_table(conn)` | Creates `_data_quality_status` if missing; runs `ADD COLUMN IF NOT EXISTS source_folder` and `ADD COLUMN IF NOT EXISTS source_checksum` migrations idempotently. |
 | `ensure_fanout_status_table(conn)` | Creates `_fanout_status` if missing; GRANTs SELECT to `app_reader`. Called by `main()` and `clean_and_reload`. |
 | `compute_and_write_fanout_status(conn, table_name)` | Computes fan-out metadata for all id-like columns in `table_name` (using declared PK/FK constraints first, cardinality heuristic as fallback) and writes rows to `_fanout_status`. DELETEs old rows first so a reload always reflects current data. Called after every `load_csv_to_table`. |
 | `_is_id_like_column(col)` | Returns True for `'id'` or any column ending in `'_id'`. Used by `compute_and_write_fanout_status`. |
 | `compute_quality_status(unresolved_issues)` | Returns `(status, issues_found_payload)` using `_issue_severity` from `data_cleaning.py`. Status: `"fail"` > `"warn"` > `"pass"`. |
-| `write_data_quality_status(conn, table_name, status, issues_found, was_cleaned, source_folder=None)` | Upserts one row in `_data_quality_status`. |
-| `load_csv_to_table(conn, csv_path, sample_rows_for_typing=500)` | Loads a CSV into Postgres via COPY, dropping and recreating the table. |
+| `write_data_quality_status(conn, table_name, status, issues_found, was_cleaned, source_folder=None, source_checksum=None)` | Upserts one row in `_data_quality_status`. `source_checksum` is the raw source file's SHA-256 at processing time (see below); `None` means "no baseline". |
+| `compute_file_checksum(path)` | Real SHA-256 hex digest of `path`'s bytes, streamed in 1 MiB chunks. |
+| `get_stored_checksum(conn, table_name)` | Returns the `source_checksum` last recorded for `table_name`, or `None` if there's no row yet or the column is `NULL`. Commits immediately after the SELECT to release its lock (same pattern as `_fetch_status` in `tests/test_auto_clean_redirect.py`). |
+| `check_source_freshness(conn, table_name, csv_path)` | Returns `(source_changed, current_checksum)`. `source_changed` is `True` only when a prior checksum exists AND differs from the file's current bytes — a table with no baseline yet is never reported as "changed". Detection/audit signal only, not a gate — `clean_dataset()` always re-examines the file's real current content regardless. Called by `clean_and_reload` (per targeted table, before its folder's `clean_dataset()` call) and by `load_data.py:main()` (per file, before the folder-wide `clean_dataset()` call), both logging a `[checksum] ...` message to stderr/stdout when a mismatch is detected — see architecture review point #20. |
+| `_create_and_populate_table(conn, table_name, csv_path, sample_rows_for_typing=500)` | Low-level create+populate primitive (CREATE TABLE + batched INSERT from the CSV). Raises on any failure (malformed row, type mismatch); never commits — callers own the transaction. Used internally by `load_csv_to_table` to build the staging table. |
+| `_swap_table_atomically(conn, staging_name, table_name)` | Atomic swap: any existing `table_name` is renamed to `table_name_previous` (kept, never dropped) before `staging_name` is renamed to `table_name`. Runs inside the caller's still-open transaction — no commit here. `ALTER TABLE ... RENAME` is atomic DDL in Postgres, so `table_name` is never observably missing or half-populated. |
+| `load_csv_to_table(conn, csv_path, sample_rows_for_typing=500)` | Loads a CSV into Postgres **atomically** (architecture review point #20): builds a staging table (`_create_and_populate_table`) inside one transaction, then swaps it into place (`_swap_table_atomically`); a single `conn.commit()` at the end covers both steps. Any exception during staging triggers `conn.rollback()` and re-raises — the existing `table_name` (if any) is never touched. Staging table name is deterministic (`__reload_staging__<table_name>`, not random), so an orphaned staging table from a crashed prior load self-heals via the `DROP TABLE IF EXISTS` at the start of `_create_and_populate_table`. Returns `(table_name, row_count)` — same contract as before. |
+| `rollback_table(conn, table_name)` | **Manual, deliberate** recovery: swaps `table_name` and `table_name_previous` back (a real swap via a temporary holding name, not a destructive overwrite — the bad version becomes the new `_previous`). Returns `True` if a rollback happened, `False` if there was no `_previous` to roll back to. Nothing in this codebase calls this automatically. |
 | `sanitize_identifier(name)` | Lowercases and strips a CSV stem to make a valid Postgres identifier (used as table name). |
 
 ---
@@ -389,8 +400,12 @@ Key internal functions:
 
 **File naming:** `tests/test_<feature>.py` — standalone executable scripts, not pytest. Run with `PYTHONPATH=/path/to/data-agent uv run python tests/test_<feature>.py`.
 
-**`_llm=None` / `llm=None` injection pattern:** Both `clean_dataset(folder_path, llm=None, ...)` and `clean_and_reload(state, _llm=None)` accept a fake LLM object in tests. When `None` (always in production), they call `pick_llm("high")`. Tests pass deterministic fake LLMs (e.g. `FakeDedupLLM`, `AlwaysFailLLM`, `AnyCodeLLM`) to control code generation without live API calls. Used in: `test_auto_clean_redirect.py`, `test_data_cleaning_retry.py`, `test_data_cleaning_post_validation.py`, `test_data_cleaning_fail_warn_split.py`, `test_data_quality_status.py`, `test_visualize_auto_clean.py`.
+**`_llm=None` / `llm=None` injection pattern:** Both `clean_dataset(folder_path, llm=None, ...)` and `clean_and_reload(state, _llm=None)` accept a fake LLM object in tests. When `None` (always in production), they call `pick_llm("high")`. Tests pass deterministic fake LLMs (e.g. `FakeDedupLLM`, `AlwaysFailLLM`, `AnyCodeLLM`) to control code generation without live API calls. Used in: `test_auto_clean_redirect.py`, `test_data_cleaning_retry.py`, `test_data_cleaning_post_validation.py`, `test_data_cleaning_fail_warn_split.py`, `test_data_quality_status.py`, `test_visualize_auto_clean.py`, `test_reload_hardening.py`.
 
-**Data fixtures:** Test data lives under `data/_test_etl/` — separate subdirectory per scenario (`clean_only/`, `dq_fail/`, `dq_warn/`, `approve_yes/`, etc.). Tests that require interactive approval (`test_data_cleaning_approve.py`) require stdin to be piped — they fail with `EOFError` when run non-interactively; this is expected behavior, not a regression.
+**Data fixtures:** Test data lives under `data/_test_etl/` — separate subdirectory per scenario (`clean_only/`, `dq_fail/`, `dq_warn/`, `approve_yes/`, `reload_hardening/`, etc.). Tests that require interactive approval (`test_data_cleaning_approve.py`) require stdin to be piped — they fail with `EOFError` when run non-interactively; this is expected behavior, not a regression.
+
+**Mode-based test files:** A few test files take a CLI arg to select which scenario(s) to run, because different scenarios need different (or no) piped stdin — see each file's own docstring for the exact `printf` invocation per mode:
+- `test_auto_clean_redirect.py`: `routing` (no stdin) / `decline` (`no\n`) / `approve` (`yes\nyes\n`).
+- `test_reload_hardening.py`: `db` (no stdin — atomic swap/rollback, forced-failure, checksum-unit scenarios) / `clean` (`yes\n` × 4 — cleaned-artifact versioning + `clean_and_reload` checksum-logging integration scenarios). Covers architecture review points #20/#21 (Tier 4 auto-clean/reload hardening): atomic `load_csv_to_table`, `rollback_table`, `check_source_freshness`, and `_clone_file`'s `.previous` rotation. Fixture: `data/_test_etl/reload_hardening/reload_dup.csv`.
 
 **`PYTHONPATH` requirement:** All tests must be run from the project root with `PYTHONPATH=/Users/dylangagliordi/data-agent` set (or equivalent), since `agents/`, `models/`, and `utils/` are not installed packages.
