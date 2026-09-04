@@ -10,6 +10,8 @@ import re
 import statistics
 from pathlib import Path
 
+import sqlglot
+from sqlglot import exp
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 
@@ -749,30 +751,84 @@ def _strip_sql_formatting(text: str) -> str:
 #    discretion) and appended to final_answer deterministically, every time —
 #    so even if some variance remains, the user is never misled about what
 #    "top"/"best" specifically meant for that particular run.
-_MIN_SAMPLE_HAVING_RE = re.compile(
-    r"\bHAVING\b.*?\bCOUNT\s*\(\s*\*?\s*\)\s*>=?\s*(\d+)", re.IGNORECASE | re.DOTALL
-)
-_ORDER_BY_CLAUSE_RE = re.compile(
-    r"\bORDER BY\b(.*?)(?=\bLIMIT\b|;|$)", re.IGNORECASE | re.DOTALL
-)
+_SQL_AST_CACHE: dict = {}
 
 
-def _split_top_level_commas(text: str) -> list:
-    """Split a SQL expression list on commas that are not inside parentheses."""
-    parts, depth, current = [], 0, []
-    for ch in text:
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        if ch == "," and depth == 0:
-            parts.append("".join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        parts.append("".join(current))
-    return [p.strip() for p in parts if p.strip()]
+def _parse_sql_ast(sql_query: str):
+    """Parse sql_query into a sqlglot AST (Postgres dialect), memoized per query text.
+
+    Returns None when sql_query is empty or fails to parse — every caller treats
+    that as "nothing extractable" rather than raising, since these helpers only
+    ever run against a query that has already executed successfully (or, in
+    tests, a hand-written query that may deliberately be malformed).
+    """
+    if not sql_query or not sql_query.strip():
+        return None
+    if sql_query in _SQL_AST_CACHE:
+        return _SQL_AST_CACHE[sql_query]
+    try:
+        tree = sqlglot.parse_one(sql_query, read="postgres")
+    except Exception:
+        tree = None
+    _SQL_AST_CACHE[sql_query] = tree
+    return tree
+
+
+def _extract_min_sample_threshold(sql_query: str):
+    """Return the integer threshold N from a HAVING COUNT(*)/COUNT(col) >= N (or > N)
+    clause anywhere in the query, or None if no such comparison exists.
+
+    Reads the actual HAVING clause structure from the parsed AST — recognizes
+    HAVING COUNT(*) >= 5, HAVING COUNT(order_id) >= 5, HAVING COUNT(*) > 4, and
+    any other textual form of the same structural pattern (a COUNT(...) compared
+    against an integer literal), not just one fixed regex shape.
+    """
+    tree = _parse_sql_ast(sql_query)
+    if tree is None:
+        return None
+    for having in tree.find_all(exp.Having):
+        for cmp_node in having.find_all((exp.GTE, exp.GT)):
+            left, right = cmp_node.this, cmp_node.expression
+            if isinstance(left, exp.Count) and isinstance(right, exp.Literal) and right.is_number:
+                return right.this
+    return None
+
+
+def _order_by_label(order_expr) -> str:
+    """Human-readable label for one ORDER BY expression.
+
+    A plain column reference (or an alias reference back to one) is humanized
+    the same way column names are elsewhere. Anything structurally richer —
+    a CASE expression, a window function, an arithmetic expression — has no
+    single "column name" to fall back to, so the real expression text is
+    shown verbatim instead of guessing at a label from it.
+    """
+    if isinstance(order_expr, exp.Column):
+        return _humanize_column(order_expr.name)  # type: ignore[name-defined]
+    return order_expr.sql(dialect="postgres")
+
+
+def _extract_order_by_columns(sql_query: str) -> list:
+    """Return [(label, direction), ...] for every top-level ORDER BY key, read
+    directly from the parsed AST — correctly handling CASE expressions, window
+    functions, and multiple sort keys, rather than regex text matching.
+    """
+    tree = _parse_sql_ast(sql_query)
+    if tree is None:
+        return []
+    # Read the outer query's own "order" arg directly rather than tree.find(exp.Order),
+    # which would return the first ORDER BY encountered in document order — including
+    # one that belongs to a CTE — instead of the one governing the final result set.
+    order = tree.args.get("order") if hasattr(tree, "args") else None
+    if order is None:
+        order = tree.find(exp.Order)
+    if order is None:
+        return []
+    parsed = []
+    for ordered in order.expressions:
+        direction = "descending" if ordered.args.get("desc") else "ascending"
+        parsed.append((_order_by_label(ordered.this), direction))
+    return parsed
 
 
 # ── New rubric helpers ────────────────────────────────────────────────────────
@@ -949,9 +1005,8 @@ def _analyst_judgment_disclosure(sql_query: str, result_data=None) -> str:
     notes = []
 
     # Rule 1: minimum sample threshold
-    having_match = _MIN_SAMPLE_HAVING_RE.search(sql_query)
-    if having_match:
-        n = having_match.group(1)
+    n = _extract_min_sample_threshold(sql_query)
+    if n is not None:
         notes.append(
             f"Only groups with at least {n} underlying rows were included in this "
             f"ranking (smaller groups were excluded to avoid basing an average on "
@@ -959,25 +1014,13 @@ def _analyst_judgment_disclosure(sql_query: str, result_data=None) -> str:
         )
 
     # Rule 2: combined-metric ranking (only disclose when 2+ ORDER BY columns)
-    order_match = _ORDER_BY_CLAUSE_RE.search(sql_query)
-    if order_match:
-        raw_cols = _split_top_level_commas(order_match.group(1))
-        if len(raw_cols) >= 2:
-            parsed = []
-            for col_expr in raw_cols:
-                direction = "descending"
-                m = re.match(r"^(.*?)\s+(ASC|DESC)$", col_expr, re.IGNORECASE)
-                if m:
-                    col_expr, direction = m.group(1).strip(), m.group(2).lower()
-                    direction = "descending" if direction == "desc" else "ascending"
-                label_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", col_expr)
-                label = _humanize_column(label_match.group(1)) if label_match else col_expr  # type: ignore[name-defined]
-                parsed.append((label, direction))
-            primary, *rest = parsed
-            desc = f"ranked primarily by {primary[0]} ({primary[1]})"
-            for label, direction in rest:
-                desc += f", then by {label} ({direction})"
-            notes.append(f"This result is {desc}.")
+    parsed = _extract_order_by_columns(sql_query)
+    if len(parsed) >= 2:
+        primary, *rest = parsed
+        desc = f"ranked primarily by {primary[0]} ({primary[1]})"
+        for label, direction in rest:
+            desc += f", then by {label} ({direction})"
+        notes.append(f"This result is {desc}.")
 
     # Rule 3: null exclusions
     notes.extend(_extract_null_exclusion_disclosures(sql_query))
@@ -1360,20 +1403,34 @@ quality." Do this ONLY when that section is actually non-empty; if it's empty, s
 about data quality at all."""
 
 
-_TABLE_NAME_RE_CACHE: dict = {}
+def _extract_referenced_tables(sql_query: str) -> set:
+    """Real table references anywhere in the query — including inside subqueries
+    and CTE bodies — as lowercase names, read from the parsed AST rather than a
+    text search. A string literal or comment that happens to contain a table
+    name never matches, since it never becomes an exp.Table node; a CTE's own
+    name (which also parses as an exp.Table when it's later selected FROM) is
+    excluded so it can't be mistaken for a real table reference.
+    """
+    tree = _parse_sql_ast(sql_query)
+    if tree is None:
+        return set()
+    cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    return {
+        t.name.lower()
+        for t in tree.find_all(exp.Table)
+        if t.name.lower() not in cte_names
+    }
 
 
 def _query_touches_table(sql_query: str, table_name: str) -> bool:
-    """Whether table_name appears as a real identifier (not a substring of a longer
-    word) anywhere in the executed SQL text — quoted ("table") or bare, case-
-    insensitive (Postgres folds unquoted identifiers to lowercase, and table_name here
-    always comes from information_schema, already lowercase).
+    """Whether table_name is a real table reference anywhere in the executed SQL
+    (including inside subqueries and CTEs) — case-insensitive (Postgres folds
+    unquoted identifiers to lowercase, and table_name here always comes from
+    information_schema, already lowercase).
     """
-    pattern = _TABLE_NAME_RE_CACHE.get(table_name)
-    if pattern is None:
-        pattern = re.compile(r'(?<![\w"])' + re.escape(table_name) + r'(?![\w"])', re.IGNORECASE)
-        _TABLE_NAME_RE_CACHE[table_name] = pattern
-    return bool(pattern.search(sql_query))
+    if not sql_query:
+        return False
+    return table_name.lower() in _extract_referenced_tables(sql_query)
 
 
 def _relevant_data_quality_notes(state: SQLAnalystState) -> list:

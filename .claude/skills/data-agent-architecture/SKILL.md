@@ -223,6 +223,12 @@ One row per id-like column per table. `source` indicates how the determination w
 | `_outlier_sensitivity_note(result_data)` | Fires when one group's metric value is > 3× the median of all groups. |
 | `_group_size_imbalance_note(result_data)` | Fires when max/min count-column ratio ≥ 10 in result_data. Requires a count-like column name in the result (n, count, num*, sample_size, total_count, *_count). |
 | `_extract_deduplication_disclosure(sql)` | Fires when `SELECT DISTINCT` is present; discloses duplicate-removal assumption. Rule 12. |
+| `_parse_sql_ast(sql_query)` | Parses `sql_query` into a `sqlglot` AST (`read="postgres"`), memoized per query text in `_SQL_AST_CACHE`. Returns `None` on empty input or a parse failure — every caller below treats that as "nothing extractable," not an error. |
+| `_extract_referenced_tables(sql_query)` | AST-based table-reference extraction: walks all `exp.Table` nodes (including inside subqueries and CTE bodies), returns lowercase names, excluding CTE names themselves (a CTE re-selected via `FROM cte_name` would otherwise look like a table). Replaces the old regex substring match — a table name inside a string literal or comment no longer matches. |
+| `_query_touches_table(sql_query, table_name)` | Thin wrapper: `table_name.lower() in _extract_referenced_tables(sql_query)`. |
+| `_extract_min_sample_threshold(sql_query)` | AST-based HAVING extraction (Rule 1): finds every `exp.Having` clause, walks for a `GTE`/`GT` comparison whose left side is `exp.Count` and right side is a numeric `exp.Literal`, returns that literal. Catches `HAVING COUNT(*) >= 5`, `HAVING COUNT(order_id) >= 5`, `HAVING COUNT(*) > 4`, and any structurally equivalent form — not one fixed regex shape. Searches all HAVING clauses in the query (including inside CTEs), matching the old regex's whole-text search behavior. |
+| `_extract_order_by_columns(sql_query)` | AST-based ORDER BY extraction (Rule 2): reads the *outer* query's own `order` arg directly (not `tree.find(exp.Order)`, which could return a CTE's own ORDER BY instead). Returns `[(label, direction), ...]`. A plain column key is humanized via `_humanize_column`; a CASE expression, window function, or other compound expression has no single "column" to name, so its real SQL text is shown verbatim instead of a guessed label. |
+| `_order_by_label(order_expr)` | Label helper used by `_extract_order_by_columns` — `exp.Column` → humanized name; everything else → `expr.sql(dialect="postgres")`. |
 
 **SQL analyst graph wiring:**
 ```
