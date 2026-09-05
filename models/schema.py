@@ -73,6 +73,32 @@ class SQLAnalystState(BaseModel):
     # chart_type and output_file_path.
     chart_image_path: str = ""
 
+    # Set by resolve_chart_columns (visualization path only, after execute_sql
+    # succeeds) to the REAL result column names the chart should actually plot,
+    # resolved by meaning rather than by SQL SELECT-list position — see
+    # resolve_chart_columns in agents/sql_analyst.py for why: chart renderers
+    # used to pick cols[0]/cols[1] positionally, which silently plotted the wrong
+    # metric whenever the column the question cared about wasn't selected first.
+    # Left blank (and build_visualization falls back to each renderer's existing
+    # positional/numeric-detection logic) when the result is empty/truncated, or
+    # when column resolution fails and the deterministic fallback in
+    # resolve_chart_columns is used instead (see chart_column_resolution_note).
+    chart_category_column: str = ""
+    chart_value_column: str = ""
+    # Only meaningful for "stacked bar" / "treemap" chart types; empty string
+    # otherwise.
+    chart_secondary_column: str = ""
+    # Non-empty only when resolve_chart_columns had to fall back to its
+    # deterministic heuristic instead of a confident LLM pick. Appended to
+    # final_answer by build_visualization, same pattern as disclosure_note.
+    chart_column_resolution_note: str = ""
+    # Set by validate_chart_shape when the chosen chart_type would render
+    # broken/misleading against the REAL result (too many pie slices, no real
+    # time axis for a line chart, too few points for a histogram, etc.) and had
+    # to be overridden to a safer fallback. Empty string when no override was
+    # needed. Appended to final_answer by build_visualization.
+    chart_type_override_note: str = ""
+
 
 class JudgeSchema(BaseModel):
     """Structured output schema for the safety-judge node only.

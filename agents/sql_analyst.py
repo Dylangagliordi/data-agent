@@ -9,11 +9,13 @@ import json
 import re
 import statistics
 from pathlib import Path
+from typing import Literal
 
 import sqlglot
 from sqlglot import exp
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
+from pydantic import create_model
 
 from models.schema import ChartTypeSchema, JudgeSchema, SQLAnalystState
 from utils.db import get_app_reader_connection
@@ -586,28 +588,38 @@ def _write_hyper_file(data: list, csv_path: Path) -> Path:
 
 
 DETERMINE_CHART_TYPE_SYSTEM_PROMPT = """You are a data visualization expert. Given a user question, \
-determine the most appropriate chart type.
+determine the most appropriate chart type using this STRICT, ORDERED priority list. Evaluate the \
+rules in order and stop at the FIRST one that matches — never skip ahead to a later rule just \
+because it also seems plausible, and never fall back to "genuinely uncertain, pick your best \
+guess": one of these rules always applies, and rule 7 is the guaranteed catch-all.
 
-Step 1: Check whether the question explicitly names a chart type.
-Examples of explicit naming: "bar chart", "line graph", "pie chart", "scatter plot", "histogram", \
-"box plot", "donut chart", "stacked bar", "treemap".
-If a chart type is explicitly named, use it exactly as the chart_type. Set chart_type_source to \
-"explicit" and chart_type_reasoning to an empty string — no justification is needed for something \
-the user already specified.
+1. Explicit chart type named in the question — e.g. "bar chart", "line graph", "pie chart", \
+"scatter plot", "histogram", "box plot", "donut chart", "stacked bar", "treemap". Use it exactly \
+as chart_type, verbatim. Set chart_type_source to "explicit" and chart_type_reasoning to an empty \
+string — no justification is needed for something the user already specified.
 
-Step 2: If no chart type is named, choose the best fit using this rubric:
-- Change over time / trend → line chart
-- Comparing categories (not over time) → bar chart
-- Relationship between two numeric variables → scatter plot
-- Proportion of a whole (5 or fewer categories ONLY) → pie chart (never for comparisons or distributions)
-- Distribution of one variable → histogram
-- Distribution of one variable across groups → box plot
-- Composition across several categories → stacked bar chart
-- Hierarchical part-to-whole → treemap
-If genuinely uncertain between two reasonable fits, default to whichever of line/bar/scatter is \
-closest, and say so explicitly in the reasoning.
-Set chart_type_source to "reasoned". chart_type_reasoning must be a real, specific justification \
-grounded in the question — never a generic placeholder like "best fit" or "seems appropriate"."""
+If no chart type is named, evaluate rules 2-7 below IN ORDER and use the first one whose \
+condition is met. For every one of these, set chart_type_source to "reasoned", and \
+chart_type_reasoning MUST explicitly name which numbered rule fired (e.g. "Rule 4: the question \
+asks for a breakdown of a small, explicitly named set of categories, so pie chart applies.") — \
+never a generic justification like "best fit" or "seems appropriate".
+
+2. Explicit time/trend language ("over time", "by month/year/quarter", "trend", "since X") \
+→ line chart.
+3. Explicit distribution language ("distribution of", "spread of", "how X varies") with no \
+grouping implied → histogram. The same distribution language WITH an explicit grouping \
+("...across regions/segments") → box plot.
+4. Explicit part-to-whole language ("share of", "% of total", "breakdown of") → pie chart, but \
+ONLY if the question implies a small, fixed set of categories — either named explicitly in the \
+question, or phrased as "top N" with N <= 5. Otherwise (an unbounded or large category set) \
+→ bar chart.
+5. Two explicit numeric measures being related to each other ("relationship between X and Y", \
+"does X correlate with Y") → scatter plot.
+6. A second categorical dimension nested inside the first ("X broken down by Y within each Z") \
+→ stacked bar chart — or treemap specifically when the question uses explicitly hierarchical \
+language ("hierarchy", "nested", "drill down").
+7. Default (the catch-all — use this whenever none of rules 2-6 matched): a plain category \
+comparison, "top N", or "which X has the highest Y" → bar chart."""
 
 
 def determine_chart_type(state: SQLAnalystState) -> dict:
@@ -636,6 +648,138 @@ def determine_chart_type(state: SQLAnalystState) -> dict:
         "chart_type_reasoning": result.chart_type_reasoning,
         "export_target": _detect_export_target(state.curated_question),
     }
+
+
+# ── Chart column resolution (by meaning, not SQL SELECT-list position) ─────────
+#
+# Root cause of a real bug: a query returning `industry, avg_salary, avg_rating,
+# job_count` for a question about employee SATISFACTION plotted avg_salary
+# (position 1) instead of avg_rating, purely because salary happened to be
+# selected first in the SQL. The chart silently answered the wrong question
+# while the LLM-written report prose (generated separately, from the same
+# result data) correctly discussed rating — text and chart disagreed with no
+# error or warning anywhere. resolve_chart_columns fixes this by asking, after
+# the real result exists, which actual column the question meant — constrained
+# so the model can only ever choose a column name that is really present.
+
+RESOLVE_CHART_COLUMNS_SYSTEM_PROMPT = """You are given a user's question, the SQL query that was \
+actually executed to answer it, and the real columns present in the query's result (each labeled \
+numeric or non-numeric based on the actual data returned).
+
+Pick exactly one category_column — what each row/bar/point represents, usually the non-numeric \
+grouping column — and exactly one value_column — the specific metric the QUESTION is actually \
+asking about, which is not always the first numeric column in the result or the SQL SELECT list. \
+Read the question carefully: when the result has more than one numeric column, you must pick the \
+one the question is actually about (e.g. a question about satisfaction/rating should pick the \
+rating column even if a salary column appears earlier in the result).
+
+Only pick secondary_column — a sub-category / nested dimension — when the chart type is \
+"stacked bar" or "treemap"; for every other chart type, secondary_column MUST be an empty string.
+
+You may only choose from the exact column names given to you — never invent, abbreviate, or \
+guess at a column name that isn't in the list."""
+
+
+def _build_chart_column_schema(columns: list):
+    """Build a Pydantic model, per-call, whose fields are typed as Literal over the
+    ACTUAL result column names present in THIS query's result — so the LLM is
+    structurally unable to invent a column name that doesn't really exist.
+    """
+    col_literal = Literal[tuple(columns)]
+    secondary_literal = Literal[tuple(columns) + ("",)]
+    return create_model(
+        "ChartColumnSchema",
+        category_column=(col_literal, ...),
+        value_column=(col_literal, ...),
+        secondary_column=(secondary_literal, ...),
+    )
+
+
+def _fallback_chart_columns(cols: list, classification: dict) -> tuple:
+    """Deterministic fallback used when the LLM pick fails or returns something
+    invalid: category_column -> first non-numeric column, else cols[0];
+    value_column -> first numeric column that isn't the category column, else
+    cols[1] (or cols[0] if there's genuinely only one column)."""
+    non_numeric = [c for c in cols if classification.get(c) != "numeric"]
+    category = non_numeric[0] if non_numeric else cols[0]
+    numeric_not_category = [
+        c for c in cols if classification.get(c) == "numeric" and c != category
+    ]
+    if numeric_not_category:
+        value = numeric_not_category[0]
+    elif len(cols) > 1:
+        value = cols[1]
+    else:
+        value = cols[0]
+    return category, value
+
+
+def resolve_chart_columns(state: SQLAnalystState) -> dict:
+    """Node: after execute_sql succeeds on the visualization path, resolve which
+    REAL result columns actually mean "category" / "value" / "secondary" for
+    charting purposes — by meaning, not by SQL SELECT-list position.
+
+    Only runs when wants_visualization is True (wired via route_after_execute_sql).
+    If the result is empty or was truncated, resolution is skipped entirely and
+    every chart_* field is left blank — build_visualization's existing truncation
+    handling already covers that case, and there is nothing meaningful to resolve
+    against an empty/partial result.
+    """
+    result_data, was_truncated = _parse_sql_result(state.sql_query_execution_result)
+    if not result_data or was_truncated or not isinstance(result_data[0], dict):
+        return {}
+
+    cols = list(result_data[0].keys())
+    first_row = result_data[0]
+    classification = {
+        c: ("numeric" if _to_float(first_row.get(c)) is not None else "non-numeric")
+        for c in cols
+    }
+
+    try:
+        schema_cls = _build_chart_column_schema(cols)
+        llm = pick_llm("cheap").with_structured_output(schema_cls)
+        classification_lines = "\n".join(
+            f"  - {c}: {classification[c]}" for c in cols
+        )
+        human_content = (
+            f"Question: {state.curated_question}\n\n"
+            f"SQL executed:\n{state.generated_sql_query}\n\n"
+            f"Chart type: {state.chart_type}\n\n"
+            f"Real result columns:\n{classification_lines}"
+        )
+        result = llm.invoke(
+            [
+                ("system", RESOLVE_CHART_COLUMNS_SYSTEM_PROMPT),
+                ("human", human_content),
+            ]
+        )
+        category_col = result.category_column
+        value_col = result.value_column
+        secondary_col = result.secondary_column
+
+        if category_col not in cols or value_col not in cols:
+            raise ValueError("resolve_chart_columns: LLM returned a non-real column name")
+        if secondary_col and secondary_col not in cols:
+            raise ValueError("resolve_chart_columns: LLM returned a non-real secondary column")
+
+        return {
+            "chart_category_column": category_col,
+            "chart_value_column": value_col,
+            "chart_secondary_column": secondary_col,
+            "chart_column_resolution_note": "",
+        }
+    except Exception:
+        category_col, value_col = _fallback_chart_columns(cols, classification)
+        return {
+            "chart_category_column": category_col,
+            "chart_value_column": value_col,
+            "chart_secondary_column": "",
+            "chart_column_resolution_note": (
+                "Could not confidently identify which column the question meant to "
+                "chart — used the first available metric column instead."
+            ),
+        }
 
 
 GENERATE_SQL_SYSTEM_PROMPT = """You are a SQL analyst. Given a question and a description of \
@@ -1568,8 +1712,9 @@ def route_after_execute_sql(state: SQLAnalystState) -> str:
 
     Returns a plain string key: "represent_final_answer" on the exhausted-retry
     error case (final_answer already set by execute_sql), "generate_sql" on a
-    retryable error, "build_visualization" on success when wants_visualization
-    is True, and "represent_final_answer" on success for a normal question.
+    retryable error, "resolve_chart_columns" on success when wants_visualization
+    is True (which then flows on to validate_chart_shape -> build_visualization),
+    and "represent_final_answer" on success for a normal question.
     """
     if state.final_answer:
         # execute_sql already gave up after MAX_SQL_ATTEMPTS — pass the error
@@ -1578,7 +1723,7 @@ def route_after_execute_sql(state: SQLAnalystState) -> str:
     if state.sql_query_execution_result.startswith(_SQL_ERROR_PREFIX):
         return "generate_sql"
     if state.wants_visualization:
-        return "build_visualization"
+        return "resolve_chart_columns"
     return "represent_final_answer"
 
 
@@ -1762,20 +1907,26 @@ def _numeric_cols(data: list, cols: list) -> list:
     return [c for c in cols if _to_float(first.get(c)) is not None]
 
 
-def _chart_bar(ax, data: list, cols: list) -> None:
+def _chart_bar(ax, data: list, cols: list, category_col: str = "", value_col: str = "") -> None:
     """Draw a bar per row. A genuinely NULL metric value is drawn as a 0-height
     bar but marked with a hatch pattern + "No data" label so it is never
     visually indistinguishable from a real zero (which renders as a plain,
-    unmarked 0-height bar)."""
-    x_labels = [str(r[cols[0]]) for r in data]
-    if len(cols) >= 2:
-        raw_vals = [_to_float(r[cols[1]]) for r in data]
+    unmarked 0-height bar).
+
+    category_col/value_col, when set and present in cols, are the real columns
+    the question actually meant (resolved by resolve_chart_columns). When not
+    set, falls back to the original positional behavior (cols[0]/cols[1])."""
+    cat_col = category_col if category_col and category_col in cols else cols[0]
+    val_col = value_col if value_col and value_col in cols else (cols[1] if len(cols) >= 2 else None)
+    x_labels = [str(r[cat_col]) for r in data]
+    if val_col is not None:
+        raw_vals = [_to_float(r[val_col]) for r in data]
     else:
         raw_vals = list(range(len(data)))
     pos = list(range(len(x_labels)))
     heights = [0.0 if v is None else v for v in raw_vals]
     bars = ax.bar(pos, heights)
-    if len(cols) >= 2:
+    if val_col is not None:
         for i, v in enumerate(raw_vals):
             if v is None:
                 bars[i].set_hatch("//")
@@ -1787,19 +1938,24 @@ def _chart_bar(ax, data: list, cols: list) -> None:
                 )
     ax.set_xticks(pos)
     ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
-    ax.set_xlabel(_humanize_column(cols[0]))
-    if len(cols) >= 2:
-        ax.set_ylabel(_humanize_column(cols[1]))
+    ax.set_xlabel(_humanize_column(cat_col))
+    if val_col is not None:
+        ax.set_ylabel(_humanize_column(val_col))
 
 
-def _chart_line(ax, data: list, cols: list) -> None:
+def _chart_line(ax, data: list, cols: list, category_col: str = "", value_col: str = "") -> None:
     """Draw the line. A genuinely NULL metric value is passed through as NaN,
     which matplotlib renders as a real gap in the line (no segment drawn
     through it, no marker plotted there) — distinct from a real zero, which
-    draws a marker at y=0."""
-    x_labels = [str(r[cols[0]]) for r in data]
-    if len(cols) >= 2:
-        y_vals = [_to_float(r[cols[1]]) for r in data]
+    draws a marker at y=0.
+
+    category_col/value_col: see _chart_bar's docstring — same resolution/fallback
+    precedence."""
+    cat_col = category_col if category_col and category_col in cols else cols[0]
+    val_col = value_col if value_col and value_col in cols else (cols[1] if len(cols) >= 2 else None)
+    x_labels = [str(r[cat_col]) for r in data]
+    if val_col is not None:
+        y_vals = [_to_float(r[val_col]) for r in data]
         y_vals = [float("nan") if v is None else v for v in y_vals]
     else:
         y_vals = []
@@ -1811,22 +1967,35 @@ def _chart_line(ax, data: list, cols: list) -> None:
         [lbl if i % step == 0 else "" for i, lbl in enumerate(x_labels)],
         rotation=45, ha="right", fontsize=8,
     )
-    ax.set_xlabel(_humanize_column(cols[0]))
-    if len(cols) >= 2:
-        ax.set_ylabel(_humanize_column(cols[1]))
+    ax.set_xlabel(_humanize_column(cat_col))
+    if val_col is not None:
+        ax.set_ylabel(_humanize_column(val_col))
 
 
-def _chart_scatter(ax, data: list, cols: list) -> None:
-    num = _numeric_cols(data, cols)
-    str_cols = [c for c in cols if c not in num]
-    if len(num) >= 2:
-        x_col, y_col = num[0], num[1]
-        label_col = str_cols[0] if str_cols else None
-    elif len(cols) >= 2:
-        x_col, y_col = cols[-2], cols[-1]
-        label_col = None
+def _chart_scatter(ax, data: list, cols: list, category_col: str = "", value_col: str = "") -> None:
+    """category_col/value_col, when both set, present in cols, AND both numeric,
+    are used as the explicit x/y measures (the two real numeric columns the
+    question actually meant). Otherwise falls back to the original
+    numeric-detection behavior."""
+    x_col = y_col = None
+    if (
+        category_col and category_col in cols and _to_float(data[0].get(category_col)) is not None
+        and value_col and value_col in cols and _to_float(data[0].get(value_col)) is not None
+        and category_col != value_col
+    ):
+        x_col, y_col = category_col, value_col
+        label_col = next((c for c in cols if c not in (x_col, y_col)), None)
     else:
-        return
+        num = _numeric_cols(data, cols)
+        str_cols = [c for c in cols if c not in num]
+        if len(num) >= 2:
+            x_col, y_col = num[0], num[1]
+            label_col = str_cols[0] if str_cols else None
+        elif len(cols) >= 2:
+            x_col, y_col = cols[-2], cols[-1]
+            label_col = None
+        else:
+            return
     xs = [_to_float(r[x_col]) for r in data]
     ys = [_to_float(r[y_col]) for r in data]
     valid_xs = [x for x, y in zip(xs, ys) if x is not None and y is not None]
@@ -1844,15 +2013,23 @@ def _chart_scatter(ax, data: list, cols: list) -> None:
     ax.set_ylabel(_humanize_column(y_col))
 
 
-def _chart_pie(ax, data: list, cols: list, donut: bool = False) -> None:
+def _chart_pie(
+    ax, data: list, cols: list, donut: bool = False,
+    category_col: str = "", value_col: str = "",
+) -> None:
     """A pie/donut wedge has no way to represent "missing" as opposed to a
     real, tiny-but-present zero share — a 0-value wedge is already invisible,
     so silently including a NULL as 0 would be indistinguishable from a real
     zero. Instead, rows with a NULL metric are omitted from the chart
-    entirely rather than plotted as a same-looking zero wedge."""
+    entirely rather than plotted as a same-looking zero wedge.
+
+    category_col/value_col: see _chart_bar's docstring — same resolution/fallback
+    precedence."""
     if len(cols) < 2:
         return
-    pairs = [(str(r[cols[0]]), _to_float(r[cols[1]])) for r in data]
+    cat_col = category_col if category_col and category_col in cols else cols[0]
+    val_col = value_col if value_col and value_col in cols else cols[1]
+    pairs = [(str(r[cat_col]), _to_float(r[val_col])) for r in data]
     pairs = [(label, val) for label, val in pairs if val is not None]
     if not pairs:
         return
@@ -1864,9 +2041,16 @@ def _chart_pie(ax, data: list, cols: list, donut: bool = False) -> None:
     ax.pie(vals, labels=labels, autopct="%1.1f%%", wedgeprops=wedge_kw)
 
 
-def _chart_histogram(ax, data: list, cols: list) -> None:
-    num = _numeric_cols(data, cols)
-    col = num[0] if num else cols[0]
+def _chart_histogram(ax, data: list, cols: list, category_col: str = "", value_col: str = "") -> None:
+    """value_col, when set, present in cols, and numeric, is the variable being
+    distributed. category_col is unused for a single-variable histogram —
+    accepted only for a uniform renderer signature. Falls back to the original
+    numeric-detection behavior otherwise."""
+    if value_col and value_col in cols and _to_float(data[0].get(value_col)) is not None:
+        col = value_col
+    else:
+        num = _numeric_cols(data, cols)
+        col = num[0] if num else cols[0]
     vals = [_to_float(r[col]) for r in data if _to_float(r.get(col)) is not None]
     if not vals:
         return
@@ -1875,12 +2059,17 @@ def _chart_histogram(ax, data: list, cols: list) -> None:
     ax.set_ylabel("Count")
 
 
-def _chart_box(ax, data: list, cols: list) -> None:
+def _chart_box(ax, data: list, cols: list, category_col: str = "", value_col: str = "") -> None:
+    """category_col/value_col: see _chart_bar's docstring — same resolution/fallback
+    precedence, applied within the original two-branch (grouped vs. single-variable)
+    structure."""
     if len(cols) >= 2:
+        cat_col = category_col if category_col and category_col in cols else cols[0]
+        val_col = value_col if value_col and value_col in cols else cols[1]
         groups: dict = {}
         for row in data:
-            g = str(row[cols[0]])
-            v = _to_float(row[cols[1]])
+            g = str(row[cat_col])
+            v = _to_float(row[val_col])
             if v is not None:
                 groups.setdefault(g, []).append(v)
         if not groups:
@@ -1893,32 +2082,43 @@ def _chart_box(ax, data: list, cols: list) -> None:
             ax.boxplot([groups[g] for g in group_labels], vert=True)
             ax.set_xticks(range(1, len(group_labels) + 1))
             ax.set_xticklabels(group_labels, rotation=45, ha="right", fontsize=8)
-        ax.set_xlabel(_humanize_column(cols[0]))
-        ax.set_ylabel(_humanize_column(cols[1]))
+        ax.set_xlabel(_humanize_column(cat_col))
+        ax.set_ylabel(_humanize_column(val_col))
     else:
-        vals = [_to_float(r[cols[0]]) for r in data if _to_float(r.get(cols[0])) is not None]
+        val_col = value_col if value_col and value_col in cols else cols[0]
+        vals = [_to_float(r[val_col]) for r in data if _to_float(r.get(val_col)) is not None]
         if not vals:
             return
         ax.boxplot(vals)
-        ax.set_ylabel(_humanize_column(cols[0]))
+        ax.set_ylabel(_humanize_column(val_col))
 
 
-def _chart_stacked_bar(ax, data: list, cols: list) -> None:
+def _chart_stacked_bar(
+    ax, data: list, cols: list,
+    category_col: str = "", value_col: str = "", secondary_col: str = "",
+) -> None:
     """A NULL metric value for a real (category, sub-category) cell is stacked
     as a 0-height segment (stacking needs a real number to sum), but that
     segment is hatched to mark it as "no data" — distinct from a real zero
-    segment, which stacks the same way with no hatch."""
+    segment, which stacks the same way with no hatch.
+
+    category_col = main (x-axis) category, secondary_col = sub-category (the
+    stack dimension), value_col = the aggregate being stacked. Falls back to
+    the original positional cols[0]/cols[1]/cols[2] behavior when not set."""
     import numpy as np
     if len(cols) < 3:
-        _chart_bar(ax, data, cols)
+        _chart_bar(ax, data, cols, category_col=category_col, value_col=value_col)
         return
+    cat_col = category_col if category_col and category_col in cols else cols[0]
+    sub_col = secondary_col if secondary_col and secondary_col in cols else cols[1]
+    val_col = value_col if value_col and value_col in cols else cols[2]
     pivot: dict = {}
     null_cells: set = set()
     subcat_order: list = []
     for row in data:
-        cat = str(row[cols[0]])
-        sub = str(row[cols[1]])
-        val = _to_float(row[cols[2]])
+        cat = str(row[cat_col])
+        sub = str(row[sub_col])
+        val = _to_float(row[val_col])
         if val is None:
             null_cells.add((cat, sub))
             val = 0.0
@@ -1936,9 +2136,9 @@ def _chart_stacked_bar(ax, data: list, cols: list) -> None:
                 bars[j].set_edgecolor("gray")
         bottom += np.array(vals)
     ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8)
-    ax.set_xlabel(_humanize_column(cols[0]))
-    ax.set_ylabel(_humanize_column(cols[2]))
-    ax.legend(title=_humanize_column(cols[1]), bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    ax.set_xlabel(_humanize_column(cat_col))
+    ax.set_ylabel(_humanize_column(val_col))
+    ax.legend(title=_humanize_column(sub_col), bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
 
 
 def _squarify_rects(sizes, x=0.0, y=0.0, width=1.0, height=1.0) -> list:
@@ -2002,15 +2202,32 @@ def _squarify_rects(sizes, x=0.0, y=0.0, width=1.0, height=1.0) -> list:
     return rects
 
 
-def _chart_treemap(fig, data: list, cols: list) -> None:
+def _chart_treemap(
+    fig, data: list, cols: list,
+    category_col: str = "", value_col: str = "", secondary_col: str = "",
+) -> None:
     """A treemap rectangle's area IS its value — a NULL size has no valid area
     to draw at all (unlike a real zero, which legitimately occupies no area).
     Rows with a NULL size metric are omitted from the treemap entirely rather
-    than silently plotted as a real (invisible) zero-area rectangle."""
+    than silently plotted as a real (invisible) zero-area rectangle.
+
+    category_col = outer/parent label, value_col = size metric. secondary_col,
+    when present, is folded into the label as "outer / inner" so the nested
+    dimension the question asked about is still visible without changing the
+    rectangle layout itself. Falls back to the original cols[0]/cols[-1]
+    behavior when not set."""
     ax = fig.add_subplot(111)
     if len(cols) < 2:
         return
-    pairs = [(str(r[cols[0]]), _to_float(r[cols[-1]])) for r in data]
+    cat_col = category_col if category_col and category_col in cols else cols[0]
+    val_col = value_col if value_col and value_col in cols else cols[-1]
+    sub_col = secondary_col if secondary_col and secondary_col in cols else None
+    if sub_col:
+        pairs = [
+            (f"{r[cat_col]} / {r[sub_col]}", _to_float(r[val_col])) for r in data
+        ]
+    else:
+        pairs = [(str(r[cat_col]), _to_float(r[val_col])) for r in data]
     pairs = [(label, val) for label, val in pairs if val is not None]
     if not pairs:
         return
@@ -2039,11 +2256,21 @@ def _chart_treemap(fig, data: list, cols: list) -> None:
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-    ax.set_title(f"Treemap: {_humanize_column(cols[-1])}")
+    ax.set_title(f"Treemap: {_humanize_column(val_col)}")
 
 
-def _render_chart_image(data: list, chart_type: str, csv_path: Path) -> "Path | None":
+def _render_chart_image(
+    data: list, chart_type: str, csv_path: Path,
+    category_col: str = "", value_col: str = "", secondary_col: str = "",
+) -> "Path | None":
     """Render a matplotlib chart from query result data and save as <csv_path>.png.
+
+    category_col/value_col/secondary_col are the REAL result columns resolved
+    by resolve_chart_columns (by meaning, not SQL SELECT-list position) — passed
+    straight through to whichever _chart_* renderer is selected below. Each
+    renderer falls back to its own original positional/numeric-detection logic
+    when a given column isn't set or isn't actually present in this result's
+    columns (see build_visualization for the precedence resolution).
 
     Returns the .png Path on success, None on failure (any exception is caught
     and logged to stderr so the caller can still return the CSV unaffected).
@@ -2066,33 +2293,39 @@ def _render_chart_image(data: list, chart_type: str, csv_path: Path) -> "Path | 
 
         if "stacked bar" in ct:
             ax = fig.add_subplot(111)
-            _chart_stacked_bar(ax, data, cols)
+            _chart_stacked_bar(
+                ax, data, cols,
+                category_col=category_col, value_col=value_col, secondary_col=secondary_col,
+            )
         elif "treemap" in ct:
-            _chart_treemap(fig, data, cols)
+            _chart_treemap(
+                fig, data, cols,
+                category_col=category_col, value_col=value_col, secondary_col=secondary_col,
+            )
         elif "line" in ct:
             ax = fig.add_subplot(111)
-            _chart_line(ax, data, cols)
+            _chart_line(ax, data, cols, category_col=category_col, value_col=value_col)
         elif "bar" in ct:
             ax = fig.add_subplot(111)
-            _chart_bar(ax, data, cols)
+            _chart_bar(ax, data, cols, category_col=category_col, value_col=value_col)
         elif "scatter" in ct:
             ax = fig.add_subplot(111)
-            _chart_scatter(ax, data, cols)
+            _chart_scatter(ax, data, cols, category_col=category_col, value_col=value_col)
         elif "donut" in ct:
             ax = fig.add_subplot(111)
-            _chart_pie(ax, data, cols, donut=True)
+            _chart_pie(ax, data, cols, donut=True, category_col=category_col, value_col=value_col)
         elif "pie" in ct:
             ax = fig.add_subplot(111)
-            _chart_pie(ax, data, cols, donut=False)
+            _chart_pie(ax, data, cols, donut=False, category_col=category_col, value_col=value_col)
         elif "histogram" in ct:
             ax = fig.add_subplot(111)
-            _chart_histogram(ax, data, cols)
+            _chart_histogram(ax, data, cols, category_col=category_col, value_col=value_col)
         elif "box" in ct:
             ax = fig.add_subplot(111)
-            _chart_box(ax, data, cols)
+            _chart_box(ax, data, cols, category_col=category_col, value_col=value_col)
         else:
             ax = fig.add_subplot(111)
-            _chart_bar(ax, data, cols)
+            _chart_bar(ax, data, cols, category_col=category_col, value_col=value_col)
 
         fig.tight_layout()
         fig.savefig(str(png_path), dpi=150, bbox_inches="tight")
@@ -2116,6 +2349,167 @@ Rules:
 - Ground every claim strictly in the result shown — never invent a claim the data \
 does not support.
 - Do not describe the chart type or the SQL — only describe what the data shows."""
+
+
+# ── Deterministic chart-type validation against the real result ────────────────
+#
+# determine_chart_type picks the chart type BEFORE generate_sql runs, purely
+# from question wording — some of its own rules (e.g. "pie chart only for <=5
+# categories") are unenforceable at that point since the real result doesn't
+# exist yet. validate_chart_shape closes that gap: pure Python, no LLM call,
+# checking the REAL parsed result against state.chart_type and overriding to a
+# safer chart type when it would render broken or misleading. Only one level
+# of fallback is ever applied — always lands on plain "bar" (or a stripped-down
+# stacked-bar/treemap), never chains multiple substitutions.
+
+_MIN_HISTOGRAM_BOX_ROWS = 10
+
+_TEMPORAL_VALUE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}|\d{4}/\d{2}/\d{2}|\d{4}-\d{2}|\d{4}|"
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _canonical_chart_kind(chart_type: str) -> str:
+    """Map a free-text chart_type string down to one of the canonical kinds this
+    validation table has a rule for, using the same substring-matching approach
+    as _render_chart_image/_chart_shaping_instruction. Anything that doesn't
+    match a specific kind (including plain "bar") is treated as "bar", which has
+    no constraint in the table below."""
+    ct = (chart_type or "").lower()
+    for key in ("stacked bar", "treemap", "line", "scatter", "donut", "pie", "histogram", "box"):
+        if key in ct:
+            return key
+    return "bar"
+
+
+def _looks_temporal(result_data: list, category_col: str) -> bool:
+    """True when the category column's real values look like dates/years/months
+    — a genuine time axis, not just an arbitrary category."""
+    if not category_col:
+        return False
+    for row in result_data[:5]:
+        v = row.get(category_col)
+        if isinstance(v, (_dt.date, _dt.datetime)):
+            return True
+        if isinstance(v, str) and _TEMPORAL_VALUE_RE.match(v.strip()):
+            return True
+    return False
+
+
+def _looks_naturally_ordered(result_data: list, category_col: str) -> bool:
+    """True when the category column is numeric and monotonic across the
+    result as returned (e.g. a sequential order number, an age) — a legitimate
+    non-date x-axis for a line chart, distinct from an arbitrary category."""
+    if not category_col or len(result_data) < 2:
+        return False
+    vals = [_to_float(r.get(category_col)) for r in result_data]
+    if any(v is None for v in vals):
+        return False
+    return vals == sorted(vals) or vals == sorted(vals, reverse=True)
+
+
+def validate_chart_shape(state: SQLAnalystState) -> dict:
+    """Node (pure Python, no LLM call): validate state.chart_type against the
+    REAL parsed result and override + record chart_type_override_note on any
+    violation. Runs after resolve_chart_columns, before build_visualization.
+
+    | chart_type          | constraint                                    | fallback |
+    |----------------------|-----------------------------------------------|----------|
+    | pie / donut          | <= 5 distinct category rows                   | bar      |
+    | line                 | temporal category, or naturally ordered rows  | bar      |
+    | scatter               | >= 2 real numeric cols (excl. id/count cols)  | bar      |
+    | stacked bar / treemap | >= 3 columns present                          | bar      |
+    | histogram / box      | >= ~10 rows returned                          | bar      |
+
+    If the result is empty or unparseable, there's nothing to validate against —
+    leave chart_type untouched (build_visualization's existing empty-result
+    handling covers that case).
+    """
+    result_data, was_truncated = _parse_sql_result(state.sql_query_execution_result)
+    if not result_data or not isinstance(result_data[0], dict):
+        return {}
+
+    cols = list(result_data[0].keys())
+    category_col = (
+        state.chart_category_column if state.chart_category_column in cols
+        else (cols[0] if cols else "")
+    )
+
+    kind = _canonical_chart_kind(state.chart_type)
+    n_rows = len(result_data)
+
+    new_chart_type = None
+    reason = ""
+
+    if kind in ("pie", "donut"):
+        distinct = {str(r.get(category_col)) for r in result_data}
+        if len(distinct) > 5:
+            new_chart_type = "bar"
+            reason = (
+                f"a {kind} chart is only readable with 5 or fewer categories, but this "
+                f"result has {len(distinct)}"
+            )
+    elif kind == "line":
+        if not (
+            _looks_temporal(result_data, category_col)
+            or _looks_naturally_ordered(result_data, category_col)
+        ):
+            new_chart_type = "bar"
+            reason = (
+                "the category column doesn't look like a time series or a naturally "
+                "ordered sequence, so a line chart would draw a misleading trend"
+            )
+    elif kind == "scatter":
+        numeric_cols = [
+            c for c in cols
+            if _to_float(result_data[0].get(c)) is not None
+            and not _is_id_like_column(c)
+            and not _COUNT_COL_RE.match(c)
+        ]
+        if len(numeric_cols) < 2:
+            new_chart_type = "bar"
+            reason = (
+                "a scatter plot needs at least two real numeric measures (excluding "
+                f"id/count columns), but this result only has {len(numeric_cols)}"
+            )
+    elif kind in ("stacked bar", "treemap"):
+        if len(cols) < 3:
+            new_chart_type = "bar"
+            reason = (
+                f"a {kind} chart needs at least 3 columns (category, sub-category, "
+                f"value), but this result only has {len(cols)}"
+            )
+    elif kind in ("histogram", "box"):
+        if n_rows < _MIN_HISTOGRAM_BOX_ROWS:
+            new_chart_type = "bar"
+            reason = (
+                f"only {n_rows} rows were returned — too few to show a meaningful "
+                f"{kind}"
+            )
+
+    if new_chart_type is None:
+        return {}
+
+    if state.chart_type_source == "explicit":
+        # state.chart_type is user-authored text that often already contains the
+        # word "chart" (e.g. "pie chart") — don't append a second one.
+        asked_for = state.chart_type if "chart" in state.chart_type.lower() else f"{state.chart_type} chart"
+        note = (
+            f"You asked for a {asked_for}, but it was rendered as a "
+            f"{new_chart_type} chart instead because {reason}."
+        )
+    else:
+        note = (
+            f"Rendered as a {new_chart_type} chart instead of the initially chosen "
+            f"{state.chart_type} because {reason}."
+        )
+
+    return {
+        "chart_type": new_chart_type,
+        "chart_type_override_note": note,
+    }
 
 
 def build_visualization(state: SQLAnalystState) -> dict:
@@ -2166,10 +2560,26 @@ def build_visualization(state: SQLAnalystState) -> dict:
     if state.export_target == "tableau":
         hyper_path = _write_hyper_file(result_data, output_path)
 
+    # --- Resolve which real columns to pass to the renderer ---
+    # Precedence: state.chart_category_column/chart_value_column/chart_secondary_column
+    # (set by resolve_chart_columns) if set AND actually present in the real result's
+    # columns; otherwise pass empty strings, in which case each _chart_* renderer
+    # falls back to its own original positional/numeric-detection logic (not deleted,
+    # just made secondary).
+    render_cols = (
+        list(result_data[0].keys()) if result_data and isinstance(result_data[0], dict) else []
+    )
+    render_category_col = state.chart_category_column if state.chart_category_column in render_cols else ""
+    render_value_col = state.chart_value_column if state.chart_value_column in render_cols else ""
+    render_secondary_col = state.chart_secondary_column if state.chart_secondary_column in render_cols else ""
+
     # --- Render chart image (always, regardless of export_target) ---
     # _render_chart_image catches all exceptions internally; a None return means
     # rendering failed and we report that honestly in final_answer.
-    chart_png: "Path | None" = _render_chart_image(result_data, state.chart_type, output_path)
+    chart_png: "Path | None" = _render_chart_image(
+        result_data, state.chart_type, output_path,
+        category_col=render_category_col, value_col=render_value_col, secondary_col=render_secondary_col,
+    )
     chart_image_path_str = str(chart_png) if chart_png is not None else ""
 
     # --- Interpretive summary ---
@@ -2221,10 +2631,22 @@ def build_visualization(state: SQLAnalystState) -> dict:
     disclosure = _analyst_judgment_disclosure(state.generated_sql_query, result_data)
     disclosure_note = f"\n\nHow this answer was computed: {disclosure}" if disclosure else ""
 
+    # Never swallow these silently — both are set only when something needed
+    # correcting (a low-confidence column pick, or a chart type that would have
+    # rendered broken/misleading against the real result).
+    column_resolution_note = (
+        f"\n\nNote: {state.chart_column_resolution_note}"
+        if state.chart_column_resolution_note else ""
+    )
+    chart_override_note = (
+        f"\n\nNote: {state.chart_type_override_note}"
+        if state.chart_type_override_note else ""
+    )
+
     final_answer = (
         f"{files_note}\n"
         f"Chart type: {state.chart_type}{reasoning_note}{chart_render_note}{truncation_note}\n\n"
-        f"Summary: {summary}{disclosure_note}"
+        f"Summary: {summary}{disclosure_note}{column_resolution_note}{chart_override_note}"
     )
     final_answer = _apply_causal_correction(final_answer, state.generated_sql_query)
 
@@ -2457,7 +2879,8 @@ def build_sql_analyst_graph():
     Additional visualization path (wants_visualization=True):
         add_context --(route_after_add_context)--> determine_chart_type
         determine_chart_type -> generate_sql  (same generate_sql, extended prompt)
-        execute_sql --(route_after_execute_sql)--> build_visualization
+        execute_sql --(route_after_execute_sql)--> resolve_chart_columns
+        resolve_chart_columns -> validate_chart_shape -> build_visualization
         build_visualization -> END
     """
     graph = StateGraph(SQLAnalystState)
@@ -2471,6 +2894,8 @@ def build_sql_analyst_graph():
     graph.add_node("execute_sql", execute_sql)
     graph.add_node("cancel_sql", cancel_sql)
     graph.add_node("represent_final_answer", represent_final_answer)
+    graph.add_node("resolve_chart_columns", resolve_chart_columns)
+    graph.add_node("validate_chart_shape", validate_chart_shape)
     graph.add_node("build_visualization", build_visualization)
 
     graph.add_edge(START, "curate_question")
@@ -2503,9 +2928,11 @@ def build_sql_analyst_graph():
         {
             "generate_sql": "generate_sql",
             "represent_final_answer": "represent_final_answer",
-            "build_visualization": "build_visualization",
+            "resolve_chart_columns": "resolve_chart_columns",
         },
     )
+    graph.add_edge("resolve_chart_columns", "validate_chart_shape")
+    graph.add_edge("validate_chart_shape", "build_visualization")
 
     graph.add_edge("cancel_sql", END)
     graph.add_edge("represent_final_answer", END)
