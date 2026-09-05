@@ -1070,6 +1070,55 @@ def _is_long_form_prose_column(series: pd.Series) -> bool:
     return bool(mean_len is not None and mean_len > _EXPLORE_PROSE_MEAN_LEN_THRESHOLD)
 
 
+# Fraction of a column's real values that must fall inside the "ideal" contiguous
+# integer range (0..n-1 or 1..n) for _is_sequential_id_like_column to treat it as a
+# row identifier rather than real data — allows some tolerance for gaps left by
+# earlier row filtering, without being so loose it also swallows genuine data.
+_SEQUENTIAL_ID_RANGE_OVERLAP_THRESHOLD = 0.9
+
+
+def _is_sequential_id_like_column(series: pd.Series) -> bool:
+    """True if a column looks like a plain sequential/row identifier rather than
+    real data worth exploring for composite structure — e.g. all-numeric, strictly
+    monotonic, or a near-permutation of a small integer range roughly matching the
+    row count (0..n-1 or 1..n, some tolerance for gaps from earlier row filtering).
+
+    A plain sequential id is the most common false-positive shape discovery hits:
+    it trivially satisfies almost any narrow all-digit regex at or near 100%, so a
+    "Composite field (discovered)" hypothesis on a column like this is essentially
+    guaranteed to mechanically verify despite there being no real second value
+    glued to anything. This is a cheap, deterministic PRECISION improvement for
+    that specific, common shape — heuristic, not exhaustive, and deliberately NOT
+    a replacement for the NO_SPLIT decline sentinel in
+    _generate_composite_split_code, which remains the general-purpose safety net
+    for false-positive shapes this heuristic doesn't catch.
+    """
+    non_null = series.dropna()
+    n = len(non_null)
+    if n < 2:
+        return False
+
+    numeric = pd.to_numeric(non_null, errors="coerce")
+    if numeric.isna().any():
+        return False
+    values = numeric.tolist()
+
+    is_increasing = all(values[i] < values[i + 1] for i in range(n - 1))
+    is_decreasing = all(values[i] > values[i + 1] for i in range(n - 1))
+    if is_increasing or is_decreasing:
+        return True
+
+    if not all(float(v).is_integer() for v in values):
+        return False
+    int_values = {int(v) for v in values}
+    for start in (0, 1):
+        ideal_range = set(range(start, start + n))
+        overlap_frac = len(int_values & ideal_range) / n
+        if overlap_frac >= _SEQUENTIAL_ID_RANGE_OVERLAP_THRESHOLD:
+            return True
+    return False
+
+
 def _sample_column_values(non_null: pd.Series) -> list:
     """Sample up to EXPLORE_SAMPLE_SIZE real values from a column, mixing a plain
     random sample with the column's least-frequent (rarest) distinct values.
@@ -1118,13 +1167,16 @@ def explore_column(df: pd.DataFrame, column: str, llm=None) -> list:
     columns should produce nothing.
 
     Skips the LLM call entirely (returns []) for a column that looks like
-    long-form prose (see _is_long_form_prose_column), has no non-null values at
-    all, or has too few real values to draw any real conclusion from (see
-    _EXPLORE_MIN_COLUMN_ROWS — a tiny column makes any regex a tautology, not
-    evidence). The other skip condition from the spec — a column check_rubric
-    already flagged with a fail-level issue this run — is applied by the
-    caller (explore_and_verify), which is where that information actually
-    lives.
+    long-form prose (see _is_long_form_prose_column), looks like a plain
+    sequential row identifier (see _is_sequential_id_like_column — the single
+    most common false-positive shape discovery hits, since a sequential id
+    trivially matches almost any narrow all-digit regex), has no non-null
+    values at all, or has too few real values to draw any real conclusion from
+    (see _EXPLORE_MIN_COLUMN_ROWS — a tiny column makes any regex a tautology,
+    not evidence). The other skip condition from the spec — a column
+    check_rubric already flagged with a fail-level issue this run — is applied
+    by the caller (explore_and_verify), which is where that information
+    actually lives.
     """
     series = df[column]
     non_null = series.dropna()
@@ -1132,6 +1184,7 @@ def explore_column(df: pd.DataFrame, column: str, llm=None) -> list:
         len(non_null) < _EXPLORE_MIN_COLUMN_ROWS
         or non_null.empty
         or _is_long_form_prose_column(series)
+        or _is_sequential_id_like_column(series)
     ):
         return []
 
@@ -1432,7 +1485,9 @@ def explore_and_verify(
 
     eligible_columns = [
         col for col in df.columns
-        if col not in flagged_columns and not _is_long_form_prose_column(df[col])
+        if col not in flagged_columns
+        and not _is_long_form_prose_column(df[col])
+        and not _is_sequential_id_like_column(df[col])
     ]
 
     for col in eligible_columns:
@@ -1520,7 +1575,12 @@ class IssueCleaningRecord:
 
     status: "resolved" | "skipped_declined" | "skipped_failed" (real execution error
     exhausted all attempts) | "skipped_incomplete" (execution succeeded but this
-    specific issue was still detected immediately afterward, every attempt).
+    specific issue was still detected immediately afterward, every attempt) |
+    "declined_false_positive" (composite-field issues only: the fix-generation
+    model itself determined discovery's pattern match was a false positive for
+    this column and declined via the NO_SPLIT sentinel — a successful terminal
+    outcome, distinct from "skipped_declined" (a HUMAN declined at the approval
+    gate) since no human was ever asked; `error` holds the model's stated reason).
     """
 
     issue: str
@@ -1968,13 +2028,24 @@ def _generate_cleaning_code(
 # ---------------------------------------------------------------------------
 
 COMPOSITE_FIELD_SPLIT_SYSTEM_PROMPT = """You are fixing exactly one specific data-quality
-issue: a column that has been mechanically confirmed to hold two distinct values glued
-together (e.g. a name with a rating appended, or a "city, state" pair in one field).
+issue: a column that has been mechanically confirmed to match a pattern suggesting it may
+hold two distinct values glued together (e.g. a name with a rating appended, or a
+"city, state" pair in one field).
 
-You are given the flagged column's real name, a real sample of its values, and the exact
-verified pattern (a regex) that was confirmed to match a high fraction of its real values.
+IMPORTANT — check this first: the pattern match was computed mechanically and can be a
+false positive. Look at the real sample values given below. If this column does NOT
+actually contain two distinct, meaningfully different pieces of information — for example,
+it is a sequential ID, a single coherent value that just happens to match the pattern by
+coincidence, or splitting it would produce two meaningless fragments — output exactly this
+and nothing else:
 
-Rules — read carefully, these are stricter than normal cleaning rules:
+# NO_SPLIT: <one-sentence reason this column should not be split>
+
+Do not attempt to force a split just because the pattern matched. A correct "no split
+needed" response is a successful outcome, not a failure — you will not be asked to retry
+if you decline for a real reason.
+
+If the column DOES genuinely hold two distinct values, proceed with the rules below:
 - You may split the named column into EXACTLY TWO new columns, using the verified pattern
   to separate the two parts. Name the new columns descriptively based on what each part
   actually represents (e.g. "company_name" and "company_rating", or "city" and "state").
@@ -1983,14 +2054,25 @@ Rules — read carefully, these are stricter than normal cleaning rules:
 - You MUST NOT touch, rename, reorder, or drop any other column in the file.
 - You MUST NOT invent a third column, a summary column, or any derived value beyond the
   two parts the pattern actually captures.
-- For any value that does NOT match the verified pattern (rows outside the matched
-  fraction), split what you can and leave the unmatched part as null/NaN — do not guess
-  or fabricate a value that isn't actually there.
-- Output ONLY raw Python code — no explanation, no markdown fences, no backticks.
-- The script must read the CSV at the exact path given, apply the split, and write the
-  result back to that same path (overwrite in place), exactly like every other cleaning
-  script in this pipeline.
+- For any value that does NOT match the verified pattern, split what you can and leave the
+  unmatched part as null/NaN — do not guess or fabricate a value that isn't actually there.
+- Output ONLY raw Python code — no explanation, no markdown fences, no backticks — UNLESS
+  you are declining, in which case output ONLY the "# NO_SPLIT: ..." line above.
 """
+
+_NO_SPLIT_RE = re.compile(r"^#\s*NO_SPLIT:\s*(.+)$", re.IGNORECASE)
+
+
+def _extract_no_split_reason(code: str) -> "str | None":
+    """Return the decline reason if code is a NO_SPLIT sentinel response from
+    _generate_composite_split_code, else None. Checked against the stripped,
+    single-purpose output COMPOSITE_FIELD_SPLIT_SYSTEM_PROMPT instructs the model
+    to produce when it decides a column shouldn't be split — not a general-purpose
+    text search that could false-match a comment inside a real split script.
+    """
+    stripped = code.strip()
+    match = _NO_SPLIT_RE.match(stripped)
+    return match.group(1).strip() if match else None
 
 
 def _generate_composite_split_code(
@@ -2171,10 +2253,23 @@ def _clean_issue_group(
     type (see _composite_split_shape_ok). Every other issue category is
     completely unaffected by this parameter.
 
+    A composite-field fix-generation call can also legitimately decline (the
+    NO_SPLIT sentinel, see _extract_no_split_reason) when it determines
+    discovery's pattern match was a false positive for this column — that is a
+    terminal, successful outcome returned immediately as "declined_false_positive",
+    with NO retry, NO execution, and NO approval prompt (nothing was generated
+    worth a human reviewing). This is deliberately NOT treated as a failure fed
+    back into the retry loop: doing so was the original hole this exists to
+    close — retry pressure ("expected 2 replacement columns, found 0 — try
+    again") could otherwise push the model toward fabricating a shape-compliant
+    but meaningless split just to satisfy _composite_split_shape_ok's letter.
+
     Returns (status, attempts, error, remaining_issues, last_code):
     - status: "resolved" | "skipped_declined" | "skipped_failed" | "skipped_incomplete"
+      | "declined_false_positive" (composite-field issues only — see above)
     - attempts: how many attempts this group actually took
-    - error: the real last error/still-present description (empty if resolved/declined)
+    - error: the real last error/still-present description (empty if resolved/declined);
+      for "declined_false_positive", the model's own stated decline reason
     - remaining_issues: which of target_issues are still detected after the last
       attempt (empty unless status == "skipped_incomplete")
     - last_code: the last code that was approved and executed (empty if declined, or if
@@ -2220,6 +2315,17 @@ def _clean_issue_group(
                 code = _generate_composite_split_code(
                     cloned_path, issue, verified_pattern, llm, previous_code, previous_error
                 )
+                # Legitimate decline: the model itself determined discovery's
+                # pattern match was a false positive for this column. This is a
+                # terminal, successful outcome — NOT fed back into the retry
+                # loop as a failure (that pressure is exactly what could push a
+                # later attempt toward fabricating a shape-compliant-but-
+                # meaningless split just to satisfy _composite_split_shape_ok).
+                # No execution, no approval prompt: nothing was generated that's
+                # worth a human reviewing.
+                no_split_reason = _extract_no_split_reason(code)
+                if no_split_reason is not None:
+                    return "declined_false_positive", attempt, no_split_reason, [], ""
             else:
                 print(
                     f"[explore] No verified pattern found for composite-field issue "
