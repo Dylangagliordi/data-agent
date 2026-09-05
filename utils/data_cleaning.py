@@ -1651,6 +1651,20 @@ class FileCleaningRecord:
     - row_loss_flagged: True if row_count_after lost >= ROW_LOSS_FLAG_THRESHOLD of
       row_count_before, even though rubric_recheck_passed is True — flagged, not
       treated as a failure, since the LLM's row-dropping strategy may be legitimate.
+
+    structured_decomposition_candidates (Spec 3): purely informational — see
+    _detect_range_columns. Populated from a scan of the file's REAL state after all
+    fail/warn cleaning above has finished (regardless of outcome — even a
+    "skipped_declined"/"skipped_incomplete" file still gets scanned), so currency/
+    unit stripping has already had its chance to run before this looks for a
+    numeric-range shape. Detecting a candidate here is NEVER itself a cleaning
+    action and NEVER triggers a fix automatically — this is a schema-ENRICHMENT
+    option (e.g. "$137K-$171K" -> min_salary/max_salary), not a data-quality
+    problem (the original value here is not wrong), so it is deliberately kept out
+    of `issues`/`FAIL_LEVEL_PREFIXES`/`WARN_LEVEL_PREFIXES` entirely. Something else
+    (a CLI flag, a future orchestrator) decides whether to actually call
+    decompose_range_column for a listed candidate — clean_dataset() itself never
+    calls it.
     """
 
     file_name: str
@@ -1665,6 +1679,7 @@ class FileCleaningRecord:
     row_count_before: int | None = None
     row_count_after: int | None = None
     row_loss_flagged: bool = False
+    structured_decomposition_candidates: list = field(default_factory=list)
 
 
 def unresolved_issues_for_record(rec: "FileCleaningRecord") -> list:
@@ -2435,6 +2450,364 @@ def _clean_issue_group(
     return "skipped_incomplete", attempt, previous_error, remaining_issues, last_executed_code
 
 
+# ---------------------------------------------------------------------------
+# Spec 3: numeric range decomposition (Salary/Revenue -> min/max/avg columns).
+#
+# Deliberately NOT the same kind of fix as composite-field splitting. A composite
+# field is a data-quality PROBLEM (two variables wrongly glued together — the
+# glued-together form is simply wrong). A salary/revenue range is not wrong —
+# "$137K-$171K" is a perfectly valid, correctly-formatted piece of information;
+# decomposing it into min_salary/max_salary/avg_salary is a deliberate SCHEMA
+# ENRICHMENT decision, closer to a migration than a cleanup. It gets its own
+# detection flag (never added to check_rubric's issue list or
+# FAIL_LEVEL_PREFIXES/WARN_LEVEL_PREFIXES), its own prompt, and its own approval
+# flow — entirely separate from check_rubric's issue list and from the
+# composite-field split path above.
+#
+# _detect_range_columns is purely informational and runs automatically inside
+# clean_dataset() (see below) — it never triggers a fix on its own.
+# decompose_range_column is the opt-in fix itself, and is NEVER called
+# automatically from clean_dataset(); something else (a CLI flag, a separate
+# pipeline stage, a future orchestrator built for this) decides whether/when to
+# actually call it for a listed candidate. This keeps "did the data get cleaned"
+# and "did we choose to enrich the schema" as two clearly separable,
+# independently-auditable decisions.
+# ---------------------------------------------------------------------------
+
+# Match-fraction threshold for a column to be listed as a range-decomposition
+# candidate — mirrors RANGE_DECOMPOSITION_MATCH_THRESHOLD's composite-field
+# counterpart (_verify_hypothesis's match_threshold concept) for consistency.
+RANGE_DECOMPOSITION_MATCH_THRESHOLD = 0.8
+
+# Scale-word suffixes commonly used INSIDE a numeric range value (e.g. "$137K",
+# "$1 to $2 billion") — distinct from UNIT_SUFFIXES (physical units like kg/cm):
+# these represent an implicit multiplier on the number itself, not a unit of
+# measurement, so a bare unit-suffix check was never meant to cover them.
+_RANGE_SCALE_SUFFIXES = ("thousand", "million", "billion", "k", "mm", "bn", "m", "b")
+_RANGE_SCALE_ALT = "|".join(re.escape(s) for s in _RANGE_SCALE_SUFFIXES)
+
+# One "side" of a range: an optional currency symbol, digits (optional commas/
+# decimal), then an optional scale suffix — e.g. matches "$137K", "$1", "2",
+# "10,000.50". Reuses CURRENCY_SYMBOLS (the same vocabulary check_rubric's own
+# _check_currency_unit_symbols is built on) rather than inventing a new one.
+_RANGE_NUMBER_PART = (
+    rf"[{re.escape(CURRENCY_SYMBOLS)}]?\s*\d[\d,]*(?:\.\d+)?\s*(?:{_RANGE_SCALE_ALT})?"
+)
+# Two of those sides joined by "-" or "to" — anchored at the start only (real
+# values commonly have trailing junk like " (Glassdoor est.)" / " (USD)" that
+# this deliberately does not require matching).
+_RANGE_PAIR_RE = re.compile(
+    rf"^\s*{_RANGE_NUMBER_PART}\s*(?:-|to)\s*{_RANGE_NUMBER_PART}",
+    re.IGNORECASE,
+)
+
+
+def _detect_range_columns(df: pd.DataFrame) -> list:
+    """Deterministic, no-LLM detector for columns that consistently hold a
+    numeric min-max range (e.g. "$137K-$171K (Glassdoor est.)", "$1 to $2
+    billion (USD)") — a candidate for OPT-IN structured decomposition (see
+    decompose_range_column below), never automatically triggered and never
+    added to check_rubric's issue list (see this section's module comment for
+    why: this is a schema-enrichment option, not a data-quality problem).
+
+    _RANGE_PAIR_RE tolerates an optional leading currency symbol and scale
+    suffix on each side of the range, so this correctly recognizes a range
+    shape whether or not upstream currency/unit cleanup has already stripped
+    the surrounding $/K symbols by the time this runs (clean_dataset() runs
+    this AFTER a file's normal cleaning finishes — see its wiring below) — no
+    separate "has this column's currency issue already been resolved" check is
+    needed, since the pattern itself already handles both forms.
+
+    Returns a list of {"column": str, "match_fraction": float,
+    "sample_pattern": str} dicts for every column clearing
+    RANGE_DECOMPOSITION_MATCH_THRESHOLD, ordered as columns appear in df. Never
+    modifies df — purely a scan, same discipline as check_rubric.
+    """
+    candidates = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip()
+        if series.empty:
+            continue
+        matches = series.str.match(_RANGE_PAIR_RE)
+        match_count = int(matches.sum())
+        match_fraction = match_count / len(series)
+        if match_fraction >= RANGE_DECOMPOSITION_MATCH_THRESHOLD:
+            sample_pattern = series[matches].iloc[0]
+            candidates.append({
+                "column": col,
+                "match_fraction": match_fraction,
+                "sample_pattern": sample_pattern,
+            })
+    return candidates
+
+
+RANGE_DECOMPOSITION_SYSTEM_PROMPT = """You are enriching a dataset by decomposing one
+column that holds a numeric range (e.g. "$137K-$171K", "$1 to $2 billion (USD)") into
+separate numeric columns. This is NOT a data-quality fix — the original column is not
+wrong, you are adding structured columns alongside it.
+
+IMPORTANT — check this first: the range pattern was matched mechanically and can be a
+false positive. Look at the real sample values given below. If this column does NOT
+actually hold a genuine numeric range worth decomposing — for example, most values are
+a single number rather than a range, a non-numeric placeholder ("Unknown", "-1", "N/A"),
+or free text that only coincidentally matched the pattern — output exactly this and
+nothing else:
+
+# NO_DECOMPOSITION: <one-sentence reason this column should not be decomposed>
+
+Do not force a decomposition just because the pattern matched. A correct "no
+decomposition needed" response is a successful outcome, not a failure — you will not be
+asked to retry if you decline for a real reason.
+
+If the column DOES genuinely hold a numeric range worth decomposing, proceed with the
+rules below:
+- You may add up to 3 new numeric columns derived from the named column: a minimum
+  value, a maximum value, and (optionally) an average of the two. Name them clearly and
+  consistently, e.g. "min_salary", "max_salary", "avg_salary" for a salary column, or
+  the equivalent naming for whatever the column represents.
+- The ORIGINAL column MUST be preserved completely unchanged — do not modify, rename, or
+  drop it.
+- You MUST NOT touch any other column in the file.
+- All added columns must use ONE consistent unit (e.g. convert "billion" ranges to the
+  same unit as "million" ranges before writing the numeric value) — state your chosen
+  unit in a one-line code comment.
+- For any value that doesn't match a clean numeric range (unparseable, a single value
+  with no range, a non-numeric placeholder), leave the new columns as null/NaN for that
+  row rather than guessing.
+- Output ONLY raw Python code — no explanation, no markdown fences, no backticks —
+  UNLESS you are declining, in which case output ONLY the "# NO_DECOMPOSITION: ..." line
+  above.
+- The script must read the CSV at the exact path given, add the new columns, and write
+  the result back to that same path (overwrite in place).
+"""
+
+_NO_DECOMPOSITION_RE = re.compile(r"^#\s*NO_DECOMPOSITION:\s*(.+)$", re.IGNORECASE)
+
+
+def _extract_no_decomposition_reason(code: str) -> "str | None":
+    """Return the decline reason if code is a NO_DECOMPOSITION sentinel response
+    from _generate_range_decomposition_code, else None — same discipline as
+    _extract_no_split_reason for the composite-field spec's NO_SPLIT sentinel.
+    """
+    stripped = code.strip()
+    match = _NO_DECOMPOSITION_RE.match(stripped)
+    return match.group(1).strip() if match else None
+
+
+def _generate_range_decomposition_code(
+    file_path: Path,
+    column: str,
+    candidate: dict,
+    llm,
+    previous_code: str = "",
+    previous_error: str = "",
+) -> str:
+    """One LLM call producing a range-decomposition script for ONE candidate
+    column, or a NO_DECOMPOSITION decline. Mirrors _generate_cleaning_code /
+    _generate_composite_split_code's prompt-building shape (_describe_file_for_
+    prompt, optional hints.txt, previous_code/previous_error on retries,
+    _strip_code_formatting) but uses RANGE_DECOMPOSITION_SYSTEM_PROMPT and
+    states the mechanically-detected match fraction + a real sample value
+    explicitly, so the model has concrete evidence to judge the candidate
+    against rather than just the column name.
+    """
+    df = _read_csv_robust(file_path)
+    file_context = _describe_file_for_prompt(file_path, df=df)
+    match_fraction = candidate.get("match_fraction", 0.0)
+    sample_pattern = candidate.get("sample_pattern", "")
+
+    human_content = (
+        f"File to enrich (read and overwrite this exact path): {file_path}\n\n"
+        f"{file_context}\n\n"
+        f"The candidate column for structured range decomposition: '{column}'\n"
+        f"Mechanically detected: {match_fraction:.0%} of its real non-null values match "
+        f"a numeric-range shape (e.g. {sample_pattern!r}).\n\n"
+        "Inspect the real sample values above for this column before deciding whether "
+        "to decompose it or decline."
+    )
+
+    # Same optional per-dataset hints as _generate_cleaning_code — see its comment
+    # for why (domain knowledge, not a config format; absent file = no behavior change).
+    hints_path = file_path.parent.parent / "hints.txt"
+    if hints_path.exists():
+        hints_text = hints_path.read_text().strip()
+        if hints_text:
+            human_content += (
+                f"\n\nDataset-specific context (domain knowledge about this data — "
+                f"treat these facts as authoritative when generating code):\n{hints_text}"
+            )
+
+    if previous_error:
+        human_content += (
+            "\n\nA previous attempt at this file's decomposition script did not fully "
+            f"succeed — fix the script so it actually works:\n{previous_error}"
+            f"\n\nPrevious script was:\n{previous_code}"
+        )
+
+    response = llm.invoke(
+        [
+            ("system", RANGE_DECOMPOSITION_SYSTEM_PROMPT),
+            ("human", human_content),
+        ]
+    )
+    content = response.content
+    if isinstance(content, list):
+        text = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+            if not (isinstance(block, dict) and block.get("type") == "thinking")
+        )
+    else:
+        text = content
+    return _strip_code_formatting(text)
+
+
+def _range_decomposition_shape_ok(file_path: Path, original_columns: list, flagged_column: str) -> tuple:
+    """Post-fix verification for a range decomposition — same discipline as
+    _composite_split_shape_ok, but this is an ENRICHMENT, not a replacement: the
+    original column must be PRESERVED (never dropped), and 1-3 new, genuinely
+    numeric columns must exist that didn't exist before.
+
+    Returns (ok, reason, new_columns). reason/new_columns are "" / [] when ok.
+    """
+    try:
+        current_df = _read_csv_robust(file_path)
+    except Exception:
+        return False, "Could not read the file back after decomposition to verify its shape.", []
+
+    current_columns = list(current_df.columns)
+    if flagged_column not in current_columns:
+        return False, (
+            f"The original column '{flagged_column}' must be preserved unchanged, "
+            "but it is no longer present after decomposition."
+        ), []
+
+    new_columns = [c for c in current_columns if c not in original_columns]
+    if not (1 <= len(new_columns) <= 3):
+        return False, (
+            f"Expected 1-3 new numeric columns after range decomposition, "
+            f"found {len(new_columns)}."
+        ), []
+
+    for new_col in new_columns:
+        non_null = current_df[new_col].dropna()
+        if non_null.empty:
+            continue
+        numeric = pd.to_numeric(non_null, errors="coerce")
+        if numeric.isna().mean() > 0.5:
+            return False, (
+                f"New column '{new_col}' does not look numeric after decomposition."
+            ), []
+
+    return True, "", new_columns
+
+
+def decompose_range_column(file_path: Path, candidate: dict, llm=None) -> dict:
+    """Opt-in structured decomposition for ONE candidate column (see
+    _detect_range_columns). Runs its own generate -> approve -> execute ->
+    re-check cycle, entirely separate from clean_dataset()'s fail/warn issue
+    loop. NEVER called automatically from clean_dataset() — see this section's
+    module comment above for why (schema enrichment vs. data-quality fix).
+
+    Reuses _request_approval (the exact same human approval gate every other
+    fix in this pipeline uses — no new or weaker approval path for a schema-
+    enrichment decision than for a real data-quality fix) and
+    _execute_cleaning_code unchanged. Operates on file_path exactly as given —
+    it does not clone or version anything itself; the caller decides which
+    path (a raw file, or an already-cleaned clone) to pass in.
+
+    Returns a result dict:
+    {"column": str, "status": str, "attempts": int, "error": str,
+     "new_columns": list, "generated_code": str}
+
+    status: "resolved" | "skipped_declined" | "skipped_failed" |
+    "skipped_incomplete" | "declined_false_positive" (the LLM itself determined
+    this candidate isn't a genuine range column worth decomposing, via the
+    NO_DECOMPOSITION sentinel — a terminal, successful, NON-retried outcome,
+    exactly like the composite-field split's NO_SPLIT decline (Spec 2.1): the
+    retry-pressure mistake from that spec (a shape-check failure fed back into
+    the retry loop as an error, which could pressure the model into fabricating
+    a shape-compliant-but-meaningless result) is deliberately not repeated here
+    — the sentinel check happens immediately after generation, before any
+    approval prompt or execution, on every attempt).
+    """
+    column = candidate["column"]
+    if llm is None:
+        from utils.llm_pick import pick_llm
+        llm = pick_llm("high")
+
+    try:
+        original_columns = list(_read_csv_robust(file_path).columns)
+    except Exception as e:
+        return {
+            "column": column, "status": "skipped_failed", "attempts": 0,
+            "error": f"Could not read {file_path} to establish a baseline: {e}",
+            "new_columns": [], "generated_code": "",
+        }
+
+    previous_code = ""
+    previous_error = ""
+    attempt = 0
+    last_code = ""
+
+    while attempt < MAX_CLEAN_ATTEMPTS:
+        attempt += 1
+        code = _generate_range_decomposition_code(
+            file_path, column, candidate, llm, previous_code, previous_error
+        )
+
+        # Legitimate decline, checked BEFORE any approval prompt or execution —
+        # a terminal, successful outcome, never fed back into the retry loop.
+        no_decomposition_reason = _extract_no_decomposition_reason(code)
+        if no_decomposition_reason is not None:
+            return {
+                "column": column, "status": "declined_false_positive", "attempts": attempt,
+                "error": no_decomposition_reason, "new_columns": [], "generated_code": "",
+            }
+
+        approved = _request_approval(code, file_path)
+        if not approved:
+            return {
+                "column": column, "status": "skipped_declined", "attempts": attempt,
+                "error": "", "new_columns": [], "generated_code": "",
+            }
+
+        success, error = _execute_cleaning_code(code, file_path)
+        if not success:
+            previous_code, previous_error = code, error
+            last_code = code
+            if attempt >= MAX_CLEAN_ATTEMPTS:
+                return {
+                    "column": column, "status": "skipped_failed", "attempts": attempt,
+                    "error": error, "new_columns": [], "generated_code": last_code,
+                }
+            continue
+
+        last_code = code
+        shape_ok, shape_reason, new_columns = _range_decomposition_shape_ok(
+            file_path, original_columns, column
+        )
+        if shape_ok:
+            return {
+                "column": column, "status": "resolved", "attempts": attempt,
+                "error": "", "new_columns": new_columns, "generated_code": last_code,
+            }
+
+        previous_code = code
+        previous_error = shape_reason
+        if attempt >= MAX_CLEAN_ATTEMPTS:
+            return {
+                "column": column, "status": "skipped_incomplete", "attempts": attempt,
+                "error": shape_reason, "new_columns": [], "generated_code": last_code,
+            }
+
+    # Unreachable in practice (mirrors _clean_issue_group's own unreachable tail).
+    return {
+        "column": column, "status": "skipped_incomplete", "attempts": attempt,
+        "error": previous_error, "new_columns": [], "generated_code": last_code,
+    }
+
+
 def _extract_reasoning_comments(code: str) -> list:
     """Pull the # comment lines from a generated cleaning script — these are the LLM's
     reasoning about WHY each transformation was applied, not just what it did."""
@@ -2616,6 +2989,17 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
             else:
                 warn_batch = WarnBatchRecord(issues=[], status="no_warn_issues")
 
+        # Spec 3: purely informational scan for structured-decomposition candidates
+        # (e.g. a salary/revenue range column) against the file's REAL current
+        # state, regardless of outcome (declined/incomplete/cleaned) — see
+        # _detect_range_columns and FileCleaningRecord.structured_decomposition_
+        # candidates. Never modifies the file, never triggers a fix; a read
+        # failure here must never abort cleaning over an enrichment side-scan.
+        try:
+            structured_decomposition_candidates = _detect_range_columns(_read_csv_robust(cloned_path))
+        except Exception:
+            structured_decomposition_candidates = []
+
         if declined:
             result.skipped_files.append(
                 FileCleaningRecord(
@@ -2625,6 +3009,7 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
                     warn_batch=warn_batch,
                     status="skipped_declined",
                     attempts=total_attempts,
+                    structured_decomposition_candidates=structured_decomposition_candidates,
                 )
             )
             continue
@@ -2652,6 +3037,7 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
             row_count_before=row_count_before,
             row_count_after=row_count_after,
             row_loss_flagged=row_loss_flagged,
+            structured_decomposition_candidates=structured_decomposition_candidates,
         )
         if still_present:
             file_record.status = "skipped_incomplete"
