@@ -113,26 +113,39 @@ assert hyps == composite_hypothesis.hypotheses, f"expected the proposed hypothes
 assert not hyps[0].startswith("Composite field"), "explore_column must return LOOSE text, never a formatted issue"
 print("PASS: explore_column returns a loose hypothesis, not a check_rubric-shaped issue.\n")
 
-# 1b. _verify_hypothesis mechanically confirms it against the FULL column.
-verified = dc._verify_hypothesis(df1, "Company Name", hyps[0], llm=fake_llm1)
+# 1b. _verify_hypothesis mechanically confirms it against the FULL column, and
+# returns the verified pattern record alongside the issue string (threaded through
+# to fix-generation by a later task — see test_composite_field_split.py).
+verified, verified_pattern = dc._verify_hypothesis(df1, "Company Name", hyps[0], llm=fake_llm1)
 print("verified issue:", verified)
+print("verified pattern:", verified_pattern)
 assert verified is not None, "hypothesis must be confirmed — the real column genuinely matches"
 assert verified.startswith("Composite field (discovered):"), f"wrong tag: {verified!r}"
 assert f"{N} value(s)" in verified, f"expected all {N} rows to match, got: {verified!r}"
 assert "100%" in verified, f"expected 100% match, got: {verified!r}"
 assert dc._issue_severity(verified) == "fail", "a discovered composite field must be fail-level"
+assert verified_pattern == {"issue": verified, "pattern": r"\n\d\.\d$", "match_threshold": 1.0}, (
+    f"expected the real verified pattern record, got {verified_pattern}"
+)
 print("PASS: _verify_hypothesis mechanically confirmed the pattern against the real full "
-      "column and tagged the result '(discovered)', classified fail-level.\n")
+      "column, tagged the result '(discovered)', classified fail-level, and returned the "
+      "real verified pattern record.\n")
 
 # 1c. Appears in explore_and_verify's final issue list (the "final issue list" the
 # deliverable spec asks for), and Job Title (no real composite structure, and this
-# fake LLM proposes nothing for it) contributes nothing.
-issues1 = dc.explore_and_verify(df1, llm=fake_llm1, flagged_columns=set())
+# fake LLM proposes nothing for it) contributes nothing. pattern_lookup carries the
+# same verified pattern record, keyed by the issue string.
+issues1, pattern_lookup1 = dc.explore_and_verify(df1, llm=fake_llm1, flagged_columns=set())
 print("explore_and_verify issues:", issues1)
+print("explore_and_verify pattern_lookup:", pattern_lookup1)
 composite_issues = [i for i in issues1 if i.startswith("Composite field (discovered):")]
 assert len(composite_issues) == 1, f"expected exactly 1 discovered composite issue, got {issues1}"
 assert "Company Name" in composite_issues[0]
-print("PASS: the discovered issue appears in explore_and_verify's final issue list.\n")
+assert pattern_lookup1.get(composite_issues[0]) == verified_pattern, (
+    f"pattern_lookup must map the issue string to its verified pattern record, got {pattern_lookup1}"
+)
+print("PASS: the discovered issue appears in explore_and_verify's final issue list, with its "
+      "verified pattern record available via pattern_lookup.\n")
 
 
 print("=" * 70)
@@ -164,14 +177,17 @@ fake_llm2 = DispatchLLM(
     hypothesis_responses=[("Column name: City", bogus_hypothesis)],
     verify_responses=[("Column name: City", bogus_proposal)],
 )
-verified2 = dc._verify_hypothesis(df2, "City", bogus_hypothesis.hypotheses[0], llm=fake_llm2)
+verified2, verified_pattern2 = dc._verify_hypothesis(df2, "City", bogus_hypothesis.hypotheses[0], llm=fake_llm2)
 assert verified2 is None, f"a hypothesis that doesn't hold up must be discarded, got {verified2!r}"
+assert verified_pattern2 is None, f"pattern record must also be None when discarded, got {verified_pattern2!r}"
 print("PASS: a proposed-but-false hypothesis is mechanically rejected (0% real match "
       "against a 50% threshold).\n")
 
-issues2 = dc.explore_and_verify(df2, llm=fake_llm2, flagged_columns=set())
+issues2, pattern_lookup2 = dc.explore_and_verify(df2, llm=fake_llm2, flagged_columns=set())
 assert issues2 == [], f"expected zero surviving issues for a genuinely clean column, got {issues2}"
-print("PASS: explore_and_verify's final issue list is empty for a genuinely clean column.\n")
+assert pattern_lookup2 == {}, f"expected an empty pattern_lookup, got {pattern_lookup2}"
+print("PASS: explore_and_verify's final issue list (and pattern_lookup) are empty for a "
+      "genuinely clean column.\n")
 
 
 print("=" * 70)
@@ -223,7 +239,7 @@ dc.EXPLORE_MAX_LLM_CALLS_PER_TABLE = 2
 try:
     stderr_capture = io.StringIO()
     with redirect_stderr(stderr_capture):
-        issues4 = dc.explore_and_verify(df4, llm=fake_llm4, flagged_columns=set())
+        issues4, pattern_lookup4 = dc.explore_and_verify(df4, llm=fake_llm4, flagged_columns=set())
     stderr_text = stderr_capture.getvalue()
     print("stderr:", stderr_text.strip())
     print("issues4:", issues4)

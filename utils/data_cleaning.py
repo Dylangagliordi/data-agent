@@ -1183,13 +1183,13 @@ overly loose or slightly wrong pattern is safely caught downstream, not somethin
 need to get perfectly right here."""
 
 
-def _verify_hypothesis(df: pd.DataFrame, column: str, hypothesis: str, llm=None) -> "str | None":
+def _verify_hypothesis(df: pd.DataFrame, column: str, hypothesis: str, llm=None) -> tuple:
     """The trust boundary: converts one loose hypothesis into a concrete regex +
     threshold via the LLM, then checks that regex against EVERY non-null value in
     the real column (not the sample) with plain Python/pandas — no LLM involved
     in the actual verification step.
 
-    Returns None (hypothesis discarded, never escalated) when:
+    Returns (None, None) (hypothesis discarded, never escalated) when:
     - the column has too few real values to meaningfully verify against (see
       _EXPLORE_MIN_COLUMN_ROWS — defense in depth alongside explore_column's
       own skip, in case this is ever called directly with a hypothesis from
@@ -1198,14 +1198,19 @@ def _verify_hypothesis(df: pd.DataFrame, column: str, hypothesis: str, llm=None)
     - the real match fraction against the full column is below the proposed
       match_threshold — this hypothesis didn't hold up against the full data.
 
-    Returns a formatted issue string, in exactly the shape check_rubric()'s other
-    checks use and tagged "(discovered)" so it's visibly distinguishable in logs/
-    reports, when the hypothesis is mechanically confirmed.
+    Returns (issue, verified_pattern) when the hypothesis is mechanically
+    confirmed: issue is a formatted issue string, in exactly the shape
+    check_rubric()'s other checks use and tagged "(discovered)" so it's visibly
+    distinguishable in logs/reports; verified_pattern is
+    {"pattern": str, "match_threshold": float} — the REAL regex and confirmed
+    match fraction, threaded through so a later scoped fix (e.g. a composite-
+    field column split) can use the pattern that was actually verified rather
+    than re-deriving one from scratch.
     """
     series = df[column]
     non_null = series.dropna().astype(str)
     if len(non_null) < _EXPLORE_MIN_COLUMN_ROWS:
-        return None
+        return None, None
 
     if llm is None:
         from utils.llm_pick import pick_llm
@@ -1225,25 +1230,30 @@ def _verify_hypothesis(df: pd.DataFrame, column: str, hypothesis: str, llm=None)
             ]
         )
     except Exception:
-        return None
+        return None, None
 
     try:
         compiled_pattern = re.compile(proposal.pattern)
     except re.error:
-        return None
+        return None, None
 
     matches = non_null.map(lambda v: bool(compiled_pattern.search(v)))
     match_count = int(matches.sum())
     match_frac = match_count / len(non_null)
 
     if match_frac < proposal.match_threshold:
-        return None
+        return None, None
 
-    return (
+    issue = (
         f"Composite field (discovered): column '{column}' has {match_count} value(s) "
         f"({match_frac:.0%}) matching the pattern '{proposal.pattern}' — this looks like two "
         f"distinct values glued together, not caught by a fixed rubric check."
     )
+    # match_threshold here is the REAL, achieved match fraction (match_frac) — more
+    # useful to a later fix-generation prompt than the LLM's originally proposed
+    # minimum bar, which was just a threshold to clear, not the actual observed rate.
+    verified_pattern = {"issue": issue, "pattern": proposal.pattern, "match_threshold": match_frac}
+    return issue, verified_pattern
 
 
 _COLUMN_NAME_TOKEN_RE = re.compile(r"[a-z]+")
@@ -1379,12 +1389,22 @@ def _explore_column_pairs(df: pd.DataFrame, llm=None, max_pairs: "int | None" = 
     return issues
 
 
-def explore_and_verify(df: "pd.DataFrame | None", llm=None, flagged_columns: "set | None" = None) -> list:
+def explore_and_verify(
+    df: "pd.DataFrame | None", llm=None, flagged_columns: "set | None" = None
+) -> tuple:
     """Orchestrator: runs explore_column across every eligible column, verifies
     every returned hypothesis via _verify_hypothesis, runs _explore_column_pairs,
-    and returns a flat list of issue strings in the exact format check_rubric()
-    produces (so they merge into the same fail/warn pipeline with no new code
-    path).
+    and returns (issues, pattern_lookup):
+    - issues: a flat list of issue strings in the exact format check_rubric()
+      produces (so they merge into the same fail/warn pipeline with no new code
+      path).
+    - pattern_lookup: dict mapping each composite-field issue string to its
+      verified pattern record ({"issue", "pattern", "match_threshold"} — see
+      _verify_hypothesis) — threaded through so a later scoped fix (splitting a
+      composite column) can use the pattern that was actually verified, rather
+      than re-deriving one from scratch. Only composite-field issues appear
+      here; duplicate-column issues (from _explore_column_pairs) have no regex
+      pattern to thread through and are absent from this dict.
 
     flagged_columns: column names check_rubric already flagged with a fail-level
     issue this run — explore_column is skipped for these (no benefit to
@@ -1399,7 +1419,7 @@ def explore_and_verify(df: "pd.DataFrame | None", llm=None, flagged_columns: "se
     never raises, never silently truncates without logging.
     """
     if df is None or df.empty:
-        return []
+        return [], {}
 
     if llm is None:
         from utils.llm_pick import pick_llm
@@ -1407,6 +1427,7 @@ def explore_and_verify(df: "pd.DataFrame | None", llm=None, flagged_columns: "se
 
     flagged_columns = flagged_columns or set()
     issues: list = []
+    pattern_lookup: dict = {}
     call_count = 0
 
     eligible_columns = [
@@ -1421,7 +1442,7 @@ def explore_and_verify(df: "pd.DataFrame | None", llm=None, flagged_columns: "se
                 f"before exploring column '{col}' — stopping discovery early for this table.",
                 file=sys.stderr,
             )
-            return issues
+            return issues, pattern_lookup
 
         hypotheses = explore_column(df, col, llm=llm)
         call_count += 1
@@ -1434,11 +1455,12 @@ def explore_and_verify(df: "pd.DataFrame | None", llm=None, flagged_columns: "se
                     "unverified.",
                     file=sys.stderr,
                 )
-                return issues
-            verified = _verify_hypothesis(df, col, hypothesis, llm=llm)
+                return issues, pattern_lookup
+            verified_issue, verified_pattern = _verify_hypothesis(df, col, hypothesis, llm=llm)
             call_count += 1
-            if verified:
-                issues.append(verified)
+            if verified_issue:
+                issues.append(verified_issue)
+                pattern_lookup[verified_issue] = verified_pattern
 
     remaining_budget = EXPLORE_MAX_LLM_CALLS_PER_TABLE - call_count
     if remaining_budget <= 0:
@@ -1447,11 +1469,11 @@ def explore_and_verify(df: "pd.DataFrame | None", llm=None, flagged_columns: "se
             "skipping column-pair exploration for this table.",
             file=sys.stderr,
         )
-        return issues
+        return issues, pattern_lookup
 
     pair_limit = min(EXPLORE_MAX_COLUMN_PAIRS, remaining_budget)
     issues.extend(_explore_column_pairs(df, llm=llm, max_pairs=pair_limit))
-    return issues
+    return issues, pattern_lookup
 
 
 # ---------------------------------------------------------------------------
@@ -1932,6 +1954,117 @@ def _generate_cleaning_code(
     return _strip_code_formatting(text)
 
 
+# ---------------------------------------------------------------------------
+# Scoped fix path for "Composite field (discovered):" issues only.
+#
+# CLEANING_CODE_SYSTEM_PROMPT above explicitly forbids adding or dropping
+# columns — correct for every other issue category. But the honest fix for a
+# composite field genuinely requires producing two columns from one and
+# removing the original. Rather than loosen the general-purpose rule
+# everywhere, this is one narrow, explicitly-scoped exception that fires ONLY
+# for this one issue category (see _clean_issue_group's branch below) — every
+# other issue still goes through _generate_cleaning_code /
+# CLEANING_CODE_SYSTEM_PROMPT completely unchanged.
+# ---------------------------------------------------------------------------
+
+COMPOSITE_FIELD_SPLIT_SYSTEM_PROMPT = """You are fixing exactly one specific data-quality
+issue: a column that has been mechanically confirmed to hold two distinct values glued
+together (e.g. a name with a rating appended, or a "city, state" pair in one field).
+
+You are given the flagged column's real name, a real sample of its values, and the exact
+verified pattern (a regex) that was confirmed to match a high fraction of its real values.
+
+Rules — read carefully, these are stricter than normal cleaning rules:
+- You may split the named column into EXACTLY TWO new columns, using the verified pattern
+  to separate the two parts. Name the new columns descriptively based on what each part
+  actually represents (e.g. "company_name" and "company_rating", or "city" and "state").
+- You MUST drop the original composite column after the split — do not leave stale
+  duplicate data behind.
+- You MUST NOT touch, rename, reorder, or drop any other column in the file.
+- You MUST NOT invent a third column, a summary column, or any derived value beyond the
+  two parts the pattern actually captures.
+- For any value that does NOT match the verified pattern (rows outside the matched
+  fraction), split what you can and leave the unmatched part as null/NaN — do not guess
+  or fabricate a value that isn't actually there.
+- Output ONLY raw Python code — no explanation, no markdown fences, no backticks.
+- The script must read the CSV at the exact path given, apply the split, and write the
+  result back to that same path (overwrite in place), exactly like every other cleaning
+  script in this pipeline.
+"""
+
+
+def _generate_composite_split_code(
+    file_path: Path,
+    issue: str,
+    verified_pattern: dict,
+    llm,
+    previous_code: str = "",
+    previous_error: str = "",
+) -> str:
+    """Mirrors _generate_cleaning_code's shape and prompt-building approach, but
+    scoped to exactly one composite-field split: uses
+    COMPOSITE_FIELD_SPLIT_SYSTEM_PROMPT (the one narrow exception to "never add/
+    drop columns") and states the ALREADY-VERIFIED regex + real match fraction
+    explicitly, so the model uses the pattern that was actually confirmed against
+    the real data rather than re-deriving one from scratch.
+
+    verified_pattern: {"pattern": str, "match_threshold": float} (see
+    _verify_hypothesis) — the real regex and the real fraction of the column's
+    values it was confirmed to match.
+    """
+    df = _read_csv_robust(file_path)
+    file_context = _describe_file_for_prompt(file_path, df=df)
+    pattern = verified_pattern.get("pattern", "")
+    match_threshold = verified_pattern.get("match_threshold", 0.0)
+
+    human_content = (
+        f"File to clean (read and overwrite this exact path): {file_path}\n\n"
+        f"{file_context}\n\n"
+        f"The specific composite-field issue to fix (fix only this):\n- {issue}\n\n"
+        "The verified pattern already mechanically confirmed against the real column's "
+        f"full data:\n"
+        f"  Regex: {pattern!r}\n"
+        f"  Confirmed to match {match_threshold:.0%} of the real non-null values.\n"
+        "Use this exact pattern to separate the two parts — do not re-derive your own "
+        "pattern from scratch."
+    )
+
+    # Same optional per-dataset hints as _generate_cleaning_code — see its comment
+    # for why (domain knowledge, not a config format; absent file = no behavior change).
+    hints_path = file_path.parent.parent / "hints.txt"
+    if hints_path.exists():
+        hints_text = hints_path.read_text().strip()
+        if hints_text:
+            human_content += (
+                f"\n\nDataset-specific context (domain knowledge about this data — "
+                f"treat these facts as authoritative when generating fix code):\n{hints_text}"
+            )
+
+    if previous_error:
+        human_content += (
+            "\n\nA previous attempt at this file's split script did not fully succeed — "
+            f"fix the script so it actually works:\n{previous_error}"
+            f"\n\nPrevious script was:\n{previous_code}"
+        )
+
+    response = llm.invoke(
+        [
+            ("system", COMPOSITE_FIELD_SPLIT_SYSTEM_PROMPT),
+            ("human", human_content),
+        ]
+    )
+    content = response.content
+    if isinstance(content, list):
+        text = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+            if not (isinstance(block, dict) and block.get("type") == "thinking")
+        )
+    else:
+        text = content
+    return _strip_code_formatting(text)
+
+
 def _request_approval(code: str, file_path: Path) -> bool:
     """The approval gate. Prints the full generated code and blocks on a real input()
     call — not a log line, not a config flag, not Hermes's own tool-approval system
@@ -1979,7 +2112,39 @@ def _count_csv_rows(path: Path) -> int | None:
         return None
 
 
-def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
+_COMPOSITE_FIELD_PREFIX = "Composite field (discovered):"
+
+
+def _composite_split_shape_ok(original_columns: list, current_columns: list, flagged_column: str) -> tuple:
+    """The real post-fix check for a composite-field split (see _clean_issue_group):
+    check_rubric() can never re-detect a "Composite field (discovered): ..." issue
+    string (it has no code path that produces that text at all), so its generic
+    "is the original issue string still present" re-check trivially always passes
+    for this issue type — it is not actually verifying anything for a composite
+    split. This is the real verification instead: the only shape a genuine two-way
+    split can honestly produce is the originally-flagged column GONE and EXACTLY
+    TWO brand-new columns (not present before) in its place.
+
+    Returns (ok, reason). reason is "" when ok is True; otherwise it is the exact
+    reason string the spec for this check requires, parameterized by how many
+    replacement columns were actually found (0 if the column was simply dropped
+    with no replacement, 3+ if extra columns appeared, anything but 2 is a
+    violation — including implicitly when the flagged column was never actually
+    dropped, since real callers always drop it as part of "df.to_csv(...)").
+    """
+    new_columns = [c for c in current_columns if c not in original_columns]
+    ok = flagged_column not in current_columns and len(new_columns) == 2
+    if ok:
+        return True, ""
+    return False, (
+        f"Expected exactly 2 replacement columns after composite-field split, "
+        f"found {len(new_columns)}."
+    )
+
+
+def _clean_issue_group(
+    cloned_path: Path, target_issues: list, llm, pattern_lookup: "dict | None" = None
+) -> tuple:
     """Shared generate -> approve -> execute -> immediate re-check -> retry cycle for
     ONE group of issues against one already-cloned file, capped at MAX_CLEAN_ATTEMPTS
     for this group specifically. Used for both:
@@ -1993,6 +2158,18 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
     target_issues are still present in a fresh check_rubric() run — never the full
     rubric — exactly matching "re-check ONLY this specific issue" for the single-issue
     case, and "re-check the batch" for the warn-level case.
+
+    pattern_lookup: dict mapping a composite-field issue string to its verified
+    pattern record (see explore_and_verify / _verify_hypothesis). Only consulted
+    when target_issues is a single composite-field issue (always the case in
+    practice — composite-field issues are fail-level, so clean_dataset() always
+    processes them one at a time, never batched). When present, routes code
+    generation to _generate_composite_split_code (the one narrow, explicitly-
+    scoped exception permitted to add/drop columns) instead of the general-
+    purpose _generate_cleaning_code, and adds an extra post-fix column-shape
+    check that check_rubric()'s generic re-check cannot provide for this issue
+    type (see _composite_split_shape_ok). Every other issue category is
+    completely unaffected by this parameter.
 
     Returns (status, attempts, error, remaining_issues, last_code):
     - status: "resolved" | "skipped_declined" | "skipped_failed" | "skipped_incomplete"
@@ -2017,9 +2194,42 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
     )
     row_count_before_group = _count_csv_rows(cloned_path) if needs_row_count_integrity else None
 
+    # Composite-field split detection + baseline (see _composite_split_shape_ok):
+    # only ever true for a singleton fail-level issue (composite-field issues are
+    # never batched — see this function's own docstring above).
+    is_composite_field_fix = (
+        len(target_issues) == 1 and target_issues[0].startswith(_COMPOSITE_FIELD_PREFIX)
+    )
+    composite_original_columns = None
+    composite_flagged_column = None
+    if is_composite_field_fix:
+        try:
+            composite_original_columns = list(_read_csv_robust(cloned_path).columns)
+        except Exception:
+            composite_original_columns = None
+        column_match = _ISSUE_COLUMN_RE.search(target_issues[0])
+        composite_flagged_column = column_match.group(1) if column_match else None
+
     while attempt < MAX_CLEAN_ATTEMPTS:
         attempt += 1
-        code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
+
+        if is_composite_field_fix:
+            issue = target_issues[0]
+            verified_pattern = (pattern_lookup or {}).get(issue)
+            if verified_pattern is not None:
+                code = _generate_composite_split_code(
+                    cloned_path, issue, verified_pattern, llm, previous_code, previous_error
+                )
+            else:
+                print(
+                    f"[explore] No verified pattern found for composite-field issue "
+                    f"{issue!r} — falling back to the general-purpose cleaning generator.",
+                    file=sys.stderr,
+                )
+                code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
+        else:
+            code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
+
         approved = _request_approval(code, cloned_path)
         if not approved:
             return "skipped_declined", attempt, "", [], ""
@@ -2058,7 +2268,31 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
             if row_count_after_attempt is not None and row_count_after_attempt != row_count_before_group:
                 row_count_changed = True
 
-        if not still_present and not row_count_changed:
+        # Composite-field shape check: check_rubric()'s re-check above can NEVER
+        # re-detect a "Composite field (discovered): ..." string (see
+        # _composite_split_shape_ok's docstring) — still_present is trivially
+        # always [] for this issue type, so this is the check doing the REAL
+        # verification work, not a redundant extra. Only evaluated once the
+        # generic checks above would otherwise already call this "resolved".
+        composite_shape_ok = True
+        composite_shape_reason = ""
+        if (
+            not still_present
+            and not row_count_changed
+            and is_composite_field_fix
+            and composite_original_columns is not None
+            and composite_flagged_column is not None
+        ):
+            try:
+                current_columns = list(_read_csv_robust(cloned_path).columns)
+            except Exception:
+                current_columns = None
+            if current_columns is not None:
+                composite_shape_ok, composite_shape_reason = _composite_split_shape_ok(
+                    composite_original_columns, current_columns, composite_flagged_column
+                )
+
+        if not still_present and not row_count_changed and composite_shape_ok:
             return "resolved", attempt, "", [], last_executed_code
 
         if row_count_changed:
@@ -2073,6 +2307,10 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
                 "NOT actually resolved. Re-generate a fix that corrects the field/row "
                 "boundaries without adding, splitting, or dropping any row."
             )
+        elif not composite_shape_ok:
+            remaining_issues = list(target_issues)
+            previous_code = code
+            previous_error = composite_shape_reason
         else:
             remaining_issues = still_present
             previous_code = code
@@ -2216,7 +2454,7 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
             exploration_df = _read_csv_robust(file_path)
         except Exception:
             exploration_df = None
-        discovered_issues = explore_and_verify(
+        discovered_issues, pattern_lookup = explore_and_verify(
             exploration_df, llm=resolved_llm,
             flagged_columns=_columns_with_fail_issues(static_issues),
         )
@@ -2239,7 +2477,9 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
         # cycle, one at a time, in the order check_rubric() found them — never batched
         # together with the others.
         for issue in fail_issues:
-            status, attempts, error, _remaining, code = _clean_issue_group(cloned_path, [issue], resolved_llm)
+            status, attempts, error, _remaining, code = _clean_issue_group(
+                cloned_path, [issue], resolved_llm, pattern_lookup=pattern_lookup
+            )
             total_attempts += attempts
             fail_issue_records.append(
                 IssueCleaningRecord(issue=issue, status=status, attempts=attempts, error=error, generated_code=code)
