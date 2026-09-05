@@ -12,6 +12,7 @@ Run:
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 from agents.sql_analyst import add_context, clean_and_reload
 from models.schema import SQLAnalystState
@@ -104,9 +105,13 @@ try:
     assert state.wants_visualization is True, "wants_visualization must survive through add_context"
     print("PASS: add_context correctly sets needs_cleaning for a visualize request.\n")
 
-    # clean_and_reload fires (FakeDedupLLM + piped 'yes yes' via stdin)
+    # clean_and_reload fires (FakeDedupLLM + piped 'yes yes' via stdin). Piped stdin
+    # isn't a tty, so tell clean_and_reload's non-interactive fail-closed gate
+    # (architecture review point #24) that stdin is interactive for this call —
+    # this test deliberately simulates an approving user via scripted answers.
     print("Running clean_and_reload...")
-    reload_result = clean_and_reload(state, _llm=FakeDedupLLM())
+    with patch("sys.stdin.isatty", return_value=True):
+        reload_result = clean_and_reload(state, _llm=FakeDedupLLM())
     state = state.model_copy(update=reload_result)
 
     print(f"cleaning_attempted_tables: {state.cleaning_attempted_tables}")

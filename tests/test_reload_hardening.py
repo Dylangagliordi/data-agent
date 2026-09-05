@@ -30,6 +30,7 @@ import csv
 import io
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 from utils.load_data import (
     check_source_freshness,
@@ -347,12 +348,16 @@ def run_checksum_integration_logging():
             cleaning_attempted_tables=[],
         )
 
-        # First run establishes a checksum baseline — no mismatch expected.
+        # First run establishes a checksum baseline — no mismatch expected. Piping
+        # scripted 'yes' answers to a non-tty stdin simulates an interactive
+        # approving user, so tell clean_and_reload's non-interactive fail-closed
+        # gate (architecture review point #24) that stdin is interactive here.
         old_stderr = sys.stderr
         buf1 = io.StringIO()
         sys.stderr = buf1
         try:
-            reload_result_1 = clean_and_reload(state, _llm=FakeDedupLLM())
+            with patch("sys.stdin.isatty", return_value=True):
+                reload_result_1 = clean_and_reload(state, _llm=FakeDedupLLM())
         finally:
             sys.stderr = old_stderr
         first_log = buf1.getvalue()
@@ -372,12 +377,13 @@ def run_checksum_integration_logging():
         buf2 = io.StringIO()
         sys.stderr = buf2
         try:
-            clean_and_reload(state2, _llm=FakeDedupLLM())
+            with patch("sys.stdin.isatty", return_value=True):
+                clean_and_reload(state2, _llm=FakeDedupLLM())
         finally:
             sys.stderr = old_stderr
         second_log = buf2.getvalue()
         print(f"Second run stderr: {second_log!r}")
-        assert "[checksum]" in second_log and "changed since it was last processed" in second_log, (
+        assert "[checksum]" in second_log and "forcing fresh clean" in second_log, (
             f"expected a checksum-mismatch log line on the second run, got: {second_log!r}"
         )
         print("PASS: modified source file correctly detected and logged before the fresh clean ran.")

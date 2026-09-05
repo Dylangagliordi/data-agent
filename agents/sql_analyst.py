@@ -136,9 +136,6 @@ def _detect_fanout_warnings(conn, tables: dict, warn_only_for: "set | None" = No
          relationship relative to whatever it references, which is exactly the risk
          generate_sql's prompt warns about (payments per order, reviews per product, etc.).
     """
-    if warn_only_for is not None:
-        tables = {t: cols for t, cols in tables.items() if t in warn_only_for}
-
     uniqueness_cache: dict = {}
 
     def total_and_distinct(table: str, column: str):
@@ -168,8 +165,12 @@ def _detect_fanout_warnings(conn, tables: dict, warn_only_for: "set | None" = No
                 own_pk_columns[table].add(column)
                 pk_names.add(column)
 
+    warn_tables = tables if warn_only_for is None else {
+        t: cols for t, cols in tables.items() if t in warn_only_for
+    }
+
     warnings = []
-    for table, columns in tables.items():
+    for table, columns in warn_tables.items():
         for column, _dtype in columns:
             is_own_pk = column in own_pk_columns[table]
             looks_like_fk = (not is_own_pk) and (
@@ -393,6 +394,24 @@ def add_context(state: SQLAnalystState) -> dict:
                 )
                 continue
             status, issues_found, source_folder = entry
+            eligible_for_reclean = source_folder is not None and table_name not in already_attempted
+
+            # Checksum freshness gate (architecture review point #22): a "pass"/"warn"
+            # status row is otherwise treated as permanently authoritative — nothing
+            # ever re-verifies it against the live source file. If the raw source has
+            # genuinely changed since this table was last processed, that stale status
+            # must not just be silently reused: force this table through clean_and_reload
+            # exactly like a "fail" table would be, regardless of its recorded status.
+            source_changed = False
+            if status != "fail" and eligible_for_reclean:
+                from utils.load_data import check_source_freshness, sanitize_identifier
+
+                target_csv = _find_source_csv(Path(source_folder), table_name, sanitize_identifier)
+                if target_csv is not None:
+                    source_changed, _current_checksum = check_source_freshness(
+                        conn, table_name, target_csv
+                    )
+
             if status == "fail":
                 summary = _summarize_fail_issues(issues_found)
                 data_quality_warnings.append(
@@ -406,9 +425,20 @@ def add_context(state: SQLAnalystState) -> dict:
                 )
                 # Eligible for auto-clean if source_folder is known and this table
                 # hasn't already been attempted this question (stop-once rule).
-                if source_folder is not None and table_name not in already_attempted:
+                if eligible_for_reclean:
                     tables_to_clean.append({"table": table_name, "source_folder": source_folder})
-            # status == "warn" or "pass": nothing injected into generate_sql's context.
+            elif source_changed:
+                data_quality_warnings.append(
+                    {
+                        "table": table_name,
+                        "warning": (
+                            f"WARNING: {table_name}'s source file has changed since it was "
+                            f"last processed — source changed, forcing fresh clean."
+                        ),
+                    }
+                )
+                tables_to_clean.append({"table": table_name, "source_folder": source_folder})
+            # status == "warn" or "pass" with an unchanged source: nothing injected.
 
         sections = []
         with conn.cursor() as cur:
@@ -1231,20 +1261,105 @@ Do not evaluate correctness, style, or performance — only read-only safety. Gi
 reason in comments."""
 
 
-def is_safe(state: SQLAnalystState) -> dict:
-    """Node 4 (medium tier, JudgeSchema via with_structured_output).
+# Top-level statement types that represent a genuinely read-only query. exp.SetOperation
+# covers UNION/INTERSECT/EXCEPT; exp.Subquery covers a query wrapped in extra parens
+# (e.g. "(SELECT 1)"). A WITH ... SELECT CTE parses as exp.Select directly (the CTE
+# definitions live under its own "with" arg), so no separate exp.With case is needed.
+_READONLY_STATEMENT_TYPES = (exp.Select, exp.SetOperation, exp.Subquery)
 
-    Receives ONLY the generated SQL text — never the original or curated question.
+# Any of these appearing ANYWHERE in an otherwise-read-shaped statement (e.g. nested in
+# a CTE body, or smuggled into a subquery) is rejected outright — defense in depth on
+# top of the top-level-statement-type check above.
+_WRITE_NODE_TYPES = (
+    exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Alter,
+    exp.TruncateTable, exp.Create, exp.Merge,
+)
+
+
+def _ast_safety_check(sql_query: str) -> tuple[bool, str]:
+    """Deterministic, authoritative SQL safety gate (architecture review point #23).
+
+    Replaces keyword/LLM-judgment-style safety review, which is foolable by comment
+    tricks, unusual casing/encoding, or a semicolon-chained second statement (psycopg2
+    happily executes multiple ';'-separated statements in one call — see execute_sql).
+    sqlglot.parse_one() alone does NOT reject multi-statement input: it silently wraps
+    everything into one exp.Block node (confirmed: "SELECT 1; DROP TABLE foo;" parses
+    without error). This uses sqlglot.parse() instead, which returns one AST per
+    semicolon-separated statement, so multi-statement input is caught structurally.
+
+    Enforces:
+      1. The query must parse as valid SQL at all.
+      2. Exactly one statement (ignoring only genuinely empty ones from stray trailing
+         semicolons, e.g. "SELECT 1;;").
+      3. That one statement must be a SELECT / WITH-...-SELECT CTE / set operation
+         (UNION/INTERSECT/EXCEPT) / parenthesized subquery — see
+         _READONLY_STATEMENT_TYPES.
+      4. No "SELECT ... INTO <table>" (Postgres' shorthand for creating a new table
+         from a query result — a write disguised as a SELECT).
+      5. No write/DDL node anywhere in the tree (defense in depth for a write smuggled
+         inside a CTE body or subquery under an outer SELECT).
+
+    Returns (is_safe, reason). reason is "" when is_safe is True.
     """
+    text = (sql_query or "").strip()
+    if not text:
+        return False, "Query is empty."
+
+    try:
+        statements = [s for s in sqlglot.parse(text, read="postgres") if s is not None]
+    except Exception as e:
+        return False, f"Query could not be parsed as valid SQL: {e}"
+
+    if len(statements) != 1:
+        return False, (
+            f"Exactly one SQL statement is allowed; found {len(statements)} "
+            "(a semicolon-separated multi-statement query is rejected outright)."
+        )
+
+    stmt = statements[0]
+    if not isinstance(stmt, _READONLY_STATEMENT_TYPES):
+        return False, (
+            f"Only read-only SELECT queries are allowed; found a "
+            f"{type(stmt).__name__} statement."
+        )
+
+    if isinstance(stmt, exp.Select) and stmt.args.get("into") is not None:
+        return False, "SELECT ... INTO is not allowed — it creates a table."
+
+    for node in stmt.walk():
+        if isinstance(node, _WRITE_NODE_TYPES):
+            return False, f"Query contains a disallowed {type(node).__name__} operation."
+
+    return True, ""
+
+
+def is_safe(state: SQLAnalystState) -> dict:
+    """Node 4: deterministic AST safety gate (authoritative), then a cheap-tier LLM
+    call (secondary, non-authoritative sanity check whose comments are surfaced for
+    transparency but never override an AST-cleared query back to unsafe).
+
+    The AST check (_ast_safety_check) is the real security boundary here — see its
+    docstring for why the LLM alone was foolable (comment tricks, encoding, a
+    semicolon-chained second statement). Receives ONLY the generated SQL text —
+    never the original or curated question.
+    """
+    sql_query = state.generated_sql_query
+    ast_is_safe, ast_reason = _ast_safety_check(sql_query)
+    if not ast_is_safe:
+        return {
+            "is_safe": "no",
+            "comments": f"Rejected by deterministic SQL safety check: {ast_reason}",
+        }
+
     llm = pick_llm("cheap").with_structured_output(JudgeSchema)
     judgement: JudgeSchema = llm.invoke(
         [
             ("system", IS_SAFE_SYSTEM_PROMPT),
-            ("human", state.generated_sql_query),
+            ("human", sql_query),
         ]
     )
 
-    return {"is_safe": judgement.answer, "comments": judgement.comments}
+    return {"is_safe": "yes", "comments": judgement.comments}
 
 
 def route_after_safety_check(state: SQLAnalystState) -> str:
@@ -2019,7 +2134,27 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
     redundant reload work for tables that were never flagged as needing it in the
     first place. Do not assume every file clean_dataset() touches gets a fresh table
     in the database — only the tables in state.tables_to_clean do.
+
+    FAILS CLOSED in a non-interactive context (architecture review point #24): this
+    node is reachable automatically from a plain, read-only question via
+    add_context's auto-clean redirect — not something the user explicitly asked to
+    trigger. clean_dataset() below can reach _request_approval's real input() call
+    for any file with real issues, anywhere in the target folder. If this graph is
+    ever invoked from a context with no attached interactive terminal (a Telegram
+    gateway, a future API), that input() call would either block forever on a stdin
+    that will never receive anything, or crash with EOFError. So BEFORE doing
+    anything else — before even opening a DB connection — this checks
+    sys.stdin.isatty() and, if false, returns a clear final_answer explaining that
+    this table needs cleaning approval that can't be obtained in this context,
+    without ever calling clean_dataset()/input(). Auto-clean-triggered approval
+    requires an interactive session; a fully autonomous/headless cleaning-approval
+    flow is out of scope for now and would need to be designed separately. Manual
+    CLI cleaning (clean_data.py, utils/load_data.py) and this project's test suite
+    are unaffected — they call clean_dataset()/_request_approval directly, not
+    through this node, and deliberately pipe answers to a non-tty stdin that
+    input() reads from successfully.
     """
+    import sys as _sys
     from pathlib import Path
 
     from utils.data_cleaning import clean_dataset, unresolved_issues_for_record
@@ -2035,6 +2170,19 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
         sanitize_identifier,
         write_data_quality_status,
     )
+
+    if not _sys.stdin.isatty():
+        table_names_all = [item["table"] for item in state.tables_to_clean]
+        return {
+            "final_answer": (
+                f"I can't answer this because table(s) {', '.join(table_names_all)} "
+                f"need data-cleaning approval before they can be reloaded, and this "
+                f"session has no interactive terminal to ask for that approval. "
+                f"Auto-clean-triggered cleaning requires an interactive session — "
+                f"please run this from one so the cleaning steps can be reviewed "
+                f"and approved."
+            ),
+        }
 
     newly_attempted = list(state.cleaning_attempted_tables)
 
@@ -2068,11 +2216,9 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
                     continue
                 changed, _current_checksum = check_source_freshness(conn, table_name, target_csv)
                 if changed:
-                    import sys as _sys
                     print(
-                        f"[checksum] source file for '{table_name}' ({target_csv}) has "
-                        f"changed since it was last processed — running a genuinely "
-                        f"fresh clean, not reusing a stale prior result.",
+                        f"[checksum] source changed, forcing fresh clean for "
+                        f"'{table_name}' ({target_csv}).",
                         file=_sys.stderr,
                     )
 
@@ -2122,13 +2268,29 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
     return {"cleaning_attempted_tables": newly_attempted}
 
 
+def route_after_clean_and_reload(state: SQLAnalystState) -> str:
+    """Conditional edge after clean_and_reload.
+
+    Normally loops back to add_context to refresh schema/status context (the usual
+    case). But if clean_and_reload had to fail closed — e.g. the non-interactive
+    approval gate (architecture review point #24) — it sets final_answer directly and
+    this routes straight to END instead of looping back, since there is nothing left
+    for add_context/generate_sql to usefully do with a question that can't proceed.
+    """
+    if state.final_answer:
+        return "end"
+    return "add_context"
+
+
 def build_sql_analyst_graph():
     """Wire all nodes into a StateGraph using SQLAnalystState, and compile it.
 
     Graph shape (normal ask: path, wants_visualization=False):
         START -> curate_question -> add_context
         add_context --(route_after_add_context)--> generate_sql | clean_and_reload
-        clean_and_reload -> add_context  (loop; stop condition via cleaning_attempted_tables)
+        clean_and_reload --(route_after_clean_and_reload)--> add_context (loop; stop
+            condition via cleaning_attempted_tables) | END (fail-closed: no interactive
+            stdin available to grant cleaning approval, see ApprovalUnavailableError)
         generate_sql -> is_safe
         is_safe --(route_after_safety_check)--> execute_sql | cancel_sql
         execute_sql --(route_after_execute_sql)--> generate_sql (retry) | represent_final_answer
@@ -2165,7 +2327,11 @@ def build_sql_analyst_graph():
             "needs_cleaning": "clean_and_reload",
         },
     )
-    graph.add_edge("clean_and_reload", "add_context")
+    graph.add_conditional_edges(
+        "clean_and_reload",
+        route_after_clean_and_reload,
+        {"add_context": "add_context", "end": END},
+    )
     graph.add_edge("determine_chart_type", "generate_sql")
     graph.add_edge("generate_sql", "is_safe")
 

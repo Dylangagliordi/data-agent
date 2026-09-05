@@ -231,6 +231,148 @@ try:
     print("PASS: live-check fallback correctly surfaces fan-out warning.")
     print("  Warning:", warning_lines[0], "\n")
 
+    # ── Scenario 6: partial-coverage bug (architecture review point #21) ───────
+    # An OLD table is already covered by _fanout_status. A NEW, uncovered table has
+    # a genuine FK relationship to that old table's PK, with no declared FK
+    # constraint (cardinality-heuristic-only). End-to-end: confirms the fan-out
+    # warning correctly fires for the new table with the fix in place (see
+    # Scenario 7 below for a direct, DB-free proof of the actual structural defect
+    # this fixes — own_pk_columns/pk_names being gathered across ALL tables, not
+    # just the uncovered subset, before deciding which tables get a warning).
+    print("=" * 70)
+    print("SCENARIO 6: partial coverage — new uncovered table FK's to an old covered table")
+    print("=" * 70)
+    t_old_customers = "tf_old_customers"
+    t_new_orders = "tf_new_orders"
+    created.extend([t_old_customers, t_new_orders])
+    with conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{t_new_orders}" CASCADE;')
+        cur.execute(f'DROP TABLE IF EXISTS "{t_old_customers}" CASCADE;')
+        # No declared PK/FK constraints anywhere — purely heuristic-driven, exactly
+        # the case the live fallback (_detect_fanout_warnings) has to get right.
+        cur.execute(f'CREATE TABLE "{t_old_customers}" (customer_id TEXT, name TEXT);')
+        cur.executemany(
+            f'INSERT INTO "{t_old_customers}" VALUES (%s, %s)',
+            [("c1", "Alice"), ("c2", "Bob")],
+        )
+    conn.commit()
+
+    # Old table gets its _fanout_status computed and written NOW — it is "already
+    # covered" by the time the new table shows up, matching the real scenario
+    # where a table was loaded (and its fan-out metadata computed) in the past.
+    compute_and_write_fanout_status(conn, t_old_customers)
+    old_rows = fetch_fanout_rows(conn, t_old_customers)
+    assert old_rows and old_rows[0][0] == "customer_id", (
+        f"expected customer_id to be recorded as the old table's PK, got {old_rows}"
+    )
+    print(f"PASS: {t_old_customers} is already covered by _fanout_status: {old_rows}\n")
+
+    # NOW create the new, uncovered table with a genuine (undeclared) FK
+    # relationship to tf_old_customers.customer_id — multiple orders per customer.
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{t_new_orders}" (order_id TEXT, customer_id TEXT);')
+        cur.executemany(
+            f'INSERT INTO "{t_new_orders}" VALUES (%s, %s)',
+            [("o1", "c1"), ("o2", "c1"), ("o3", "c2")],
+        )
+    conn.commit()
+    # Deliberately do NOT call compute_and_write_fanout_status for the new table —
+    # it must be caught by the live fallback in add_context, exactly like a
+    # freshly-loaded table would be before its own metadata is ever computed.
+
+    state = SQLAnalystState(
+        user_question=f"How many orders per customer in {t_new_orders}?",
+        curated_question=f"How many orders per customer in {t_new_orders}?",
+    )
+    ctx = add_context(state)
+    ctx_text = ctx["prompt_query_context"]
+    warning_lines = [
+        ln for ln in ctx_text.splitlines()
+        if ln.startswith("WARNING") and t_new_orders in ln and "fan-out" in ln
+    ]
+    assert warning_lines, (
+        f"expected a fan-out warning for {t_new_orders}.customer_id (FK to the "
+        f"already-covered {t_old_customers}). Context was:\n{ctx_text}"
+    )
+    print("PASS: fan-out warning correctly fires for the new table's FK to the old, "
+          "already-covered table.")
+    print("  Warning:", warning_lines[0], "\n")
+
+    # ── Scenario 7: direct, DB-free proof of the partial-coverage structural fix ──
+    # Scenario 6 exercises the end-to-end path, but with an "_id"-suffixed column
+    # name, _is_id_like_column() alone already recognizes the new table's column as
+    # a FK candidate regardless of cross-table PK info — so it doesn't, by itself,
+    # prove metadata is actually gathered from the covered table too. This uses a
+    # fake connection that just logs every query _detect_fanout_warnings issues, to
+    # directly confirm: metadata gathering (own_pk_columns/pk_names) now queries
+    # the COVERED table's own column too, before deciding (separately) which
+    # tables get a live warning. Before the fix, `tables` was filtered down to only
+    # the uncovered subset BEFORE this metadata-gathering pass ran at all, so the
+    # covered table would never be queried here — this is the actual, literal
+    # defect architecture review point #21 describes.
+    print("=" * 70)
+    print("SCENARIO 7: metadata gathering itself must query ALL tables, not just uncovered")
+    print("=" * 70)
+    from agents.sql_analyst import _detect_fanout_warnings
+
+    class _FakeCursor:
+        def __init__(self, log, data):
+            self._log = log
+            self._data = data
+            self._result = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            self._log.append(sql)
+            for (table, col), val in self._data.items():
+                if f'"{table}"' in sql and f'"{col}"' in sql:
+                    self._result = val
+                    return
+            raise AssertionError(f"unexpected query with no matching fixture data: {sql}")
+
+        def fetchone(self):
+            return self._result
+
+    class _FakeConn:
+        def __init__(self, data):
+            self.log = []
+            self._data = data
+
+        def cursor(self):
+            return _FakeCursor(self.log, self._data)
+
+    fake_tables = {
+        "fake_old_customers": [("customer_id", "text"), ("name", "text")],
+        "fake_new_orders": [("order_id", "text"), ("customer_id", "text")],
+    }
+    fake_data = {
+        ("fake_old_customers", "customer_id"): (2, 2),   # unique -> old table's own PK
+        ("fake_new_orders", "order_id"): (3, 3),          # unique -> new table's own PK
+        ("fake_new_orders", "customer_id"): (3, 2),       # non-unique -> genuine fan-out
+    }
+    fake_conn = _FakeConn(fake_data)
+    fake_warnings = _detect_fanout_warnings(
+        fake_conn, fake_tables, warn_only_for={"fake_new_orders"}
+    )
+
+    queried_old_table = any('"fake_old_customers"' in sql for sql in fake_conn.log)
+    assert queried_old_table, (
+        f"expected metadata gathering to query the covered table 'fake_old_customers' "
+        f"too (not just the uncovered subset) — queries issued were: {fake_conn.log}"
+    )
+    print("PASS: metadata gathering queried the covered table's own column too — "
+          "own_pk_columns/pk_names are no longer scoped to the uncovered subset alone.")
+
+    assert any("fake_new_orders" in w and "customer_id" in w for w in fake_warnings), (
+        f"expected a fan-out warning for fake_new_orders.customer_id, got: {fake_warnings}"
+    )
+    print("PASS: warning generation is still correctly restricted to the uncovered table only.\n")
+
     print("=" * 70)
     print("ALL FANOUT-STATUS ASSERTIONS PASSED")
     print("=" * 70)

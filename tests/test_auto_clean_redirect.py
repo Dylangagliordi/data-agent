@@ -45,6 +45,7 @@ Run scenarios 1 and 2 separately with the appropriate piped stdin:
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 from agents.sql_analyst import add_context, clean_and_reload
 from models.schema import SQLAnalystState
@@ -270,7 +271,12 @@ def run_approve_scenario():
 
         # --- clean_and_reload (FakeDedupLLM + piped 'yes yes' via stdin) ---
         print(f"\nRunning clean_and_reload (approve the prompts with 'yes')...")
-        reload_result = clean_and_reload(state, _llm=FakeDedupLLM())
+        # This test pipes scripted 'yes' answers to a non-tty stdin to simulate an
+        # interactive approving user — clean_and_reload's non-interactive fail-closed
+        # gate (architecture review point #24) would otherwise short-circuit before
+        # ever reading them, so tell it stdin is interactive for this call.
+        with patch("sys.stdin.isatty", return_value=True):
+            reload_result = clean_and_reload(state, _llm=FakeDedupLLM())
         state = state.model_copy(update=reload_result)
 
         print(f"cleaning_attempted_tables after: {state.cleaning_attempted_tables}")
@@ -344,7 +350,8 @@ def run_decline_scenario():
 
         # --- clean_and_reload (AnyCodeLLM + piped 'no' via stdin to decline) ---
         print(f"\nRunning clean_and_reload (decline the prompt by typing 'no')...")
-        reload_result = clean_and_reload(state, _llm=AnyCodeLLM())
+        with patch("sys.stdin.isatty", return_value=True):
+            reload_result = clean_and_reload(state, _llm=AnyCodeLLM())
         state = state.model_copy(update=reload_result)
 
         print(f"cleaning_attempted_tables after: {state.cleaning_attempted_tables}")
@@ -391,6 +398,78 @@ def run_decline_scenario():
 
 
 # ---------------------------------------------------------------------------
+# Scenario 6: non-interactive context fails closed (architecture review point #24)
+# ---------------------------------------------------------------------------
+
+def run_noninteractive_scenario():
+    print("=" * 70)
+    print("SCENARIO 6: no interactive stdin attached -> clean_and_reload fails closed")
+    print("(no stdin needed — sys.stdin.isatty() is forced to False)")
+    print("=" * 70)
+    from agents.sql_analyst import route_after_clean_and_reload
+
+    conn = get_admin_connection()
+    try:
+        ensure_data_quality_status_table(conn)
+        _setup_fail_table_with_source(conn, source_folder=FAIL_FIXTURE_FOLDER)
+
+        state = SQLAnalystState(
+            user_question=f"How many rows are in {FAIL_TABLE}?",
+            curated_question=f"How many rows are in {FAIL_TABLE}?",
+            cleaning_attempted_tables=[],
+        )
+        ctx1 = add_context(state)
+        state = state.model_copy(update=ctx1)
+        assert state.data_quality_action == "needs_cleaning", (
+            f"expected 'needs_cleaning', got {state.data_quality_action!r}"
+        )
+        print("PASS: add_context sets needs_cleaning (redirect would normally fire).")
+
+        # Force a genuinely non-interactive stdin — no real terminal, no piped
+        # data — matching a headless caller (a Telegram gateway, a future API)
+        # that a plain, read-only question could reach through this redirect with
+        # no explicit cleaning request from the user.
+        with patch("sys.stdin.isatty", return_value=False):
+            reload_result = clean_and_reload(state, _llm=FakeDedupLLM())
+
+        print(f"clean_and_reload result keys: {sorted(reload_result.keys())}")
+        assert "final_answer" in reload_result and reload_result["final_answer"], (
+            f"expected a clear final_answer explaining the failure, got: {reload_result}"
+        )
+        final_answer = reload_result["final_answer"]
+        print(f"final_answer: {final_answer!r}")
+        assert FAIL_TABLE in final_answer, (
+            f"expected the affected table named in final_answer, got: {final_answer!r}"
+        )
+        assert "interactive" in final_answer.lower(), (
+            f"expected final_answer to explain the interactivity requirement, got: {final_answer!r}"
+        )
+        print("PASS: clean_and_reload failed closed with a clear final_answer — no input() attempted, no hang, no crash.")
+
+        # The graph must end here, not loop back to add_context, once final_answer
+        # is set this way.
+        state_after = state.model_copy(update=reload_result)
+        route = route_after_clean_and_reload(state_after)
+        assert route == "end", f"expected route_after_clean_and_reload to return 'end', got {route!r}"
+        print("PASS: route_after_clean_and_reload routes straight to END instead of looping back.")
+
+        # The table's DB status must be untouched — no cleaning was attempted at all.
+        row_after = _fetch_status(conn, FAIL_TABLE)
+        assert row_after[0] == "fail", (
+            f"expected status to remain untouched ('fail'), got {row_after[0]!r} — "
+            f"clean_and_reload must not have touched the DB in the fail-closed path"
+        )
+        print("PASS: table's DB status is untouched — nothing was attempted before failing closed.")
+
+        print("\n" + "=" * 70)
+        print("SCENARIO 6 PASSED")
+        print("=" * 70)
+    finally:
+        _cleanup(conn, FAIL_TABLE)
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -398,6 +477,7 @@ def usage():
     print(
         "Usage:\n"
         "  uv run python -m tests.test_auto_clean_redirect routing\n"
+        "  uv run python -m tests.test_auto_clean_redirect noninteractive\n"
         "  printf 'no\\n'       | uv run python -m tests.test_auto_clean_redirect decline\n"
         "  printf 'yes\\nyes\\n' | uv run python -m tests.test_auto_clean_redirect approve\n"
     )
@@ -412,6 +492,8 @@ if __name__ == "__main__":
         run_approve_scenario()
     elif mode == "decline":
         run_decline_scenario()
+    elif mode == "noninteractive":
+        run_noninteractive_scenario()
     else:
         usage()
         sys.exit(1)

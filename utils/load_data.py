@@ -618,9 +618,8 @@ def main() -> None:
             changed, _current_checksum = check_source_freshness(conn, table_name, csv_path)
             if changed:
                 print(
-                    f"[checksum] source file for '{table_name}' ({csv_path}) has "
-                    f"changed since it was last processed — running a genuinely "
-                    f"fresh clean, not reusing a stale prior result.",
+                    f"[checksum] source changed, forcing fresh clean for "
+                    f"'{table_name}' ({csv_path}).",
                     file=sys.stderr,
                 )
 
