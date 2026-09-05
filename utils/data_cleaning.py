@@ -975,6 +975,24 @@ MAX_CLEAN_ATTEMPTS = 3
 # success message.
 ROW_LOSS_FLAG_THRESHOLD = 0.20
 
+# Issues in this set are purely about REPARSING/reshaping existing rows correctly
+# (fixing which bytes belong to which field/row) — a genuinely correct fix for one of
+# these can never change how many logical data rows the file has. This is distinct
+# from issues like "Duplicate rows:" or "Dangling references:" where removing rows IS
+# the correct, expected outcome. Without this distinction, a fix that accidentally
+# splits one row into several (e.g. by mishandling an embedded newline while chasing
+# down an unmatched quote) can pass _clean_issue_group's own textual re-check — which
+# only asks "is the originally-flagged condition still detectable?" — while silently
+# corrupting the file's row structure. See the incident this was added for: a
+# "Column misalignment" fix on data/data-science-jobs/Uncleaned_DS_jobs.csv was
+# accepted as "resolved" three times in a row while actually growing 672 rows into
+# 778 malformed ones (job-description text split across bogus extra rows), which then
+# failed at load time with a Postgres type error instead of being caught here.
+ROW_COUNT_INTEGRITY_PREFIXES = (
+    "Column misalignment:",
+    "Structural issue:",
+)
+
 
 @dataclass
 class IssueCleaningRecord:
@@ -1496,6 +1514,14 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
     attempt = 0
     last_executed_code = ""
 
+    # Row-count-integrity baseline: only meaningful (and only checked) when at least
+    # one of this group's target_issues is a reparsing/reshaping issue for which a
+    # correct fix can never change the row count — see ROW_COUNT_INTEGRITY_PREFIXES.
+    needs_row_count_integrity = any(
+        issue.startswith(ROW_COUNT_INTEGRITY_PREFIXES) for issue in target_issues
+    )
+    row_count_before_group = _count_csv_rows(cloned_path) if needs_row_count_integrity else None
+
     while attempt < MAX_CLEAN_ATTEMPTS:
         attempt += 1
         code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
@@ -1520,19 +1546,49 @@ def _clean_issue_group(cloned_path: Path, target_issues: list, llm) -> tuple:
         post_issues = check_rubric(cloned_path)
         still_present = [issue for issue in remaining_issues if issue in post_issues]
 
-        if not still_present:
+        # Row-count-integrity check: check_rubric() only re-tests the textual
+        # condition it originally flagged (e.g. "is there still an unmatched quote
+        # character") — it has no idea whether the fix also silently reshaped the
+        # file's row structure. A misalignment/structural fix that mishandles an
+        # embedded newline can make the flagged condition disappear (so still_present
+        # comes back empty) while actually splitting or merging real rows. Treat that
+        # as NOT resolved — a corrupted-but-textually-clean result is worse than an
+        # honestly-still-flagged one, since it can silently pass through to the
+        # database load step and fail there with a much less diagnosable error (see
+        # ROW_COUNT_INTEGRITY_PREFIXES' docstring for the real incident this covers).
+        row_count_changed = False
+        row_count_after_attempt = None
+        if not still_present and needs_row_count_integrity and row_count_before_group is not None:
+            row_count_after_attempt = _count_csv_rows(cloned_path)
+            if row_count_after_attempt is not None and row_count_after_attempt != row_count_before_group:
+                row_count_changed = True
+
+        if not still_present and not row_count_changed:
             return "resolved", attempt, "", [], last_executed_code
 
-        remaining_issues = still_present
-        previous_code = code
-        previous_error = (
-            "The script executed without raising an exception, but re-running the "
-            "data-quality check against the real cleaned output found these "
-            "originally-listed issue(s) are STILL PRESENT (not fixed):\n"
-            + "\n".join(f"- {i}" for i in still_present)
-        )
+        if row_count_changed:
+            remaining_issues = list(target_issues)
+            previous_code = code
+            previous_error = (
+                "The script executed without raising an exception, and the "
+                "originally-flagged issue text is no longer detected, but the file's "
+                f"row count changed from {row_count_before_group} to "
+                f"{row_count_after_attempt} — a correct fix for this issue must "
+                "preserve every existing row (only reshape/reparse them), so this is "
+                "NOT actually resolved. Re-generate a fix that corrects the field/row "
+                "boundaries without adding, splitting, or dropping any row."
+            )
+        else:
+            remaining_issues = still_present
+            previous_code = code
+            previous_error = (
+                "The script executed without raising an exception, but re-running the "
+                "data-quality check against the real cleaned output found these "
+                "originally-listed issue(s) are STILL PRESENT (not fixed):\n"
+                + "\n".join(f"- {i}" for i in still_present)
+            )
         if attempt >= MAX_CLEAN_ATTEMPTS:
-            return "skipped_incomplete", attempt, previous_error, still_present, last_executed_code
+            return "skipped_incomplete", attempt, previous_error, remaining_issues, last_executed_code
 
     # Unreachable in practice (the while loop always returns before falling off the
     # end, since MAX_CLEAN_ATTEMPTS >= 1), but keeps this function's return type
