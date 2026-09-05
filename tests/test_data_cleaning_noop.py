@@ -1,9 +1,12 @@
 """Standalone test: clean_dataset() against a genuinely clean file — confirms it does
-nothing (no cloning, no LLM call, no approval prompt) for that file.
+nothing (no cloning, no approval prompt) for that file.
 
-No stdin piping needed here: if this test hangs waiting on input(), that itself is a
-failure (it would mean the approval gate fired for a file that should never have
-reached it).
+clean_dataset() now also runs the exploratory discovery phase (explore_and_verify) on
+every file, including this one — but this fixture's columns have only 5 rows each,
+under _EXPLORE_MIN_COLUMN_ROWS, so explore_column skips them without ever calling the
+LLM (see utils/data_cleaning.py). No stdin piping needed here: if this test hangs
+waiting on input(), that itself is a failure (it would mean the approval gate fired
+for a file that should never have reached it).
 """
 
 from pathlib import Path

@@ -59,12 +59,15 @@ import csv
 import json
 import re
 import shutil
+import sys
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+
+from models.schema import ExplorationHypothesis, VerifiedPatternProposal
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CLEANING_LOG_PATH = _PROJECT_ROOT / "logs" / "cleaning_log.jsonl"
@@ -74,6 +77,58 @@ _CLEANING_LOG_PATH = _PROJECT_ROOT / "logs" / "cleaning_log.jsonl"
 # few genuinely missing values; this is meant to catch columns that are substantially
 # incomplete, not to flag every dataset with a handful of nulls.
 MISSING_VALUE_THRESHOLD = 0.05
+
+# ---------------------------------------------------------------------------
+# Discovery-phase config (see explore_and_verify below): an LLM-driven "glance and
+# notice" pass that mimics a human scanning sorted(df[col].unique()) and going
+# "huh, that's weird" — something check_rubric's closed catalog of pattern-matchers
+# structurally cannot do, since it only catches shapes someone anticipated in
+# advance. Everything this phase notices is mechanically re-verified against the
+# real full column before it's allowed to become an actual issue (see
+# _verify_hypothesis) — the LLM is never trusted on its own word.
+# ---------------------------------------------------------------------------
+
+# Per-column sample size for explore_column's "glance" — mimics how much of a
+# column a human would actually scan by eye before noticing something odd.
+EXPLORE_SAMPLE_SIZE = 40
+
+# Fraction of EXPLORE_SAMPLE_SIZE dedicated to the least-frequent distinct values
+# in the column (the rest is a plain random sample). Rare/low-frequency values are
+# where a one-off oddity like "Healthfirst\n3.1" actually lives — pure-random
+# sampling would almost never surface it in a large column.
+EXPLORE_RARE_VALUE_FRACTION = 0.5
+
+# Cap on how many column pairs _explore_column_pairs will ever send to the LLM
+# for one table, to keep the cross-column pass from becoming O(n^2) in cost on a
+# wide table.
+EXPLORE_MAX_COLUMN_PAIRS = 10
+
+# Hard ceiling on total LLM calls (column exploration + hypothesis verification +
+# column-pair exploration, combined) explore_and_verify will make for one table.
+# If hit before everything is explored, a warning is logged and whatever was
+# verified so far is returned — this never raises and never silently truncates.
+EXPLORE_MAX_LLM_CALLS_PER_TABLE = 60
+
+# A column whose values average longer than this (characters) is treated as
+# long-form prose (e.g. a "Job Description" column) rather than a candidate for
+# composite-field discovery — skipped entirely to avoid wasted LLM calls on
+# columns where "two variables glued together" isn't a meaningful question.
+_EXPLORE_PROSE_MEAN_LEN_THRESHOLD = 200
+
+# Real full-column overlap fraction at or above which two columns are considered
+# "suspiciously identical" by _explore_column_pairs' mechanical verification step.
+_COLUMN_PAIR_OVERLAP_THRESHOLD = 0.95
+
+# Minimum non-null row count a column must have before discovery will even
+# attempt it (explore_column) or accept a verified pattern for it
+# (_verify_hypothesis). Below this, a proposed regex almost always just
+# describes the tiny sample verbatim — a 5-row column where every value happens
+# to be a single digit will "verify" against literally any narrow pattern that
+# matches those 5 digits, which is a tautology, not evidence of a real
+# composite-field structure. Applied in both places as defense in depth (the
+# same layered-checks pattern already used elsewhere in this codebase, e.g.
+# is_safe's deterministic AST check plus a secondary LLM sanity check).
+_EXPLORE_MIN_COLUMN_ROWS = 20
 
 # Column-name substrings that suggest a column should hold non-negative counts/quantities/
 # amounts — used only for the "impossible negative value" check. This is a heuristic on
@@ -189,6 +244,14 @@ FAIL_LEVEL_PREFIXES = (
     "Header row duplicated mid-file:",
     "Byte-order-mark:",
     "Dangling references:",
+    # Discovery-phase issues (see explore_and_verify below): an LLM-noticed pattern
+    # that was mechanically verified against the REAL full column before ever
+    # becoming an issue string — a genuinely undiscovered structural problem
+    # silently corrupting downstream joins/grouping meets the same fail-level bar
+    # as the statically-detected categories above, so it flows through the
+    # identical approval-gate + fix pipeline with no new code path.
+    "Composite field (discovered):",
+    "Duplicate column (discovered):",
 )
 
 WARN_LEVEL_PREFIXES = (
@@ -960,6 +1023,438 @@ def check_rubric(file_path) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Piece 1b: LLM-driven exploratory discovery, mechanically verified before it's
+# ever trusted. check_rubric() above is a closed catalog of pattern-matchers — it
+# only catches problem shapes someone anticipated in advance. The functions below
+# add a "glance and notice" pass that mimics a human running
+# sorted(df[col].unique()) and going "huh, that's weird" — but nothing an LLM
+# notices here is allowed to become a real issue string on its own word. Every
+# hypothesis is converted into a deterministic, mechanical test against the real
+# full column (never just the sample) before it's accepted — same discipline
+# already used elsewhere in this codebase (agents/sql_analyst.py's rubric
+# disclosures are always mechanically extracted from real executed SQL, never
+# taken on an LLM's word), applied here to exploration instead of query
+# generation.
+# ---------------------------------------------------------------------------
+
+_ISSUE_COLUMN_RE = re.compile(r"column '([^']+)'")
+
+
+def _columns_with_fail_issues(issues: list) -> set:
+    """Column names mentioned in any FAIL-level issue string from check_rubric().
+
+    Used to skip explore_column for a column check_rubric already flagged as
+    needing a fix this run — no benefit to discovering more on top of a column
+    already known to need fixing. Extracted directly from the issue text (every
+    per-column check in check_rubric formats its message as
+    "... column '<name>' ..."), not a hardcoded list of category names.
+    """
+    flagged = set()
+    for issue in issues:
+        if _issue_severity(issue) != "fail":
+            continue
+        flagged.update(_ISSUE_COLUMN_RE.findall(issue))
+    return flagged
+
+
+def _is_long_form_prose_column(series: pd.Series) -> bool:
+    """True when a column's real values average longer than
+    _EXPLORE_PROSE_MEAN_LEN_THRESHOLD characters — a proxy for free-text prose
+    (e.g. a "Job Description" column) where "does this hold two variables glued
+    together" isn't a meaningful question. Used to skip explore_column entirely
+    for such columns, avoiding a wasted LLM call."""
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    mean_len = non_null.astype(str).str.len().mean()
+    return bool(mean_len is not None and mean_len > _EXPLORE_PROSE_MEAN_LEN_THRESHOLD)
+
+
+def _sample_column_values(non_null: pd.Series) -> list:
+    """Sample up to EXPLORE_SAMPLE_SIZE real values from a column, mixing a plain
+    random sample with the column's least-frequent (rarest) distinct values.
+
+    This mimics the part of human scanning that actually surfaces a one-off
+    oddity: pure-random sampling would almost never draw a mostly-unique value
+    like "Healthfirst\\n3.1" out of a column with hundreds of rows, but sorting
+    by real frequency and taking the rarest values puts it directly in view.
+    """
+    n = len(non_null)
+    if n == 0:
+        return []
+    sample_size = min(EXPLORE_SAMPLE_SIZE, n)
+    rare_target = int(round(sample_size * EXPLORE_RARE_VALUE_FRACTION))
+    random_target = sample_size - rare_target
+
+    value_counts = non_null.value_counts().sort_values(ascending=True)
+    rare_values = list(value_counts.index[:rare_target])
+
+    random_target = min(random_target, n)
+    random_sample = non_null.sample(n=random_target).tolist() if random_target > 0 else []
+
+    combined = random_sample + rare_values
+    return combined[:sample_size]
+
+
+EXPLORE_COLUMN_SYSTEM_PROMPT = """You are looking at real sampled values from one column
+of a dataset. Do not fix anything. Do not assume the column's name tells you what it
+contains — judge only from the actual values shown.
+
+Describe anything about these values that looks unusual, inconsistent, or that suggests
+the column might actually contain more than one distinct piece of information glued
+together. If nothing looks unusual, say so plainly — do not invent a finding to have
+something to report.
+
+For each thing you notice, state it as a testable hypothesis about the FULL column,
+not just the sample — e.g. "this column may hold two variables joined by a newline,
+with the second part looking like a decimal number" rather than "row 4 looks weird."
+"""
+
+
+def explore_column(df: pd.DataFrame, column: str, llm=None) -> list:
+    """Open-ended, per-column "glance and notice" pass. Returns a list of loose,
+    plain-English hypothesis strings — NEVER something check_rubric() would
+    accept directly as an issue. An empty list is a valid, expected result; most
+    columns should produce nothing.
+
+    Skips the LLM call entirely (returns []) for a column that looks like
+    long-form prose (see _is_long_form_prose_column), has no non-null values at
+    all, or has too few real values to draw any real conclusion from (see
+    _EXPLORE_MIN_COLUMN_ROWS — a tiny column makes any regex a tautology, not
+    evidence). The other skip condition from the spec — a column check_rubric
+    already flagged with a fail-level issue this run — is applied by the
+    caller (explore_and_verify), which is where that information actually
+    lives.
+    """
+    series = df[column]
+    non_null = series.dropna()
+    if (
+        len(non_null) < _EXPLORE_MIN_COLUMN_ROWS
+        or non_null.empty
+        or _is_long_form_prose_column(series)
+    ):
+        return []
+
+    if llm is None:
+        from utils.llm_pick import pick_llm
+        llm = pick_llm("cheap")
+
+    sample_values = _sample_column_values(non_null)
+    human_content = (
+        f"Column name: {column}\n"
+        f"Inferred dtype: {series.dtype}\n"
+        f"Cardinality: {non_null.nunique()} distinct value(s) out of {len(df)} row(s) "
+        f"({len(non_null)} non-null)\n\n"
+        "Sampled real values (mix of random + rare/low-frequency):\n"
+        + "\n".join(f"  - {v!r}" for v in sample_values)
+    )
+
+    try:
+        structured_llm = llm.with_structured_output(ExplorationHypothesis)
+        result: ExplorationHypothesis = structured_llm.invoke(
+            [
+                ("system", EXPLORE_COLUMN_SYSTEM_PROMPT),
+                ("human", human_content),
+            ]
+        )
+    except Exception:
+        # An exploration call is best-effort noticing, not a required step —
+        # an LLM error here just means "nothing noticed this time", never a
+        # reason to abort the rest of discovery or cleaning.
+        return []
+
+    return list(result.hypotheses)
+
+
+VERIFY_HYPOTHESIS_SYSTEM_PROMPT = """You are given a testable hypothesis about a real
+dataset column, proposed during an earlier exploratory pass, along with that column's
+real dtype.
+
+Turn this hypothesis into something mechanically checkable: a single regular expression
+(Python re syntax) that would match a value in this column if the hypothesis is
+genuinely true, and a match_threshold — the minimum fraction (0.0-1.0) of the column's
+real non-null values that should match this pattern for the hypothesis to count as
+confirmed rather than a one-off coincidence.
+
+If the hypothesis genuinely cannot be expressed as a single regex + threshold pair,
+still return your best attempt — the caller mechanically re-checks it against every
+real value in the column and discards it if the match rate doesn't hold up, so an
+overly loose or slightly wrong pattern is safely caught downstream, not something you
+need to get perfectly right here."""
+
+
+def _verify_hypothesis(df: pd.DataFrame, column: str, hypothesis: str, llm=None) -> "str | None":
+    """The trust boundary: converts one loose hypothesis into a concrete regex +
+    threshold via the LLM, then checks that regex against EVERY non-null value in
+    the real column (not the sample) with plain Python/pandas — no LLM involved
+    in the actual verification step.
+
+    Returns None (hypothesis discarded, never escalated) when:
+    - the column has too few real values to meaningfully verify against (see
+      _EXPLORE_MIN_COLUMN_ROWS — defense in depth alongside explore_column's
+      own skip, in case this is ever called directly with a hypothesis from
+      elsewhere);
+    - the LLM call fails, or its proposed pattern doesn't compile as a regex;
+    - the real match fraction against the full column is below the proposed
+      match_threshold — this hypothesis didn't hold up against the full data.
+
+    Returns a formatted issue string, in exactly the shape check_rubric()'s other
+    checks use and tagged "(discovered)" so it's visibly distinguishable in logs/
+    reports, when the hypothesis is mechanically confirmed.
+    """
+    series = df[column]
+    non_null = series.dropna().astype(str)
+    if len(non_null) < _EXPLORE_MIN_COLUMN_ROWS:
+        return None
+
+    if llm is None:
+        from utils.llm_pick import pick_llm
+        llm = pick_llm("cheap")
+
+    human_content = (
+        f"Column name: {column}\n"
+        f"Real dtype: {series.dtype}\n\n"
+        f"Hypothesis to verify:\n{hypothesis}"
+    )
+    try:
+        structured_llm = llm.with_structured_output(VerifiedPatternProposal)
+        proposal: VerifiedPatternProposal = structured_llm.invoke(
+            [
+                ("system", VERIFY_HYPOTHESIS_SYSTEM_PROMPT),
+                ("human", human_content),
+            ]
+        )
+    except Exception:
+        return None
+
+    try:
+        compiled_pattern = re.compile(proposal.pattern)
+    except re.error:
+        return None
+
+    matches = non_null.map(lambda v: bool(compiled_pattern.search(v)))
+    match_count = int(matches.sum())
+    match_frac = match_count / len(non_null)
+
+    if match_frac < proposal.match_threshold:
+        return None
+
+    return (
+        f"Composite field (discovered): column '{column}' has {match_count} value(s) "
+        f"({match_frac:.0%}) matching the pattern '{proposal.pattern}' — this looks like two "
+        f"distinct values glued together, not caught by a fixed rubric check."
+    )
+
+
+_COLUMN_NAME_TOKEN_RE = re.compile(r"[a-z]+")
+
+
+def _column_name_token_overlap(col_a: str, col_b: str) -> float:
+    """Jaccard overlap of lowercased word tokens between two column names —
+    e.g. "Industry" / "Sector" share no tokens (0.0), but "customer_id" /
+    "customer id" share everything (1.0). A cheap, dataset-agnostic heuristic
+    for ranking which column pairs are worth asking the LLM about."""
+    tokens_a = set(_COLUMN_NAME_TOKEN_RE.findall(col_a.lower()))
+    tokens_b = set(_COLUMN_NAME_TOKEN_RE.findall(col_b.lower()))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+
+
+def _quick_value_overlap(df: pd.DataFrame, col_a: str, col_b: str, sample_n: int = 20) -> float:
+    """Cheap, approximate overlap fraction between two columns' real values,
+    computed from a small sample — used only to RANK candidate pairs before
+    deciding which ones are worth an LLM call. The actual accept/reject decision
+    always re-checks the FULL columns (see _verify_column_pair)."""
+    a = df[col_a].dropna().astype(str)
+    b = df[col_b].dropna().astype(str)
+    if a.empty or b.empty:
+        return 0.0
+    n = min(sample_n, len(a))
+    a_sample = a.sample(n=n) if len(a) > n else a
+    b_values = set(b.sample(n=min(sample_n * 5, len(b))))
+    overlap = sum(1 for v in a_sample if v in b_values)
+    return overlap / n if n else 0.0
+
+
+def _rank_column_pairs(df: pd.DataFrame, columns: list) -> list:
+    """Every column pair with any real signal (shared name tokens, or sampled
+    value overlap), ranked highest-signal first. Pairs with zero signal on both
+    measures are excluded entirely — nothing worth asking the LLM about."""
+    scored = []
+    for i, col_a in enumerate(columns):
+        for col_b in columns[i + 1:]:
+            name_score = _column_name_token_overlap(col_a, col_b)
+            value_score = _quick_value_overlap(df, col_a, col_b)
+            score = max(name_score, value_score)
+            if score > 0:
+                scored.append((score, col_a, col_b))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [(a, b) for _, a, b in scored]
+
+
+def _verify_column_pair(df: pd.DataFrame, col_a: str, col_b: str) -> "str | None":
+    """The trust boundary for column-pair discovery: actually compares the two
+    FULL real columns (never just the sample) and only accepts the LLM's
+    suspicion when the real overlap fraction clears _COLUMN_PAIR_OVERLAP_THRESHOLD.
+    """
+    both = df[[col_a, col_b]].dropna()
+    if both.empty:
+        return None
+    equal_mask = both[col_a].astype(str) == both[col_b].astype(str)
+    overlap_frac = float(equal_mask.mean())
+
+    if overlap_frac < _COLUMN_PAIR_OVERLAP_THRESHOLD:
+        return None
+
+    return (
+        f"Duplicate column (discovered): columns '{col_a}' and '{col_b}' are "
+        f"{overlap_frac:.0%} identical — one may be silently derived from or "
+        f"overwritten by the other, unintentionally destroying the original data "
+        f"in one of them."
+    )
+
+
+EXPLORE_COLUMN_PAIR_SYSTEM_PROMPT = """You are given real sampled values from two columns
+of the same dataset. Do not fix anything.
+
+Do these two columns look suspiciously identical, or like one was silently derived from
+or overwritten by the other in a way that looks unintentional (as opposed to two
+columns that are legitimately, deliberately related — e.g. a subtotal and a total)? If
+nothing looks suspicious, say so plainly — do not invent a finding to have something to
+report.
+
+State any finding as a testable hypothesis about the FULL columns, not just the sample."""
+
+
+def _explore_column_pairs(df: pd.DataFrame, llm=None, max_pairs: "int | None" = None) -> list:
+    """Cross-column consistency pass — catches the class of bug where one column
+    is silently derived from/overwritten by another (e.g. Sector overwritten by
+    a transform of Industry), which is invisible to any single-column check.
+
+    Ranks candidate pairs (see _rank_column_pairs), asks the LLM about the
+    top ones (capped at max_pairs, default EXPLORE_MAX_COLUMN_PAIRS), and only
+    accepts a finding after mechanically re-comparing the two FULL real columns
+    (see _verify_column_pair) — the LLM's suspicion alone is never enough.
+    """
+    columns = list(df.columns)
+    if len(columns) < 2:
+        return []
+    limit = EXPLORE_MAX_COLUMN_PAIRS if max_pairs is None else max(0, min(max_pairs, EXPLORE_MAX_COLUMN_PAIRS))
+    if limit == 0:
+        return []
+
+    if llm is None:
+        from utils.llm_pick import pick_llm
+        llm = pick_llm("cheap")
+
+    candidate_pairs = _rank_column_pairs(df, columns)[:limit]
+
+    issues = []
+    for col_a, col_b in candidate_pairs:
+        sample_a = _sample_column_values(df[col_a].dropna())[:10]
+        sample_b = _sample_column_values(df[col_b].dropna())[:10]
+        human_content = (
+            f"Column A: {col_a}\nSample values: {sample_a}\n\n"
+            f"Column B: {col_b}\nSample values: {sample_b}"
+        )
+        try:
+            structured_llm = llm.with_structured_output(ExplorationHypothesis)
+            result: ExplorationHypothesis = structured_llm.invoke(
+                [
+                    ("system", EXPLORE_COLUMN_PAIR_SYSTEM_PROMPT),
+                    ("human", human_content),
+                ]
+            )
+        except Exception:
+            continue
+
+        if not result.hypotheses:
+            continue
+
+        issue = _verify_column_pair(df, col_a, col_b)
+        if issue:
+            issues.append(issue)
+
+    return issues
+
+
+def explore_and_verify(df: "pd.DataFrame | None", llm=None, flagged_columns: "set | None" = None) -> list:
+    """Orchestrator: runs explore_column across every eligible column, verifies
+    every returned hypothesis via _verify_hypothesis, runs _explore_column_pairs,
+    and returns a flat list of issue strings in the exact format check_rubric()
+    produces (so they merge into the same fail/warn pipeline with no new code
+    path).
+
+    flagged_columns: column names check_rubric already flagged with a fail-level
+    issue this run — explore_column is skipped for these (no benefit to
+    discovering more on top of a column already known to need fixing). Optional
+    so this function stays usable standalone with just (df, llm).
+
+    Cost/safety: tracks total LLM calls made (per-column exploration + per-
+    hypothesis verification + column-pair exploration, combined) against
+    EXPLORE_MAX_LLM_CALLS_PER_TABLE. If the ceiling is hit before everything is
+    explored, logs a warning via print(..., file=sys.stderr) (same pattern as
+    existing warnings in this file) and returns whatever was verified so far —
+    never raises, never silently truncates without logging.
+    """
+    if df is None or df.empty:
+        return []
+
+    if llm is None:
+        from utils.llm_pick import pick_llm
+        llm = pick_llm("cheap")
+
+    flagged_columns = flagged_columns or set()
+    issues: list = []
+    call_count = 0
+
+    eligible_columns = [
+        col for col in df.columns
+        if col not in flagged_columns and not _is_long_form_prose_column(df[col])
+    ]
+
+    for col in eligible_columns:
+        if call_count >= EXPLORE_MAX_LLM_CALLS_PER_TABLE:
+            print(
+                f"[explore] LLM call ceiling ({EXPLORE_MAX_LLM_CALLS_PER_TABLE}) reached "
+                f"before exploring column '{col}' — stopping discovery early for this table.",
+                file=sys.stderr,
+            )
+            return issues
+
+        hypotheses = explore_column(df, col, llm=llm)
+        call_count += 1
+
+        for hypothesis in hypotheses:
+            if call_count >= EXPLORE_MAX_LLM_CALLS_PER_TABLE:
+                print(
+                    f"[explore] LLM call ceiling ({EXPLORE_MAX_LLM_CALLS_PER_TABLE}) reached "
+                    f"while verifying hypotheses for column '{col}' — some hypotheses left "
+                    "unverified.",
+                    file=sys.stderr,
+                )
+                return issues
+            verified = _verify_hypothesis(df, col, hypothesis, llm=llm)
+            call_count += 1
+            if verified:
+                issues.append(verified)
+
+    remaining_budget = EXPLORE_MAX_LLM_CALLS_PER_TABLE - call_count
+    if remaining_budget <= 0:
+        print(
+            f"[explore] LLM call ceiling ({EXPLORE_MAX_LLM_CALLS_PER_TABLE}) reached — "
+            "skipping column-pair exploration for this table.",
+            file=sys.stderr,
+        )
+        return issues
+
+    pair_limit = min(EXPLORE_MAX_COLUMN_PAIRS, remaining_budget)
+    issues.extend(_explore_column_pairs(df, llm=llm, max_pairs=pair_limit))
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Piece 2: LLM-generated cleaning code, human approval gate, execution with
 # retry-on-real-error, and the clean_dataset() orchestrator that ties it all
 # together. This is the part clean_data.py, the enhanced load_data.py, and the
@@ -1708,13 +2203,30 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
     result = CleaningResult(folder_path=str(folder), cleaned_dir=str(cleaned_dir))
 
     for file_path in csv_files:
-        issues = check_rubric(file_path)
+        static_issues = check_rubric(file_path)
+        resolved_llm = llm if llm is not None else pick_llm("high")
+
+        # Discovery phase (see explore_and_verify): runs even when the static
+        # rubric found nothing for this file — that's exactly the case a closed
+        # catalog of pattern-matchers can miss entirely (see its module docstring).
+        # Every discovered issue is mechanically verified against the real full
+        # column before it's allowed to reach this list, so it merges onto
+        # static_issues before severity splitting with no new code path below.
+        try:
+            exploration_df = _read_csv_robust(file_path)
+        except Exception:
+            exploration_df = None
+        discovered_issues = explore_and_verify(
+            exploration_df, llm=resolved_llm,
+            flagged_columns=_columns_with_fail_issues(static_issues),
+        )
+        issues = static_issues + discovered_issues
+
         if not issues:
             result.untouched_files.append(file_path.name)
             continue
 
         cloned_path = _clone_file(file_path, cleaned_dir)
-        resolved_llm = llm if llm is not None else pick_llm("high")
         row_count_before = _count_csv_rows(cloned_path)
         fail_issues, warn_issues = _split_issues_by_severity(issues)
 

@@ -123,3 +123,34 @@ class ChartTypeSchema(BaseModel):
     chart_type: str
     chart_type_source: Literal["explicit", "reasoned"]
     chart_type_reasoning: str
+
+
+class ExplorationHypothesis(BaseModel):
+    """Structured output schema for utils/data_cleaning.py's explore_column
+    (open-ended, per-column "glance and notice" pass) and _explore_column_pairs
+    (cross-column consistency pass) — used via with_structured_output only.
+
+    hypotheses is deliberately loose, plain-English text — never something
+    check_rubric() would accept directly as an issue string. Every hypothesis
+    returned here MUST be run through _verify_hypothesis (or the mechanical
+    column-pair comparison) before it can become a real issue; nothing an LLM
+    notices here is trusted on its own. An empty list is a valid, expected
+    result — most columns/pairs should produce nothing.
+    """
+
+    hypotheses: list[str]
+
+
+class VerifiedPatternProposal(BaseModel):
+    """Structured output schema for utils/data_cleaning.py's _verify_hypothesis
+    only — used via with_structured_output. Turns one loose hypothesis into a
+    concrete, mechanically-testable claim: a regex to run against the FULL real
+    column (never just the sample) and the match fraction it must clear to be
+    considered confirmed. The LLM's role stops here; the actual verification
+    (does match_frac >= match_threshold against every non-null real value) is
+    plain Python/pandas, no LLM involved.
+    """
+
+    pattern: str
+    match_threshold: float
+    description: str
