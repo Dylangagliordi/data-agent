@@ -26,7 +26,6 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
-import agents.router as router_module
 from agents.data_agent import build_data_agent_graph
 from models.router_schema import DataAgentSchema
 
@@ -50,9 +49,11 @@ def log_run(user_question: str, result: dict) -> None:
     if route_response == "sql_analyst":
         # The SQL analyst's own internal trace (curated_question,
         # generated_sql_query, is_safe, comments, sql_query_execution_result)
-        # isn't part of DataAgentSchema — sql_node stashes the real sub-agent
-        # result dict in this module-level side channel for exactly this use.
-        sql_state = router_module.LAST_SQL_ANALYST_STATE
+        # isn't part of DataAgentSchema's normal fields — sql_node returns the
+        # real sub-agent result dict as sql_analyst_trace on the graph's own
+        # state for exactly this use (threaded through normally, not a shared
+        # module-level global that a concurrent request could overwrite).
+        sql_state = result.get("sql_analyst_trace", {})
         entry.update(
             {
                 "user_question": user_question,
@@ -65,10 +66,10 @@ def log_run(user_question: str, result: dict) -> None:
             }
         )
     elif route_response == "visualize":
-        # visualize_node also stashes its SQL analyst sub-agent result in
-        # LAST_SQL_ANALYST_STATE (same side channel, same pattern as sql_node)
-        # so all visualization-specific fields are accessible here.
-        sql_state = router_module.LAST_SQL_ANALYST_STATE
+        # visualize_node also returns its SQL analyst sub-agent result as
+        # sql_analyst_trace (same field, same pattern as sql_node) so all
+        # visualization-specific fields are accessible here.
+        sql_state = result.get("sql_analyst_trace", {})
         entry.update(
             {
                 "user_question": user_question,

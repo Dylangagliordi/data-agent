@@ -68,6 +68,31 @@ as follows — do not weaken any of this without deliberately re-reviewing why i
   for why: reloading a table that was never flagged as needing it would be redundant
   work, not a correctness fix.
 
+## SSRF Protection — extract_load only ever fetches public network targets
+
+`extract_load` (`agents/etl_analyst.py`) is invoked by an LLM deciding what URL to pass
+it, with no allowlist of its own — this is a real, permanent safety boundary, not a
+suggestion to be relaxed for convenience:
+
+- Before every fetch, and before following any HTTP redirect, `_validate_fetch_url`
+  resolves the target hostname's real IP address(es) and rejects the request if any of
+  them fall in a private, loopback, link-local, reserved, multicast, or unspecified
+  range (`ipaddress.ip_address(...).is_private` / `.is_loopback` / `.is_link_local` /
+  `.is_reserved` / `.is_multicast` / `.is_unspecified`). This is exactly what blocks
+  `169.254.169.254` (the AWS/GCP/Azure cloud-metadata endpoint, which serves IAM
+  credentials) — it's a link-local address.
+- A small set of known metadata hostnames (`metadata.google.internal`, `metadata.goog`)
+  are also blocked by name, in case a future metadata service doesn't resolve to a
+  link-local IP.
+- Only `http`/`https` schemes are allowed.
+- Redirects are followed manually (not via `requests`' automatic redirect-following) so
+  each redirect target is validated exactly the same way as the original URL — a URL
+  that passes validation but redirects to an internal address is still blocked.
+- DNS is resolved fresh at request time, not cached or trusted from the URL text alone.
+
+Do not weaken this by adding a bypass flag, widening the allowed IP ranges, or trusting
+the URL's hostname without resolving it.
+
 ## Workflow
 - After building or changing any node or component, write a small test, run it, and show real
   output before moving on to the next piece.

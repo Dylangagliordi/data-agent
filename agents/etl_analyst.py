@@ -11,7 +11,10 @@ spec — no tool here logs into or scrapes an authenticated source. extract_load
 does a plain, unauthenticated HTTP GET against a URL it's given.
 """
 
+import ipaddress
+import socket
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import requests
 from langchain.tools import tool
@@ -23,6 +26,72 @@ from utils.data_cleaning import clean_dataset
 from utils.llm_pick import pick_llm
 
 DOWNLOAD_TIMEOUT_SECONDS = 30
+
+# SSRF protection (permanent safety boundary — see AGENTS.md). extract_load will
+# fetch whatever URL the LLM decides to pass it; without this, that URL could
+# point at a private/internal network address or a cloud-metadata endpoint
+# (e.g. 169.254.169.254, which serves IAM credentials on AWS/GCP/Azure) and the
+# tool would happily fetch it. Known cloud-metadata hostnames that don't
+# already resolve to a link-local IP (so aren't already caught by the
+# ip.is_link_local check below).
+_BLOCKED_METADATA_HOSTNAMES = {
+    "metadata.google.internal",
+    "metadata.goog",
+}
+_MAX_REDIRECTS = 5
+
+
+def _resolve_all_ips(hostname: str) -> list:
+    """Every distinct IP (v4 and v6) a hostname resolves to right now."""
+    infos = socket.getaddrinfo(hostname, None)
+    return list({info[4][0] for info in infos})
+
+
+def _ip_is_blocked(ip_str: str) -> bool:
+    """True for any IP that is not a genuine, routable public address —
+    private ranges (10/8, 172.16/12, 192.168/16, fc00::/7, ...), loopback
+    (127.0.0.1, ::1), link-local (169.254.0.0/16, fe80::/10 — this is what
+    169.254.169.254, the AWS/GCP/Azure metadata endpoint, actually is),
+    multicast, reserved, and unspecified (0.0.0.0)."""
+    ip = ipaddress.ip_address(ip_str)
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _validate_fetch_url(url: str) -> tuple[bool, str]:
+    """Reject a URL before any request is made if it targets a private/internal
+    network address or a known cloud-metadata endpoint. Returns (is_safe, reason)
+    — reason is "" when is_safe is True. DNS is resolved here (not left to the
+    HTTP client) specifically so the check happens against the real IP the
+    hostname currently points to, not just the hostname text.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False, f"only http/https URLs are allowed, got scheme {parsed.scheme!r}"
+    hostname = parsed.hostname
+    if not hostname:
+        return False, "URL has no hostname"
+    if hostname.lower() in _BLOCKED_METADATA_HOSTNAMES:
+        return False, f"{hostname!r} is a known cloud-metadata endpoint"
+    try:
+        ips = _resolve_all_ips(hostname)
+    except socket.gaierror as e:
+        return False, f"could not resolve host {hostname!r}: {e}"
+    if not ips:
+        return False, f"host {hostname!r} did not resolve to any IP address"
+    for ip_str in ips:
+        if _ip_is_blocked(ip_str):
+            return False, (
+                f"host {hostname!r} resolves to {ip_str}, a private/internal/"
+                "metadata address — fetching internal network resources is blocked"
+            )
+    return True, ""
 
 
 @tool
@@ -40,12 +109,40 @@ def extract_load(url: str, output_folder: str, format: str) -> str:
 
     Returns a short human-readable status string: either a success message naming the
     saved file path and its size, or a clear description of what went wrong (bad URL,
-    timeout, non-200 response) — this function never raises for a real network/HTTP
-    failure, it always returns a string either way.
+    blocked target, timeout, non-200 response) — this function never raises for a real
+    network/HTTP failure, it always returns a string either way.
+
+    SSRF protection (permanent safety boundary — see AGENTS.md): before fetching, and
+    again before following any redirect, the target URL's hostname is resolved and
+    rejected if it points at a private/internal IP range or a known cloud-metadata
+    endpoint (e.g. 169.254.169.254). This is checked here rather than trusted to the
+    caller because this tool is invoked by an LLM deciding what URL to pass, with no
+    allowlist of its own.
     """
+    is_safe, reason = _validate_fetch_url(url)
+    if not is_safe:
+        return f"ERROR: refused to fetch URL — {reason}"
+
+    current_url = url
     try:
-        response = requests.get(url, timeout=DOWNLOAD_TIMEOUT_SECONDS)
-        response.raise_for_status()
+        for _ in range(_MAX_REDIRECTS + 1):
+            response = requests.get(
+                current_url, timeout=DOWNLOAD_TIMEOUT_SECONDS, allow_redirects=False
+            )
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    break
+                next_url = urljoin(current_url, location)
+                is_safe, reason = _validate_fetch_url(next_url)
+                if not is_safe:
+                    return f"ERROR: refused to follow redirect — {reason}"
+                current_url = next_url
+                continue
+            response.raise_for_status()
+            break
+        else:
+            return f"ERROR: too many redirects (> {_MAX_REDIRECTS}) while fetching URL: {url}"
     except requests.exceptions.Timeout:
         return f"ERROR: download timed out after {DOWNLOAD_TIMEOUT_SECONDS}s for URL: {url}"
     except requests.exceptions.ConnectionError as e:
@@ -58,7 +155,7 @@ def extract_load(url: str, output_folder: str, format: str) -> str:
     out_dir = Path(output_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    url_name = Path(url.split("?")[0]).name
+    url_name = Path(current_url.split("?")[0]).name
     if url_name and "." in url_name:
         file_name = url_name
     else:

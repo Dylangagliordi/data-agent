@@ -68,8 +68,7 @@ else:
 assert Path(file_path2).exists(), f"output CSV must exist at {file_path2}"
 
 # Access the internal state to verify chart_type_source
-import agents.router as router_module
-sql_state = router_module.LAST_SQL_ANALYST_STATE
+sql_state = result2.get("sql_analyst_trace", {})
 print(f"chart_type: {sql_state.get('chart_type')}, source: {sql_state.get('chart_type_source')}")
 print(f"chart_type_reasoning: {sql_state.get('chart_type_reasoning')}")
 

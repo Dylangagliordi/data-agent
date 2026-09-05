@@ -31,19 +31,6 @@ from models.etl_schema import ETLAnalystState
 _SQL_ANALYST_GRAPH = build_sql_analyst_graph()
 _ETL_ANALYST_GRAPH = build_etl_analyst_graph()
 
-# Side channel for main.py's logging only — NOT part of DataAgentSchema (that
-# schema is deliberately kept to exactly messages/route_response/
-# route_comments/final_answer, per spec, so a sub-agent's own internal fields
-# never leak into or overwrite the router's own state). main.py needs the SQL
-# analyst's full internal trace (curated_question, generated_sql_query, etc.)
-# to log it exactly as before the router existed; sql_node stashes the real
-# sub-agent result dict here on every call so a caller can read it right after
-# graph.invoke() returns, without re-running the sub-agent a second time just
-# to get its trace. Reset to {} at the start of every sql_node call so a
-# caller never sees a stale trace from a previous, unrelated invocation.
-LAST_SQL_ANALYST_STATE: dict = {}
-
-
 ROUTER_SYSTEM_PROMPT = """You classify an incoming request into exactly one of three \
 categories, for a data platform with three sub-agents:
 
@@ -99,14 +86,13 @@ def sql_node(state: DataAgentSchema) -> dict:
     clear final_answer naming which sub-agent failed and the real error, rather
     than propagating and crashing the router.
 
-    Also stashes the full real sub-agent result dict into the module-level
-    LAST_SQL_ANALYST_STATE (see its own comment above) so main.py's logging can
-    access the SQL analyst's internal trace fields without DataAgentSchema itself
-    needing to carry them.
+    Returns the full real sub-agent result dict as sql_analyst_trace, threaded
+    through DataAgentSchema like any other node output — not a module-level
+    global, which would be unsafe if two questions were ever handled
+    concurrently (one request's trace could be overwritten by another's before
+    the first caller reads it). main.py's logging reads it from the graph's own
+    returned state.
     """
-    global LAST_SQL_ANALYST_STATE
-    LAST_SQL_ANALYST_STATE = {}
-
     last_message = state.messages[-1]
     content = last_message.content if hasattr(last_message, "content") else str(last_message)
 
@@ -115,12 +101,12 @@ def sql_node(state: DataAgentSchema) -> dict:
             SQLAnalystState(user_question=content),
             config={"recursion_limit": 50},
         )
-        LAST_SQL_ANALYST_STATE = result
         final_answer = result["final_answer"]
     except Exception as e:
+        result = {}
         final_answer = f"The SQL analyst sub-agent failed with an unexpected error: {type(e).__name__}: {e}"
 
-    return {"final_answer": final_answer}
+    return {"final_answer": final_answer, "sql_analyst_trace": result}
 
 
 def visualize_node(state: DataAgentSchema) -> dict:
@@ -132,14 +118,11 @@ def visualize_node(state: DataAgentSchema) -> dict:
     from sql_node; all other nodes (curate_question, add_context, generate_sql,
     is_safe, execute_sql) are shared and unmodified.
 
-    Also stashes the full sub-agent result into LAST_SQL_ANALYST_STATE exactly
-    as sql_node does, so main.py's logging can read the visualization-specific
-    fields (chart_type, output_file_path, etc.) without DataAgentSchema needing
-    to carry them.
+    Returns the full sub-agent result as sql_analyst_trace exactly as sql_node
+    does (see its own docstring), so main.py's logging can read the
+    visualization-specific fields (chart_type, output_file_path, etc.) from the
+    graph's own returned state instead of a shared module-level global.
     """
-    global LAST_SQL_ANALYST_STATE
-    LAST_SQL_ANALYST_STATE = {}
-
     last_message = state.messages[-1]
     content = last_message.content if hasattr(last_message, "content") else str(last_message)
 
@@ -148,12 +131,12 @@ def visualize_node(state: DataAgentSchema) -> dict:
             SQLAnalystState(user_question=content, wants_visualization=True),
             config={"recursion_limit": 50},
         )
-        LAST_SQL_ANALYST_STATE = result
         final_answer = result["final_answer"]
     except Exception as e:
+        result = {}
         final_answer = f"The visualize sub-agent failed with an unexpected error: {type(e).__name__}: {e}"
 
-    return {"final_answer": final_answer}
+    return {"final_answer": final_answer, "sql_analyst_trace": result}
 
 
 def etl_node(state: DataAgentSchema) -> dict:

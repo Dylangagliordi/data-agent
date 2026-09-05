@@ -8,7 +8,6 @@ Runs a plain SQL question through sql_node and verifies:
 
 from langchain_core.messages import HumanMessage
 
-import agents.router as router_module
 from agents.router import sql_node
 from models.router_schema import DataAgentSchema
 
@@ -34,7 +33,7 @@ assert "Chart type:" not in result["final_answer"], (
 print("PASS: final_answer is a plain-English answer, not a visualization message.\n")
 
 # Verify visualization state fields remain at defaults in the sub-agent result
-sql_state = router_module.LAST_SQL_ANALYST_STATE
+sql_state = result.get("sql_analyst_trace", {})
 print(f"wants_visualization in sub-agent state: {sql_state.get('wants_visualization')}")
 print(f"chart_type in sub-agent state: {sql_state.get('chart_type')!r}")
 print(f"output_file_path in sub-agent state: {sql_state.get('output_file_path')!r}")

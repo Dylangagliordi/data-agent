@@ -824,6 +824,73 @@ def _extract_min_sample_threshold(sql_query: str):
     return None
 
 
+_RANKING_QUESTION_RE = re.compile(
+    r"\b(rank|ranking|compare|comparison|best|worst|top|bottom|highest|lowest)\b",
+    re.IGNORECASE,
+)
+_ALL_GROUPS_REGARDLESS_RE = re.compile(
+    r"\b(regardless of size|no matter how (?:few|small)|including small|every group|"
+    r"all groups|even (?:small|tiny) (?:categories|groups)|small samples? included)\b",
+    re.IGNORECASE,
+)
+
+
+def _query_has_group_by(sql_query: str) -> bool:
+    tree = _parse_sql_ast(sql_query)
+    if tree is None:
+        return False
+    return tree.find(exp.Group) is not None
+
+
+def _query_has_averaged_or_rate_metric(sql_query: str) -> bool:
+    """True when the query computes an AVG(...), or a rate (a division where
+    either side is itself an aggregate — e.g. SUM(x)/COUNT(*)). The minimum-
+    sample-size rule specifically targets averaged/rate-based rankings, not a
+    plain SUM/COUNT total, so this deliberately doesn't fire for those.
+    """
+    tree = _parse_sql_ast(sql_query)
+    if tree is None:
+        return False
+    if tree.find(exp.Avg) is not None:
+        return True
+    for div in tree.find_all(exp.Div):
+        if isinstance(div.this, (exp.Count, exp.Sum, exp.Avg)) or isinstance(
+            div.expression, (exp.Count, exp.Sum, exp.Avg)
+        ):
+            return True
+    return False
+
+
+def _min_sample_rule_violated(question: str, sql_query: str) -> bool:
+    """Mechanical, deterministic check for architecture review point #25: the
+    minimum-sample-size rule (HAVING COUNT(*) >= 5 for a per-category ranking
+    by an averaged/rate metric) was previously only DISCLOSED if present in the
+    generated SQL — nothing ever caught the rule being silently skipped
+    entirely, since disclosure only extracts what's actually there.
+
+    Fires only when all of the following are true:
+    - the question itself uses ranking/comparison language (rank, top, best,
+      highest, ...) — this rule doesn't apply to a plain "what's the average
+      X per category" with no ranking intent;
+    - the question does NOT explicitly ask for every group regardless of size;
+    - the generated SQL actually GROUPs BY (a per-category aggregation exists
+      at all);
+    - that aggregation is averaged/rate-based (_query_has_averaged_or_rate_metric);
+    - no HAVING COUNT(*)/COUNT(col) threshold is present anywhere in the query.
+    """
+    if not sql_query or not question:
+        return False
+    if not _RANKING_QUESTION_RE.search(question):
+        return False
+    if _ALL_GROUPS_REGARDLESS_RE.search(question):
+        return False
+    if not _query_has_group_by(sql_query):
+        return False
+    if not _query_has_averaged_or_rate_metric(sql_query):
+        return False
+    return _extract_min_sample_threshold(sql_query) is None
+
+
 def _order_by_label(order_expr) -> str:
     """Human-readable label for one ORDER BY expression.
 
@@ -1247,6 +1314,31 @@ def generate_sql(state: SQLAnalystState) -> dict:
     )
     sql_query = _strip_sql_formatting(_extract_text(response.content))
 
+    # Mechanical compliance check (architecture review point #25): the minimum-
+    # sample-size rule was previously only disclosed if present, never enforced
+    # — a first attempt that silently skipped it entirely would execute
+    # unchallenged. Regenerate exactly once, with the missing rule made
+    # explicit, the same corrective pattern already used for real execution
+    # errors above (never re-ask an LLM to "double check" — feed it the
+    # concrete violation and the previous query, same as a real DB error).
+    if _min_sample_rule_violated(state.curated_question, sql_query):
+        retry_content = (
+            human_content
+            + "\n\nCOMPLIANCE CHECK FAILED: your previous query grouped by category and "
+            "ranked/compared an averaged or rate-based metric, but did not include the "
+            "required HAVING COUNT(*) >= 5 (or equivalent) minimum-sample-size clause — "
+            "this is a fixed project convention (see the rules above), not optional. "
+            "Add it now.\n\n"
+            f"Previous (non-compliant) query was:\n{sql_query}"
+        )
+        retry_response = llm.invoke(
+            [
+                ("system", GENERATE_SQL_SYSTEM_PROMPT),
+                ("human", retry_content),
+            ]
+        )
+        sql_query = _strip_sql_formatting(_extract_text(retry_response.content))
+
     return {"generated_sql_query": sql_query}
 
 
@@ -1417,6 +1509,16 @@ def execute_sql(state: SQLAnalystState) -> dict:
     attempts = state.sql_attempts + 1
     conn = get_app_reader_connection()
     try:
+        # SET LOCAL statement_timeout only binds within an open transaction block —
+        # under autocommit=True, each cur.execute() is its own implicit transaction,
+        # so a timeout set on one statement would never apply to the next (the
+        # query below would run completely unbounded). psycopg2 connections default
+        # to autocommit=False (get_app_reader_connection never sets it), which is
+        # what makes SET LOCAL here + the query below share one transaction — but
+        # this is verified explicitly, not just assumed, so a future change to the
+        # connection helper can't silently reopen this hole.
+        if conn.autocommit:
+            conn.autocommit = False
         with conn.cursor() as cur:
             # Hard resource guard: kill the query if it runs longer than the timeout.
             # SET LOCAL applies for the current transaction only.
@@ -1661,10 +1763,28 @@ def _numeric_cols(data: list, cols: list) -> list:
 
 
 def _chart_bar(ax, data: list, cols: list) -> None:
+    """Draw a bar per row. A genuinely NULL metric value is drawn as a 0-height
+    bar but marked with a hatch pattern + "No data" label so it is never
+    visually indistinguishable from a real zero (which renders as a plain,
+    unmarked 0-height bar)."""
     x_labels = [str(r[cols[0]]) for r in data]
-    y_vals = [_to_float(r[cols[1]]) or 0 for r in data] if len(cols) >= 2 else list(range(len(data)))
+    if len(cols) >= 2:
+        raw_vals = [_to_float(r[cols[1]]) for r in data]
+    else:
+        raw_vals = list(range(len(data)))
     pos = list(range(len(x_labels)))
-    ax.bar(pos, y_vals)
+    heights = [0.0 if v is None else v for v in raw_vals]
+    bars = ax.bar(pos, heights)
+    if len(cols) >= 2:
+        for i, v in enumerate(raw_vals):
+            if v is None:
+                bars[i].set_hatch("//")
+                bars[i].set_edgecolor("gray")
+                bars[i].set_facecolor("none")
+                ax.annotate(
+                    "No data", (pos[i], 0), ha="center", va="bottom",
+                    fontsize=7, color="gray", rotation=90,
+                )
     ax.set_xticks(pos)
     ax.set_xticklabels(x_labels, rotation=45, ha="right", fontsize=8)
     ax.set_xlabel(_humanize_column(cols[0]))
@@ -1673,8 +1793,16 @@ def _chart_bar(ax, data: list, cols: list) -> None:
 
 
 def _chart_line(ax, data: list, cols: list) -> None:
+    """Draw the line. A genuinely NULL metric value is passed through as NaN,
+    which matplotlib renders as a real gap in the line (no segment drawn
+    through it, no marker plotted there) — distinct from a real zero, which
+    draws a marker at y=0."""
     x_labels = [str(r[cols[0]]) for r in data]
-    y_vals = [_to_float(r[cols[1]]) or 0 for r in data] if len(cols) >= 2 else []
+    if len(cols) >= 2:
+        y_vals = [_to_float(r[cols[1]]) for r in data]
+        y_vals = [float("nan") if v is None else v for v in y_vals]
+    else:
+        y_vals = []
     pos = list(range(len(x_labels)))
     ax.plot(pos, y_vals, marker="o", linewidth=2, markersize=4)
     ax.set_xticks(pos)
@@ -1717,10 +1845,19 @@ def _chart_scatter(ax, data: list, cols: list) -> None:
 
 
 def _chart_pie(ax, data: list, cols: list, donut: bool = False) -> None:
+    """A pie/donut wedge has no way to represent "missing" as opposed to a
+    real, tiny-but-present zero share — a 0-value wedge is already invisible,
+    so silently including a NULL as 0 would be indistinguishable from a real
+    zero. Instead, rows with a NULL metric are omitted from the chart
+    entirely rather than plotted as a same-looking zero wedge."""
     if len(cols) < 2:
         return
-    labels = [str(r[cols[0]]) for r in data]
-    vals = [abs(_to_float(r[cols[1]]) or 0) for r in data]
+    pairs = [(str(r[cols[0]]), _to_float(r[cols[1]])) for r in data]
+    pairs = [(label, val) for label, val in pairs if val is not None]
+    if not pairs:
+        return
+    labels = [label for label, _ in pairs]
+    vals = [abs(val) for _, val in pairs]
     if sum(vals) == 0:
         return
     wedge_kw = {"width": 0.5} if donut else {}
@@ -1767,16 +1904,24 @@ def _chart_box(ax, data: list, cols: list) -> None:
 
 
 def _chart_stacked_bar(ax, data: list, cols: list) -> None:
+    """A NULL metric value for a real (category, sub-category) cell is stacked
+    as a 0-height segment (stacking needs a real number to sum), but that
+    segment is hatched to mark it as "no data" — distinct from a real zero
+    segment, which stacks the same way with no hatch."""
     import numpy as np
     if len(cols) < 3:
         _chart_bar(ax, data, cols)
         return
     pivot: dict = {}
+    null_cells: set = set()
     subcat_order: list = []
     for row in data:
         cat = str(row[cols[0]])
         sub = str(row[cols[1]])
-        val = _to_float(row[cols[2]]) or 0
+        val = _to_float(row[cols[2]])
+        if val is None:
+            null_cells.add((cat, sub))
+            val = 0.0
         pivot.setdefault(cat, {})[sub] = val
         if sub not in subcat_order:
             subcat_order.append(sub)
@@ -1784,7 +1929,11 @@ def _chart_stacked_bar(ax, data: list, cols: list) -> None:
     bottom = np.zeros(len(categories))
     for i, sc in enumerate(subcat_order):
         vals = [pivot[cat].get(sc, 0) for cat in categories]
-        ax.bar(categories, vals, bottom=bottom, label=sc, color=f"C{i % 10}")
+        bars = ax.bar(categories, vals, bottom=bottom, label=sc, color=f"C{i % 10}")
+        for j, cat in enumerate(categories):
+            if (cat, sc) in null_cells:
+                bars[j].set_hatch("//")
+                bars[j].set_edgecolor("gray")
         bottom += np.array(vals)
     ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8)
     ax.set_xlabel(_humanize_column(cols[0]))
@@ -1854,11 +2003,19 @@ def _squarify_rects(sizes, x=0.0, y=0.0, width=1.0, height=1.0) -> list:
 
 
 def _chart_treemap(fig, data: list, cols: list) -> None:
+    """A treemap rectangle's area IS its value — a NULL size has no valid area
+    to draw at all (unlike a real zero, which legitimately occupies no area).
+    Rows with a NULL size metric are omitted from the treemap entirely rather
+    than silently plotted as a real (invisible) zero-area rectangle."""
     ax = fig.add_subplot(111)
     if len(cols) < 2:
         return
-    labels = [str(r[cols[0]]) for r in data]
-    sizes = [abs(_to_float(r[cols[-1]]) or 0) for r in data]
+    pairs = [(str(r[cols[0]]), _to_float(r[cols[-1]])) for r in data]
+    pairs = [(label, val) for label, val in pairs if val is not None]
+    if not pairs:
+        return
+    labels = [label for label, _ in pairs]
+    sizes = [abs(val) for _, val in pairs]
     if sum(sizes) == 0:
         return
 

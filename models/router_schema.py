@@ -30,6 +30,17 @@ class DataAgentSchema(BaseModel):
     route_comments: str = ""
     final_answer: str = ""
 
+    # The SQL analyst sub-agent's own internal trace (curated_question,
+    # generated_sql_query, is_safe, comments, sql_query_execution_result, and, on
+    # the visualize path, chart_type/output_file_path/chart_image_path) isn't part
+    # of this schema's normal fields — it's the sub-agent's own state dict, needed
+    # only so main.py's logging can record it. sql_node/visualize_node return the
+    # full sub-agent result dict here as part of their own node return value, so it
+    # threads through the graph's normal state mechanism like everything else,
+    # rather than living in a module-level global that a second concurrent
+    # invocation could overwrite before the first caller reads it.
+    sql_analyst_trace: dict = Field(default_factory=dict)
+
 
 class RouterSchema(BaseModel):
     """Structured-output schema for the router node only (used via
