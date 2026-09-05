@@ -398,7 +398,11 @@ def _slide_uncleaned_data(all_issues: list) -> str:
 
 
 def _slides_issue_solution(tname: str, file_rec: dict) -> list[str]:
-    """One slide per resolved fail-level issue."""
+    """One slide per resolved fail-level issue, plus one combined slide per
+    resolved fail-level BATCH (Spec 4 — a group of 2+ issues that shared an
+    identical, mechanically-verified treatment and got one combined fix),
+    listing every issue the batch covered together rather than repeating one
+    near-identical slide per column."""
     slides = []
     fail_issues = file_rec.get("fail_issues", [])
     resolved_set = set(file_rec.get("issues_resolved", []))
@@ -422,6 +426,38 @@ def _slides_issue_solution(tname: str, file_rec: dict) -> list[str]:
             f'<div class="issue-box">'
             f'<div class="issue-label">Issue</div>'
             f'<div class="issue-text">{_esc(issue_text)}</div>'
+            f'</div>'
+            f'<div class="solution-box">'
+            f'<div class="solution-label">Solution</div>'
+            f'<div class="solution-text">{_esc(solution[:500])}</div>'
+            f'</div>'
+            f'</div>'
+        )
+
+    for batch in file_rec.get("fail_batches", []):
+        if batch.get("status") != "resolved":
+            continue
+        batch_issues = batch.get("issues", [])
+        if not batch_issues:
+            continue
+
+        reasoning = batch.get("reasoning_comments", [])
+        if reasoning:
+            solution = " ".join(
+                re.sub(r"^#\s*", "", c) for c in reasoning
+            ).strip()
+        else:
+            solution = "The issue was resolved — see full report for fix details."
+
+        issue_text = (
+            f"{len(batch_issues)} columns with the identical issue: " + "; ".join(batch_issues)
+        )
+        slides.append(
+            f'<div class="slide">'
+            f'<div class="label">Data Cleaning — {_esc(tname)}</div>'
+            f'<div class="issue-box">'
+            f'<div class="issue-label">Issue (batched, {len(batch_issues)} columns)</div>'
+            f'<div class="issue-text">{_esc(issue_text[:500])}</div>'
             f'</div>'
             f'<div class="solution-box">'
             f'<div class="solution-label">Solution</div>'

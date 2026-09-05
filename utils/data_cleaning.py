@@ -618,7 +618,14 @@ def _check_lost_leading_zeros(df: pd.DataFrame) -> list:
 
 def _check_currency_unit_symbols(df: pd.DataFrame) -> list:
     """Currency symbols or unit suffixes embedded in what is otherwise a numeric-looking
-    column (e.g. '$50.00', '50 kg' stored as text instead of a plain number)."""
+    column (e.g. '$50.00', '50 kg' stored as text instead of a plain number).
+
+    The specific symbols/suffixes actually found are named in the issue text (e.g.
+    "(['$'])" or "(['kg'])") — this is what lets _extract_currency_unit_symbols
+    (see the treatment-signature section below) tell apart two columns that
+    genuinely need the identical mechanical strip (same symbols/suffixes) from two
+    that merely share this category but need different literal characters removed.
+    """
     issues = []
     currency_pattern = re.compile(rf"^[{re.escape(CURRENCY_SYMBOLS)}]\s?\d")
     unit_pattern = re.compile(
@@ -633,9 +640,19 @@ def _check_currency_unit_symbols(df: pd.DataFrame) -> list:
         unit_matches = series.str.match(unit_pattern)
         total_matches = (currency_matches | unit_matches).sum()
         if total_matches:
+            found_symbols: set = set()
+            for val in series[currency_matches]:
+                for sym in CURRENCY_SYMBOLS:
+                    if sym in val:
+                        found_symbols.add(sym)
+            for val in series[unit_matches]:
+                unit_match = unit_pattern.match(val)
+                if unit_match:
+                    found_symbols.add(unit_match.group(2).lower())
             issues.append(
                 f"Currency/unit symbols: column '{col}' has {total_matches} value(s) with "
-                "a currency symbol or unit suffix embedded in an otherwise numeric value."
+                f"a currency symbol or unit suffix embedded in an otherwise numeric value "
+                f"({sorted(found_symbols)})."
             )
     return issues
 
@@ -1020,6 +1037,203 @@ def check_rubric(file_path) -> list:
     issues += _check_dangling_references(df)
 
     return issues
+
+
+# ---------------------------------------------------------------------------
+# Piece 1a: treatment signatures for batching fail/warn-level issues that require
+# IDENTICAL fixes across different columns (Spec 4).
+#
+# check_rubric()'s checks run per-column, so a dataset with the same underlying
+# problem in several columns (e.g. "-1" placeholder tokens in eight different
+# columns) produces eight separate issue strings. clean_dataset()'s fail-level
+# loop processes every fail-level issue strictly one at a time — its own LLM
+# call, its own approval prompt — even when the correct fix is identical logic
+# applied to a different column name.
+#
+# Two issues can only be batched together when a MECHANICALLY VERIFIED signature
+# proves their required treatment is identical — never an LLM's guess that two
+# issues "seem similar," and never for a category where "identical" isn't
+# actually well-defined yet (e.g. missing values legitimately needs a different
+# strategy above/below a 20% threshold, even within the same category — blurring
+# that into one LLM call risks silently applying the wrong strategy with no way
+# to detect it afterward). Categories with no signature defined below always
+# return None here and stay on the existing one-at-a-time path, unchanged.
+# ---------------------------------------------------------------------------
+
+_BRACKETED_QUOTED_LIST_RE = re.compile(r"\(\[(.+?)\]\)")
+
+
+def _extract_bracketed_quoted_list(issue: str) -> frozenset:
+    """Shared helper: extract a Python-list-repr-style bracketed, quoted token
+    list embedded in an issue string as "(['a', 'b'])" — the exact shape both
+    _check_placeholder_values (its found_tokens) and _check_boolean_inconsistency
+    (its families_used) already produce via an f-string embedding
+    `{sorted(some_list)}`. Matches only the FIRST such bracketed group in the
+    issue text (non-greedy), which is what both of those checks' message
+    formats place first.
+    """
+    match = _BRACKETED_QUOTED_LIST_RE.search(issue)
+    if not match:
+        return frozenset()
+    return frozenset(re.findall(r"'([^']*)'", match.group(1)))
+
+
+def _extract_placeholder_tokens(issue: str) -> frozenset:
+    """The exact placeholder tokens (e.g. {'-1', 'unknown'}) named in a
+    "Placeholder values: ..." issue string — same token vocabulary
+    _check_placeholder_values / report.py's _parse_placeholder_issue already
+    parse, extracted here as a frozenset for signature comparison."""
+    return _extract_bracketed_quoted_list(issue)
+
+
+def _extract_boolean_families(issue: str) -> frozenset:
+    """The exact conflicting boolean-token families (e.g. {'y/n', '1/0'}) named
+    in an "Inconsistent boolean representations: ..." issue string."""
+    return _extract_bracketed_quoted_list(issue)
+
+
+_CURRENCY_UNIT_SYMBOLS_RE = re.compile(r"embedded in an otherwise numeric value \(\[(.+?)\]\)")
+
+
+def _extract_currency_unit_symbols(issue: str) -> frozenset:
+    """The exact currency symbols/unit suffixes (e.g. {'$'}, {'kg'}) named in a
+    "Currency/unit symbols: ..." issue string (see _check_currency_unit_symbols,
+    which embeds them specifically so this extraction is possible)."""
+    match = _CURRENCY_UNIT_SYMBOLS_RE.search(issue)
+    if not match:
+        return frozenset()
+    return frozenset(re.findall(r"'([^']*)'", match.group(1)))
+
+
+def _extract_locale_format_pair(issue: str) -> frozenset:
+    """The exact pair of locale format labels (currently always {'US-style',
+    'EU-style'} — the only two this project's _check_locale_number_formatting
+    knows about) named in a "Locale-specific number formatting: ..." issue."""
+    found = set()
+    if "US-style" in issue:
+        found.add("US-style")
+    if "EU-style" in issue:
+        found.add("EU-style")
+    return frozenset(found)
+
+
+_LEADING_ZERO_LENGTH_RE = re.compile(r"common length \((\d+)\)")
+
+
+def _extract_leading_zero_target_length(issue: str) -> "int | None":
+    """The common/target digit length (e.g. 5 for a 5-digit zip code) named in
+    a "Lost leading zeros: ..." issue string."""
+    match = _LEADING_ZERO_LENGTH_RE.search(issue)
+    return int(match.group(1)) if match else None
+
+
+def _extract_spreadsheet_artifact_kind(issue: str) -> "str | None":
+    """"formula" or "excel_error" — the two distinct sub-kinds
+    _check_spreadsheet_artifacts' message text already distinguishes; a
+    literal-formula issue and an Excel-error-token issue need different fix
+    logic even within the same "Spreadsheet artifacts:" category, so they must
+    never share a signature."""
+    if "uncalculated spreadsheet formula" in issue:
+        return "formula"
+    if "literal Excel error strings" in issue:
+        return "excel_error"
+    return None
+
+
+def _issue_treatment_signature(issue: str) -> "tuple | None":
+    """Return a hashable signature identifying the exact fix treatment this
+    issue requires, or None if this issue type has no defined signature
+    (meaning: never group it — always process alone). Two issues with equal,
+    non-None signatures are guaranteed to require the identical fix operation,
+    not just a similar-looking one.
+
+    Defined for exactly six categories (see this section's module comment for
+    why these six and not others): "Placeholder values:", "Currency/unit
+    symbols:", "Spreadsheet artifacts:", "Locale-specific number formatting:",
+    "Inconsistent boolean representations:", "Lost leading zeros:". Every other
+    category — including missing values, wrong data types, duplicate rows/
+    values, invalid values, dangling references, inconsistent categorical
+    values, inconsistent delimiters, inconsistent granularity, formatting
+    noise, control characters, and the discovery-phase "(discovered)" issues —
+    returns None here and always stays on the one-at-a-time path.
+    """
+    if issue.startswith("Placeholder values:"):
+        tokens = _extract_placeholder_tokens(issue)
+        return ("placeholder", tokens) if tokens else None
+
+    if issue.startswith("Currency/unit symbols:"):
+        symbols = _extract_currency_unit_symbols(issue)
+        return ("currency_unit", symbols) if symbols else None
+
+    if issue.startswith("Spreadsheet artifacts:"):
+        kind = _extract_spreadsheet_artifact_kind(issue)
+        return ("spreadsheet_artifact", kind) if kind is not None else None
+
+    if issue.startswith("Locale-specific number formatting:"):
+        pair = _extract_locale_format_pair(issue)
+        return ("locale_format", pair) if pair else None
+
+    if issue.startswith("Inconsistent boolean representations:"):
+        families = _extract_boolean_families(issue)
+        return ("boolean_families", families) if families else None
+
+    if issue.startswith("Lost leading zeros:"):
+        length = _extract_leading_zero_target_length(issue)
+        return ("leading_zeros", length) if length is not None else None
+
+    return None
+
+
+def _group_issues_by_signature(issues: list) -> list:
+    """Partition issues into groups for processing. Issues whose
+    _issue_treatment_signature matches (non-None and equal) are grouped
+    together (2+ issues per group); every issue with signature None, or with a
+    signature unique among this file's issues, becomes its own single-item
+    group. Order of groups follows the order the first issue in each group was
+    originally found — preserves check_rubric's original ordering for anything
+    not grouped.
+    """
+    groups: dict = {}
+    order: list = []
+
+    for issue in issues:
+        sig = _issue_treatment_signature(issue)
+        if sig is None:
+            order.append(("single", issue))
+            continue
+        if sig not in groups:
+            groups[sig] = []
+            order.append(("group", sig))
+        groups[sig].append(issue)
+
+    result = []
+    for kind, value in order:
+        if kind == "single":
+            result.append([value])
+        else:
+            result.append(groups[value])
+    return result
+
+
+def _partition_warn_groups(warn_issues: list) -> list:
+    """Warn-level counterpart to the fail-level grouping above, but with one
+    deliberate difference: warn-level issues have ALWAYS been processed as one
+    single combined batch (unlike fail-level, which was always one-at-a-time) —
+    Spec 4 only carves real structure OUT of that existing default, it doesn't
+    replace it. So: any _group_issues_by_signature group with 2+ issues (a
+    genuine, mechanically-verified shared treatment) becomes its own batch: but
+    every group of size 1 — signature None, or a signature that happened not to
+    match any other warn issue in this file — is pooled back together into ONE
+    final combined batch, preserving the original "always one whole-file warn
+    batch" behavior for anything that isn't a genuine multi-issue signature
+    match. Returns [] for an empty input (no warn issues at all).
+    """
+    if not warn_issues:
+        return []
+    raw_groups = _group_issues_by_signature(warn_issues)
+    real_batches = [g for g in raw_groups if len(g) >= 2]
+    leftover = [issue for g in raw_groups if len(g) < 2 for issue in g]
+    return real_batches + [leftover] if leftover else real_batches
 
 
 # ---------------------------------------------------------------------------
@@ -1592,9 +1806,15 @@ class IssueCleaningRecord:
 
 @dataclass
 class WarnBatchRecord:
-    """The batched outcome of every warn-level issue in a file, processed together in
-    one combined generate -> approve -> execute -> re-check cycle — unchanged in
-    spirit from the original whole-file design, just scoped to warn-level issues only.
+    """The batched outcome of a group of warn-level issues in a file, processed
+    together in one combined generate -> approve -> execute -> re-check cycle.
+
+    A file can now have MULTIPLE WarnBatchRecords (Spec 4): _group_issues_by_signature
+    carves out its own batch for any set of 2+ warn issues sharing a real, mechanically-
+    verified treatment signature (see _issue_treatment_signature); everything left over
+    (signature None, or a signature unique among this file's warn issues) is pooled back
+    into ONE final combined batch, preserving the original pre-Spec-4 "always one
+    whole-file warn batch" behavior for anything that isn't a genuine signature match.
 
     status: "no_warn_issues" (nothing warn-level was flagged for this file — no clone
     mutation, no LLM call, no approval prompt happened for this stage) | "resolved" |
@@ -1611,6 +1831,46 @@ class WarnBatchRecord:
 
 
 @dataclass
+class FailBatchRecord:
+    """The batched outcome of 2+ fail-level issues sharing an identical treatment
+    signature (Spec 4 — see _issue_treatment_signature / _group_issues_by_signature),
+    processed together in one combined generate -> approve -> execute -> re-check
+    cycle — the same _clean_issue_group already used for a single fail-level issue
+    or the warn-level batch, just called with more than one issue this time.
+
+    signature: the treatment signature (e.g. ("placeholder", frozenset({'-1'})))
+    that made these issues eligible to group — stored for transparency in logs/
+    reports, not just internal bookkeeping (see _signature_to_jsonable for how this
+    is serialized into cleaning_log.jsonl, since a signature may contain a frozenset).
+
+    status/attempts/error/remaining_issues/generated_code: same meanings and same
+    status vocabulary as IssueCleaningRecord and WarnBatchRecord
+    ("resolved" | "skipped_declined" | "skipped_failed" | "skipped_incomplete").
+    """
+
+    issues: list = field(default_factory=list)
+    signature: "tuple | None" = None
+    status: str = ""
+    attempts: int = 0
+    error: str = ""
+    remaining_issues: list = field(default_factory=list)
+    generated_code: str = ""
+
+
+def _signature_to_jsonable(signature: "tuple | None"):
+    """Convert a treatment signature (which may contain a frozenset — not
+    JSON-serializable on its own) into a plain, JSON-serializable form for the
+    cleaning log, e.g. ("placeholder", frozenset({'-1'})) -> ["placeholder", ["-1"]].
+    """
+    if signature is None:
+        return None
+    kind, payload = signature
+    if isinstance(payload, frozenset):
+        return [kind, sorted(payload)]
+    return [kind, payload]
+
+
+@dataclass
 class FileCleaningRecord:
     """One file's outcome from clean_dataset(): either cleaned, or skipped.
 
@@ -1620,13 +1880,22 @@ class FileCleaningRecord:
     callers) that only cares about "what was wrong with this file", not how each
     issue was individually processed.
 
-    fail_issue_records: list[IssueCleaningRecord], one per fail-level issue, in the
-    order they were processed (== the order check_rubric() found them) — empty if
-    this file had no fail-level issues at all.
+    fail_issue_records: list[IssueCleaningRecord], one per SINGLE (ungrouped)
+    fail-level issue, in the order they were processed (== the order check_rubric()
+    found them) — empty if this file had no ungrouped fail-level issues.
 
-    warn_batch: WarnBatchRecord for the batched warn-level pass, or None if the file's
-    processing was declined before ever reaching the warn-level stage (mid-way through
-    the fail-level loop).
+    fail_batch_records: list[FailBatchRecord] (Spec 4), one per GROUP of 2+
+    fail-level issues sharing an identical treatment signature — empty if this
+    file had no such groups. An issue that got grouped appears in exactly one
+    FailBatchRecord.issues and never ALSO as a standalone IssueCleaningRecord —
+    every fail-level issue lives in exactly one of fail_issue_records /
+    fail_batch_records, never both, so attempts/summaries are never double-counted.
+
+    warn_batches: list[WarnBatchRecord] (Spec 4 — plural; was a single optional
+    WarnBatchRecord before this spec). Empty list if the file's processing was
+    declined before ever reaching the warn-level stage (mid-way through the
+    fail-level loop) — see WarnBatchRecord's own docstring for why there can now
+    be more than one.
 
     status / attempts / error: an aggregate/overall view for this file — status is
     "cleaned" (final full re-check passed cleanly), "skipped_declined" (the user
@@ -1634,9 +1903,9 @@ class FileCleaningRecord:
     file stops at that point, same as the original whole-file design's decline
     semantics), or "skipped_incomplete" (every issue/batch got its full, individually-
     scoped chance, but the final full check_rubric() pass still found at least one of
-    the file's original issues present). attempts is the sum of every fail-issue's and
-    the warn-batch's individual attempt counts, for a quick "how much retrying did
-    this file need in total" figure.
+    the file's original issues present). attempts is the sum of every fail-issue's,
+    fail-batch's, and warn-batch's individual attempt counts, for a quick "how much
+    retrying did this file need in total" figure.
 
     Post-cleaning-validation fields (final, whole-file check — a report/audit of the
     complete result after every issue already got its own appropriately-scoped retry
@@ -1670,7 +1939,8 @@ class FileCleaningRecord:
     file_name: str
     issues: list = field(default_factory=list)
     fail_issue_records: list = field(default_factory=list)
-    warn_batch: WarnBatchRecord | None = None
+    fail_batch_records: list = field(default_factory=list)
+    warn_batches: list = field(default_factory=list)
     status: str = ""  # "cleaned" | "skipped_declined" | "skipped_incomplete"
     attempts: int = 0
     error: str = ""
@@ -1694,25 +1964,25 @@ def unresolved_issues_for_record(rec: "FileCleaningRecord") -> list:
     For "skipped_declined" files, that final re-check never ran (processing stopped
     the moment the user declined), so rec.remaining_issues is just its unused default
     ([]). This falls back to a bookkeeping computation instead: every original issue
-    EXCEPT ones individually confirmed "resolved" before the decline point (a
-    fail-level issue with its own IssueCleaningRecord.status == "resolved", or every
-    warn-level issue if the whole warn batch resolved) counts as still unresolved.
+    EXCEPT ones individually confirmed "resolved" before the decline point counts as
+    still unresolved — a fail-level issue with its own IssueCleaningRecord.status ==
+    "resolved", every issue in a FailBatchRecord whose status == "resolved" (Spec 4:
+    a resolved batch means ALL of its member issues were fixed together), or every
+    issue in a WarnBatchRecord whose status == "resolved" (now checked across
+    potentially several warn_batches, not just one).
     """
     if rec.status != "skipped_declined":
         return rec.remaining_issues
 
-    resolved_fail_issues = {r.issue for r in rec.fail_issue_records if r.status == "resolved"}
-    warn_batch_resolved = rec.warn_batch is not None and rec.warn_batch.status == "resolved"
-    warn_issue_set = set(rec.warn_batch.issues) if rec.warn_batch is not None else set()
+    resolved_issues: set = {r.issue for r in rec.fail_issue_records if r.status == "resolved"}
+    for batch in rec.fail_batch_records:
+        if batch.status == "resolved":
+            resolved_issues.update(batch.issues)
+    for batch in rec.warn_batches:
+        if batch.status == "resolved":
+            resolved_issues.update(batch.issues)
 
-    unresolved = []
-    for issue in rec.issues:
-        if issue in resolved_fail_issues:
-            continue
-        if warn_batch_resolved and issue in warn_issue_set:
-            continue
-        unresolved.append(issue)
-    return unresolved
+    return [issue for issue in rec.issues if issue not in resolved_issues]
 
 
 def _issue_outcome_line(status: str, attempts: int, error: str) -> str:
@@ -1744,8 +2014,9 @@ class CleaningResult:
 
     def _file_detail_lines(self, rec: "FileCleaningRecord") -> list:
         """Shared detail rendering for one file's fail-issue-by-fail-issue outcomes,
-        the warn-batch outcome, and the final overall check — used for both cleaned
-        and skipped files so the same real information is visible either way."""
+        any fail-level batches (Spec 4), the warn-level batch(es), and the final
+        overall check — used for both cleaned and skipped files so the same real
+        information is visible either way."""
         lines = []
         if rec.fail_issue_records:
             lines.append("        Fail-level issues (processed individually):")
@@ -1753,11 +2024,22 @@ class CleaningResult:
                 outcome = _issue_outcome_line(issue_rec.status, issue_rec.attempts, issue_rec.error)
                 lines.append(f"          * {issue_rec.issue}")
                 lines.append(f"              -> {outcome}")
-        if rec.warn_batch is not None and rec.warn_batch.status != "no_warn_issues":
-            lines.append("        Warn-level issues (batched together):")
-            for issue in rec.warn_batch.issues:
+        for batch_rec in rec.fail_batch_records:
+            lines.append(
+                f"        Fail-level issues (batched together, {len(batch_rec.issues)} identical, "
+                f"signature={_signature_to_jsonable(batch_rec.signature)}):"
+            )
+            for issue in batch_rec.issues:
                 lines.append(f"          * {issue}")
-            outcome = _issue_outcome_line(rec.warn_batch.status, rec.warn_batch.attempts, rec.warn_batch.error)
+            outcome = _issue_outcome_line(batch_rec.status, batch_rec.attempts, batch_rec.error)
+            lines.append(f"              -> batch {outcome}")
+        for warn_batch in rec.warn_batches:
+            if warn_batch.status == "no_warn_issues":
+                continue
+            lines.append(f"        Warn-level issues (batched together, {len(warn_batch.issues)}):")
+            for issue in warn_batch.issues:
+                lines.append(f"          * {issue}")
+            outcome = _issue_outcome_line(warn_batch.status, warn_batch.attempts, warn_batch.error)
             lines.append(f"              -> batch {outcome}")
         if rec.status != "skipped_declined":
             if rec.rubric_recheck_passed:
@@ -2836,13 +3118,22 @@ def _append_cleaning_log(result: "CleaningResult", source_folder: str, trigger: 
                     "reasoning_comments": _extract_reasoning_comments(fir.generated_code),
                 })
 
-            warn_entry = None
-            if rec.warn_batch is not None:
-                warn_entry = {
-                    "issues": rec.warn_batch.issues,
-                    "status": rec.warn_batch.status,
-                    "reasoning_comments": _extract_reasoning_comments(rec.warn_batch.generated_code),
-                }
+            fail_batch_entries = []
+            for fbr in rec.fail_batch_records:
+                fail_batch_entries.append({
+                    "issues": fbr.issues,
+                    "signature": _signature_to_jsonable(fbr.signature),
+                    "status": fbr.status,
+                    "reasoning_comments": _extract_reasoning_comments(fbr.generated_code),
+                })
+
+            warn_batch_entries = []
+            for wb in rec.warn_batches:
+                warn_batch_entries.append({
+                    "issues": wb.issues,
+                    "status": wb.status,
+                    "reasoning_comments": _extract_reasoning_comments(wb.generated_code),
+                })
 
             issues_resolved = [i for i in rec.issues if i not in (rec.remaining_issues or [])]
             files.append({
@@ -2856,7 +3147,8 @@ def _append_cleaning_log(result: "CleaningResult", source_folder: str, trigger: 
                 "issues_resolved": issues_resolved,
                 "issues_still_unresolved": list(rec.remaining_issues or []),
                 "fail_issues": fail_entries,
-                "warn_batch": warn_entry,
+                "fail_batches": fail_batch_entries,
+                "warn_batches": warn_batch_entries,
             })
 
         entry = {
@@ -2878,21 +3170,32 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
     split its issues into fail-level and warn-level (see FAIL_LEVEL_PREFIXES /
     WARN_LEVEL_PREFIXES), and for any file with real issues:
 
-    1. Process EACH fail-level issue individually, one at a time, in the order
-       check_rubric() found them: its own generate -> approve -> execute -> immediate
-       re-check (scoped to just that one issue) -> retry cycle, capped at
-       MAX_CLEAN_ATTEMPTS for that issue specifically (see _clean_issue_group). If one
-       fail-level issue is declined, the rest of the file's processing (remaining
-       fail-level issues, the warn-level batch, the final check) is skipped entirely —
-       same decline semantics as the original whole-file design. If a fail-level issue
-       is NOT declined but still can't be resolved (a real execution error every
-       attempt, or the issue's still detectably present every attempt), it's recorded
-       as skipped for that one issue and processing moves on to the next fail-level
-       issue — one unresolved issue never aborts the rest of the file.
-    2. Once every fail-level issue has been individually processed (and none were
-       declined), batch every warn-level issue into ONE combined generate -> approve
-       -> execute -> re-check cycle, same as the original whole-file design, just
-       scoped to warn-level issues only.
+    1. Fail-level issues are first grouped by treatment signature (Spec 4 —
+       _group_issues_by_signature / _issue_treatment_signature): a group of 2+
+       issues sharing an identical, mechanically-verified fix requirement (e.g. the
+       same placeholder tokens, or the same currency symbol, in different columns)
+       gets ONE combined generate -> approve -> execute -> re-check cycle
+       (-> FailBatchRecord); everything else — no defined signature, or a signature
+       that happens to be unique among this file's fail issues — is still processed
+       individually, one at a time, in the order check_rubric() found them, exactly
+       as before (-> IssueCleaningRecord). Either way it's the same
+       generate -> approve -> execute -> immediate re-check -> retry cycle, capped at
+       MAX_CLEAN_ATTEMPTS for that issue/group specifically (see _clean_issue_group).
+       If one fail-level issue/group is declined, the rest of the file's processing
+       (remaining fail-level issues/groups, the warn-level batches, the final check)
+       is skipped entirely — same decline semantics as the original whole-file
+       design. If a fail-level issue/group is NOT declined but still can't be
+       resolved (a real execution error every attempt, or still detectably present
+       every attempt), it's recorded as skipped and processing moves on to the next
+       one — one unresolved issue/group never aborts the rest of the file.
+    2. Once every fail-level issue/group has been processed (and none were
+       declined), warn-level issues are similarly grouped by signature
+       (_partition_warn_groups) — but preserving the pre-Spec-4 default: any group of
+       2+ issues sharing a real signature gets its own combined cycle
+       (-> its own WarnBatchRecord), while everything else is still pooled into ONE
+       final combined batch, exactly the original "always one whole-file warn batch"
+       behavior for anything that isn't a genuine multi-issue signature match. A file
+       can therefore now have MULTIPLE WarnBatchRecords, not just one.
     3. Run a final, full check_rubric() pass across the complete result (unless
        something above was declined) and compare row counts before vs. after — exactly
        the same post-cleaning validation and row-count-loss check as before this
@@ -2949,45 +3252,76 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
 
         total_attempts = 0
         fail_issue_records: list = []
-        warn_batch: WarnBatchRecord | None = None
+        fail_batch_records: list = []
+        warn_batches: list = []
         declined = False
 
-        # Step 2: each fail-level issue gets its OWN generate/approve/execute/re-check
-        # cycle, one at a time, in the order check_rubric() found them — never batched
-        # together with the others.
-        for issue in fail_issues:
-            status, attempts, error, _remaining, code = _clean_issue_group(
-                cloned_path, [issue], resolved_llm, pattern_lookup=pattern_lookup
+        # Step 2: fail-level issues, grouped by treatment signature first (Spec 4) —
+        # a group of 2+ issues sharing an identical, mechanically-verified signature
+        # (see _issue_treatment_signature) gets ONE combined generate/approve/execute/
+        # re-check cycle (-> FailBatchRecord); everything else (no signature, or a
+        # signature unique among this file's fail issues) is still processed exactly
+        # as before — its own cycle, one at a time (-> IssueCleaningRecord), in the
+        # order check_rubric() found them.
+        for group in _group_issues_by_signature(fail_issues):
+            status, attempts, error, remaining, code = _clean_issue_group(
+                cloned_path, group, resolved_llm, pattern_lookup=pattern_lookup
             )
             total_attempts += attempts
-            fail_issue_records.append(
-                IssueCleaningRecord(issue=issue, status=status, attempts=attempts, error=error, generated_code=code)
-            )
+            if len(group) == 1:
+                fail_issue_records.append(
+                    IssueCleaningRecord(
+                        issue=group[0], status=status, attempts=attempts, error=error, generated_code=code
+                    )
+                )
+            else:
+                fail_batch_records.append(
+                    FailBatchRecord(
+                        issues=group,
+                        signature=_issue_treatment_signature(group[0]),
+                        status=status,
+                        attempts=attempts,
+                        error=error,
+                        remaining_issues=remaining,
+                        generated_code=code,
+                    )
+                )
             if status == "skipped_declined":
                 declined = True
                 break
             # skipped_failed / skipped_incomplete: report and continue to the next
-            # fail-level issue — one unresolved issue never aborts the rest of the file.
+            # fail-level issue/group — one unresolved issue/group never aborts the
+            # rest of the file.
 
-        # Step 3: every warn-level issue, batched into one combined cycle — unchanged
-        # from the original whole-file design, just scoped to warn-level issues only.
-        # Skipped entirely if a fail-level issue was declined above.
+        # Step 3: warn-level issues, similarly grouped by signature (Spec 4), but
+        # preserving the pre-Spec-4 default: anything NOT part of a genuine 2+-issue
+        # signature match is still pooled into one final combined batch, exactly the
+        # original "always one whole-file warn batch" behavior — see
+        # _partition_warn_groups. Skipped entirely if a fail-level issue was declined
+        # above.
         if not declined:
-            if warn_issues:
-                status, attempts, error, remaining, code = _clean_issue_group(cloned_path, warn_issues, resolved_llm)
-                total_attempts += attempts
-                warn_batch = WarnBatchRecord(
-                    issues=warn_issues,
-                    status=status,
-                    attempts=attempts,
-                    error=error,
-                    remaining_issues=remaining,
-                    generated_code=code,
-                )
-                if status == "skipped_declined":
-                    declined = True
+            warn_groups = _partition_warn_groups(warn_issues)
+            if warn_groups:
+                for group in warn_groups:
+                    status, attempts, error, remaining, code = _clean_issue_group(
+                        cloned_path, group, resolved_llm
+                    )
+                    total_attempts += attempts
+                    warn_batches.append(
+                        WarnBatchRecord(
+                            issues=group,
+                            status=status,
+                            attempts=attempts,
+                            error=error,
+                            remaining_issues=remaining,
+                            generated_code=code,
+                        )
+                    )
+                    if status == "skipped_declined":
+                        declined = True
+                        break
             else:
-                warn_batch = WarnBatchRecord(issues=[], status="no_warn_issues")
+                warn_batches = [WarnBatchRecord(issues=[], status="no_warn_issues")]
 
         # Spec 3: purely informational scan for structured-decomposition candidates
         # (e.g. a salary/revenue range column) against the file's REAL current
@@ -3006,7 +3340,8 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
                     file_name=file_path.name,
                     issues=issues,
                     fail_issue_records=fail_issue_records,
-                    warn_batch=warn_batch,
+                    fail_batch_records=fail_batch_records,
+                    warn_batches=warn_batches,
                     status="skipped_declined",
                     attempts=total_attempts,
                     structured_decomposition_candidates=structured_decomposition_candidates,
@@ -3030,7 +3365,8 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
             file_name=file_path.name,
             issues=issues,
             fail_issue_records=fail_issue_records,
-            warn_batch=warn_batch,
+            fail_batch_records=fail_batch_records,
+            warn_batches=warn_batches,
             attempts=total_attempts,
             rubric_recheck_passed=not still_present,
             remaining_issues=still_present,

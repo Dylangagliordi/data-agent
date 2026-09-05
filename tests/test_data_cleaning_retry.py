@@ -101,8 +101,8 @@ assert len(rec1.fail_issue_records) == 1, (
 issue_rec = rec1.fail_issue_records[0]
 assert issue_rec.status == "resolved", f"expected the fail-level issue resolved, got {issue_rec.status}"
 assert issue_rec.attempts == 2, f"expected the fail-level issue took 2 attempts, got {issue_rec.attempts}"
-assert rec1.warn_batch is not None and rec1.warn_batch.status == "no_warn_issues", (
-    f"expected no warn-level issues for this fixture, got {rec1.warn_batch}"
+assert len(rec1.warn_batches) == 1 and rec1.warn_batches[0].status == "no_warn_issues", (
+    f"expected no warn-level issues for this fixture, got {rec1.warn_batches}"
 )
 print("PASS: file cleaned successfully on attempt 2 after a real forced failure on attempt 1, "
       "correctly attributed to the single fail-level issue's own record.")

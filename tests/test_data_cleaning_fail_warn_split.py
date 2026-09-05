@@ -135,11 +135,11 @@ print("PASS: first issue correctly resolved, second correctly skipped after exha
 # Critically: processing did NOT abort after the second issue's failure -- it reached
 # the warn-level stage (there are none in this fixture, so it's reported as such) and
 # the final overall check, rather than the file record being cut short.
-assert rec2.warn_batch is not None, (
+assert len(rec2.warn_batches) == 1, (
     "expected processing to continue to the warn-level stage rather than aborting "
     "over the one unresolved fail-level issue"
 )
-assert rec2.warn_batch.status == "no_warn_issues"
+assert rec2.warn_batches[0].status == "no_warn_issues"
 assert rec2.remaining_issues == [negative_issue], (
     f"expected only the still-broken issue in the final remaining_issues, got: {rec2.remaining_issues}"
 )
@@ -173,8 +173,8 @@ print(f"PASS: {prompt_count3} approval prompt confirmed — both warn-level issu
 assert len(result3.cleaned_files) == 1, f"expected 1 cleaned file, got: {result3.cleaned_files + result3.skipped_files}"
 rec3 = result3.cleaned_files[0]
 assert rec3.fail_issue_records == [], f"expected no fail-level issue records, got: {rec3.fail_issue_records}"
-assert rec3.warn_batch is not None and rec3.warn_batch.status == "resolved"
-assert len(rec3.warn_batch.issues) == 2
+assert len(rec3.warn_batches) == 1 and rec3.warn_batches[0].status == "resolved"
+assert len(rec3.warn_batches[0].issues) == 2
 print("PASS: file with only warn-level issues processed as one single batched pass.\n")
 
 print("=" * 70)

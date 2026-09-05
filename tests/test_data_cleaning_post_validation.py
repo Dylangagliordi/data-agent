@@ -123,10 +123,12 @@ print(result2.summary())
 assert len(result2.cleaned_files) == 1, f"expected 1 cleaned file, got: {result2.cleaned_files + result2.skipped_files}"
 rec2 = result2.cleaned_files[0]
 assert len(rec2.fail_issue_records) == 1 and rec2.fail_issue_records[0].status == "resolved"
-assert rec2.warn_batch is not None
-assert rec2.warn_batch.status == "resolved", f"expected the warn batch eventually resolved, got: {rec2.warn_batch}"
-assert rec2.warn_batch.attempts == 2, (
-    f"expected the warn batch to need 2 attempts (first was a no-op), got {rec2.warn_batch.attempts}"
+assert len(rec2.warn_batches) == 1
+assert rec2.warn_batches[0].status == "resolved", (
+    f"expected the warn batch eventually resolved, got: {rec2.warn_batches[0]}"
+)
+assert rec2.warn_batches[0].attempts == 2, (
+    f"expected the warn batch to need 2 attempts (first was a no-op), got {rec2.warn_batches[0].attempts}"
 )
 assert rec2.rubric_recheck_passed is True
 print("PASS: post-cleaning re-check caught the still-present warn-level issue after a "

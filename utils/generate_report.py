@@ -528,28 +528,68 @@ def _section_data_cleaning(cleaning_map: dict) -> str:
                 "<h4 style='margin-top:18px'>Critical Issues — Checked and Resolved in Sequence</h4>"
             )
 
-            # Build a lookup from issue text → fail_issues detail record.
+            # Build a lookup from issue text → fail_issues detail record (ungrouped
+            # issues), and a second lookup from issue text → the FailBatchRecord dict
+            # it belongs to, if any (Spec 4 — a group of 2+ issues that shared an
+            # identical, mechanically-verified treatment and got one combined fix).
             fail_detail_map = {fi["issue"]: fi for fi in file_rec.get("fail_issues", [])}
+            batch_by_issue = {}
+            for batch in file_rec.get("fail_batches", []):
+                for batch_issue_text in batch.get("issues", []):
+                    batch_by_issue[batch_issue_text] = batch
             resolved_set = set(file_rec.get("issues_resolved", []))
+            rendered_batch_ids: set = set()
 
-            for idx, iss in enumerate(fail_issues_found, 1):
+            idx = 0
+            for iss in fail_issues_found:
                 issue_text = iss.get("issue", "")
-                detail = fail_detail_map.get(issue_text, {})
-                is_resolved = issue_text in resolved_set
-                reasoning = detail.get("reasoning_comments", [])
+                batch = batch_by_issue.get(issue_text)
 
-                outcome_label = (
-                    "<span class='ok'>&#x2713; Resolved</span>"
-                    if is_resolved
-                    else "<span class='bad'>&#x2717; Unresolved</span>"
-                )
-                block_cls = "resolved-block" if is_resolved else "issue-block"
+                if batch is not None:
+                    # One combined block per batch — replaces the N-near-identical-
+                    # blocks problem: render it once, the first time any of its
+                    # member issues is encountered, listing every issue it covered.
+                    if id(batch) in rendered_batch_ids:
+                        continue
+                    rendered_batch_ids.add(id(batch))
+                    idx += 1
+                    batch_issues = batch.get("issues", [])
+                    is_resolved = batch.get("status") == "resolved"
+                    reasoning = batch.get("reasoning_comments", [])
 
-                parts.append(f"<div class='{block_cls}'>")
-                parts.append(
-                    f"<p><strong>Issue {idx}:</strong> {_esc(issue_text)}</p>"
-                    f"<p><strong>Outcome:</strong> {outcome_label}</p>"
-                )
+                    outcome_label = (
+                        "<span class='ok'>&#x2713; Resolved</span>"
+                        if is_resolved
+                        else "<span class='bad'>&#x2717; Unresolved</span>"
+                    )
+                    block_cls = "resolved-block" if is_resolved else "issue-block"
+
+                    parts.append(f"<div class='{block_cls}'>")
+                    parts.append(
+                        f"<p><strong>Issue {idx} "
+                        f"(identical fix applied across {len(batch_issues)} columns):</strong></p>"
+                        "<ul>" + "".join(f"<li>{_esc(bi)}</li>" for bi in batch_issues) + "</ul>"
+                        f"<p><strong>Outcome:</strong> {outcome_label}</p>"
+                    )
+                else:
+                    idx += 1
+                    detail = fail_detail_map.get(issue_text, {})
+                    is_resolved = issue_text in resolved_set
+                    reasoning = detail.get("reasoning_comments", [])
+
+                    outcome_label = (
+                        "<span class='ok'>&#x2713; Resolved</span>"
+                        if is_resolved
+                        else "<span class='bad'>&#x2717; Unresolved</span>"
+                    )
+                    block_cls = "resolved-block" if is_resolved else "issue-block"
+
+                    parts.append(f"<div class='{block_cls}'>")
+                    parts.append(
+                        f"<p><strong>Issue {idx}:</strong> {_esc(issue_text)}</p>"
+                        f"<p><strong>Outcome:</strong> {outcome_label}</p>"
+                    )
+
                 if reasoning:
                     clean_comments = "\n".join(
                         re.sub(r"^#\s*", "", c) for c in reasoning
@@ -575,17 +615,20 @@ def _section_data_cleaning(cleaning_map: dict) -> str:
                 parts.append(f"<li>{marker} {_esc(issue_text)}</li>")
             parts.append("</ul>")
 
-            wb = file_rec.get("warn_batch") or {}
-            warn_reasoning = wb.get("reasoning_comments", [])
-            if warn_reasoning:
-                clean_warn = "\n".join(
-                    re.sub(r"^#\s*", "", c) for c in warn_reasoning
-                ).strip()
-                if clean_warn:
-                    parts.append(
-                        f"<p><strong>Fix reasoning:</strong></p>"
-                        f"<pre>{_esc(clean_warn)}</pre>"
-                    )
+            # One or more warn batches (Spec 4 — a file can now have multiple, when
+            # some warn issues shared a real treatment signature separately from the
+            # rest); render each batch's own fix reasoning in turn.
+            for wb in file_rec.get("warn_batches") or []:
+                warn_reasoning = wb.get("reasoning_comments", [])
+                if warn_reasoning:
+                    clean_warn = "\n".join(
+                        re.sub(r"^#\s*", "", c) for c in warn_reasoning
+                    ).strip()
+                    if clean_warn:
+                        parts.append(
+                            f"<p><strong>Fix reasoning ({len(wb.get('issues', []))} issue(s)):</strong></p>"
+                            f"<pre>{_esc(clean_warn)}</pre>"
+                        )
 
         # ── Step 4: Row counts before / after ─────────────────────────────────
         if rb is not None and ra is not None:
