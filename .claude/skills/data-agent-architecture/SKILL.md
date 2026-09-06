@@ -400,6 +400,24 @@ build_visualization → END
 
 ---
 
+### `utils/sql_transform_extraction.py` — Question-specific SQL shaping (shared)
+
+Public API: `extract_question_transformations(sql_query: str) -> dict`, `has_any_transformation(transformations: dict) -> bool`.
+
+Deterministic (no LLM) parse of a single generated SQL query, used by BOTH `generate_report.py` (`_section_question_transformations`) and `generate_presentation.py` (`_slide_question_shaping`) so this nontrivial parsing logic has exactly one implementation — unlike the small, cheap result-row/column helpers those two modules deliberately keep as independent copies. Separates the transformations unique to shaping data for a SPECIFIC business question from the general, dataset-wide cleaning already tracked in `cleaning_log.jsonl`.
+
+Returns a dict with:
+- `cte_steps` — ordered CTE names from a leading `WITH` clause, extracted paren-depth-aware (`_extract_cte_names`) so a comma inside a nested `AS (...)` body never miscounts as a CTE separator.
+- `computed_columns` — `[{"alias", "expression"}, ...]`, one per real `<expr> AS <alias>` SELECT-list item (across every CTE and the final query, deduped by alias) that has real arithmetic/`CASE`/aggregate structure — a bare column passthrough (`SELECT industry AS industry`) is excluded via `_BARE_COLUMN_RE` + `_ARITHMETIC_RE`.
+- `grouping_columns` — one list of column names per distinct real `GROUP BY` clause, paren-depth-aware split (`_split_top_level`) so `AVG((a+b)/2.0)` in the SELECT list doesn't confuse the parser.
+- `having_threshold` — the `N` from `HAVING COUNT(*) >= N`, or `None`.
+- `ranking_stages` — `[{"order_by", "limit"}, ...]`, one per real `ORDER BY` clause in appearance order — a query that ranks-and-caps in an intermediate CTE then re-sorts in the final `SELECT` produces two stages.
+- `scope_filters` — plain-English topic-scope descriptions from `ILIKE`/`LIKE` pattern matches and positive `=`/`IN` filters against real literals. Deliberately EXCLUDES `IS NOT NULL`/`IS NULL` checks and placeholder `<>`/`NOT IN` exclusions (`_PLACEHOLDER_LITERALS`, same list as `generate_report.py`'s `_extract_query_assumptions`) — those describe general data-quality cleaning, not this question's specific scope, and are already covered by the Data Cleaning section/slides.
+
+`has_any_transformation(t)` is `True` iff any of the above fields is non-empty/non-None — callers use it to render an honest "no additional shaping was needed" note (report) or skip the slide entirely (presentation) for a plain passthrough query, rather than showing an empty section.
+
+---
+
 ### `utils/generate_presentation.py` — HTML slideshow generator
 
 Public API: `generate_presentation(entry: dict) -> str` (returns path to written `.html`).
@@ -408,6 +426,7 @@ Writes vanilla-JS slideshows to `presentations/<slug>_<timestamp>.html`. Slide s
 - Always present: Title, "What are we exploring?", Summary ("Key Takeaways")
 - sql_analyst entries: Question slide added
 - Cleaning history present: Uncleaned Data + Issue/Solution + Cleaned Data slides (omitted entirely when no cleaning history exists for the queried tables). `_slides_issue_solution(tname, file_rec, llm=None)` builds one slide per resolved fail-level issue from `file_rec["fail_issues"]`, PLUS (Spec 4) one combined slide per resolved entry in `file_rec["fail_batches"]` — listing the batch's covered issues/columns together and showing its shared reasoning once, rather than one near-identical slide per column. When `llm` is given, the raw code-comment-style solution text for every issue/batch on that table is rewritten into plain, conversational language via ONE batched call (`_simplify_cleaning_narratives`, `---`-separated response parsed back onto the real issues by position) — never one LLM call per slide; falls back to the original raw text unchanged whenever the call fails or its response doesn't map 1:1 onto the real issue count.
+- `_slide_question_shaping(sql_query)` slide, "How we shaped the data for this answer" (optional, right after Cleaned Data, before "Making sense of the categories"): calls the shared `utils/sql_transform_extraction.extract_question_transformations(sql_query)` (same module used by `generate_report.py`, see below) and renders the CTE step chain, computed-metric formulas, GROUP BY column(s), `HAVING COUNT(*) >=` minimum sample size, and ORDER BY/LIMIT ranking stages — the transformations unique to shaping data for THIS question, kept separate from the general cleaning slides above. Returns `None` (slide omitted) via `has_any_transformation` when the query is a plain passthrough with nothing to show; present for both `sql_analyst` and `visualize` entries alike.
 - visualize entries, "Making sense of the categories" slide (optional, before Visualization): `_resolve_category_values(entry)` deterministically re-parses the already-executed `sql_query_execution_result` (own copy of the `{"columns","rows","truncated"}` parser, not imported cross-module) and picks the first non-numeric column as the real category column — no LLM in this step. Its distinct values (capped at `_MAX_GLOSSARY_TERMS = 12`) go to `_generate_glossary`, ONE LLM call that explains what each label generally MEANS in everyday terms (e.g. what "Staffing & Outsourcing" is) — explicitly framed as general background knowledge, not a claim about the dataset, and never invents a number. Slide omitted entirely if the result has no non-numeric column or the LLM response doesn't parse into `label :: explanation` lines.
 - visualize entries: Visualization slide with chart embedded as base64 `<img>`; "Why this chart type" section added when `chart_type_source == "reasoned"`
 - visualize entries, "Scatter, sized by volume" slide (optional, after Visualization): `_resolve_scatter_columns(entry)` deterministically re-parses the SAME already-executed result (never a fresh query) and requires the real shape to have one non-numeric category column, a count-like numeric column (matched via `_COUNT_COL_RE`, e.g. `job_count`/`n`/`num_*`), and at least two OTHER numeric measure columns — returns `None` (slide omitted) otherwise. `_render_scatter_chart_b64` renders an in-memory matplotlib scatter (own `Figure`/`FigureCanvasAgg`, no global pyplot, same discipline as `agents/sql_analyst.py`'s chart renderers) with point size scaled from the count column, annotated with the real category labels, and returns base64 PNG bytes straight from a `BytesIO` buffer (no temp file). Gives a second, volume-aware view of the exact same result already shown in the bar chart — e.g. distinguishing a category perched on an extreme value backed by very few real records from one backed by many.
@@ -425,12 +444,13 @@ JS navigation: `show(n)`, ArrowRight/ArrowLeft keyboard support, `show(0)` on lo
 
 Public API: `generate_report(entry: dict) -> str` (returns path to written `.html`). `last_query_log_entry() -> dict | None`.
 
-Report section order: Introduction → **Results** → Data Cleaning → Topic Focus → Visualization (visualize entries only) → Summary.
+Report section order: Introduction → **Results** → Data Cleaning → Question-Specific Data Shaping → Topic Focus → Visualization (visualize entries only) → Summary.
 
 Key internal functions:
 
 | Function | Role |
 |---|---|
+| `_section_question_transformations(sql_query)` | Deterministic section, right after Data Cleaning: calls the shared `utils/sql_transform_extraction.extract_question_transformations(sql_query)` and renders it — CTE step chain, computed-metric formulas (alias + real expression, e.g. `avg_salary_k` ← `AVG((salary_min_k + salary_max_k) / 2.0)`), GROUP BY column(s), `HAVING COUNT(*) >= N` minimum sample size, ORDER BY/LIMIT ranking stages, and topic-scope filters (`ILIKE`/`LIKE`/positive `IN`/`=` against real literals — NOT NULL checks and placeholder `<>`/`NOT IN` exclusions are deliberately excluded, they belong to the general cleaning section above). States honestly when the query has no such shaping (`has_any_transformation` is False) rather than rendering an empty section. |
 | `_section_results(entry)` | **The single deterministic source of truth for the answer.** Renders `sql_query_execution_result` as a plain HTML table (all columns, all rows, human-readable headers via `_humanize_col`) — no LLM involved. States honestly when no rows are available (empty result or an entry that predates structured result logging), and flags a truncated result. Every other section (chart, Topic Focus prose, Summary prose) is checkable against this table. |
 | `_parse_result_rows(result_str)` | Parses execute_sql's `{"columns", "rows", "truncated"}` JSON into a list of row dicts. Deliberately independent of `agents.sql_analyst._parse_sql_result` (same shape) to avoid a `utils` → `agents` import cycle. |
 | `_results_text_for_prompt(entry, max_rows=15)` | Plain-text rendering of the same rows `_section_results` shows — used to ground `_section_topic_focus`'s LLM call in the exact numbers a reader already sees, instead of a separately-truncated raw JSON snippet. |
