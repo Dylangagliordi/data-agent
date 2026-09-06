@@ -10,9 +10,20 @@ Slide structure — every fact traced to real logged data, nothing invented:
   5. One slide per real resolved fail-level issue (Issue / Solution format).
      Omitted entirely when no cleaning history exists.
   6. "Cleaned Data" — real before/after row-count comparison.
-  7. Visualization — chart image embedded full-slide, reasoning if reasoned.
+  7. "Making sense of the categories" — plain-English glossary of the real
+     category values (e.g. industry names) that appear in the result, when
+     the result has a resolvable category column. Only present for
+     visualize: entries; omitted when no such column exists.
+  8. Visualization — chart image embedded full-slide, reasoning if reasoned.
      Only present for visualize: entries.
-  8. Summary — grounded synthesis, same standard as the report.
+  9. Scatter, sized by volume — a second view of the same result plotted on
+     two numeric axes with point size encoding a count-like column (e.g. how
+     many job postings back each category's numbers). Only built when the
+     real result actually has a category column, 2+ numeric measure columns,
+     and a count-like column — never invented when the shape doesn't fit.
+  10. Summary — grounded synthesis, written in a plain, conversational voice
+      that explains the actual reasoning behind each judgment call, not just
+      the raw facts.
 """
 
 import base64
@@ -25,6 +36,11 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CLEANING_LOG_PATH = _PROJECT_ROOT / "logs" / "cleaning_log.jsonl"
 _PRESENTATIONS_DIR = _PROJECT_ROOT / "presentations"
+
+_COUNT_COL_RE = re.compile(
+    r"^(?:n|count|num\w*|sample_size|total_count|\w+_count)$", re.IGNORECASE
+)
+_MAX_GLOSSARY_TERMS = 12
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -183,7 +199,252 @@ def _issue_category(issue_text: str) -> str:
     return "Other"
 
 
-# ── LLM summary (slide 8) ──────────────────────────────────────────────────────
+# ── Real-result parsing (shared by the glossary + scatter slides) ─────────────
+
+def _parse_result_rows(result_str: str) -> tuple[list, bool]:
+    """Parse execute_sql's {"columns", "rows", "truncated"} JSON payload into a
+    list of row dicts. Returns ([], False) for an error string or unparseable
+    input. Deliberately its own copy (same shape as generate_report.py's and
+    agents/sql_analyst.py's own parsers) rather than a cross-module import, to
+    avoid coupling three independently-testable files together.
+    """
+    if not result_str or result_str.startswith("SQL_EXECUTION_ERROR"):
+        return [], False
+    try:
+        payload = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        return [], False
+    if not isinstance(payload, dict):
+        return [], False
+    columns = payload.get("columns") or []
+    rows = payload.get("rows") or []
+    truncated = bool(payload.get("truncated", False))
+    if not columns or not isinstance(rows, list):
+        return [], truncated
+    return [dict(zip(columns, r)) for r in rows], truncated
+
+
+def _to_float(val):
+    """Safely coerce any value to float; return None if not possible."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _humanize_col(col: str) -> str:
+    """Convert a SQL alias like 'avg_salary_k' -> 'Avg Salary K'."""
+    return col.replace("_", " ").title()
+
+
+def _resolve_category_values(entry: dict) -> "tuple[str, list[str]] | None":
+    """Deterministically pick the real category column out of the executed
+    query's actual result (first non-numeric column, by real column order —
+    no LLM involved in this step) and return its distinct values in the order
+    they first appear. Returns None when the result has no non-numeric column
+    at all (nothing to build a glossary of).
+    """
+    rows, truncated = _parse_result_rows(entry.get("sql_query_execution_result", ""))
+    if not rows:
+        return None
+    cols = list(rows[0].keys())
+    numeric_cols = {c for c in cols if any(_to_float(r.get(c)) is not None for r in rows)}
+    non_numeric_cols = [c for c in cols if c not in numeric_cols]
+    if not non_numeric_cols:
+        return None
+    cat_col = non_numeric_cols[0]
+    seen: set = set()
+    values: list = []
+    for r in rows:
+        v = r.get(cat_col)
+        if v is None:
+            continue
+        v = str(v)
+        if v not in seen:
+            seen.add(v)
+            values.append(v)
+    if not values:
+        return None
+    return cat_col, values[:_MAX_GLOSSARY_TERMS]
+
+
+def _resolve_scatter_columns(entry: dict) -> "dict | None":
+    """Deterministically resolve category/x/y/count columns for a second,
+    volume-aware scatter view of the SAME already-executed result — never a
+    fresh query, never invented data. Returns None when the real result
+    doesn't have the right shape: needs one non-numeric category column, a
+    real count-like column (job_count, n, num_*, etc.) to size points by, and
+    at least two OTHER numeric measure columns to plot on the two axes.
+    """
+    rows, truncated = _parse_result_rows(entry.get("sql_query_execution_result", ""))
+    if not rows or truncated:
+        return None
+    cols = list(rows[0].keys())
+    numeric_cols = [c for c in cols if any(_to_float(r.get(c)) is not None for r in rows)]
+    non_numeric_cols = [c for c in cols if c not in numeric_cols]
+    if not non_numeric_cols:
+        return None
+    category_col = non_numeric_cols[0]
+    count_col = next((c for c in numeric_cols if _COUNT_COL_RE.match(c)), None)
+    if count_col is None:
+        return None
+    measure_cols = [c for c in numeric_cols if c != count_col]
+    if len(measure_cols) < 2:
+        return None
+    return {
+        "rows": rows,
+        "category_col": category_col,
+        "x_col": measure_cols[0],
+        "y_col": measure_cols[1],
+        "count_col": count_col,
+    }
+
+
+def _render_scatter_chart_b64(resolved: dict) -> "str | None":
+    """Render the volume-aware scatter chart in-memory; return base64 PNG
+    bytes, or None if rendering fails for any reason (never blocks the rest
+    of the presentation).
+    """
+    try:
+        import io as _io
+
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        rows = resolved["rows"]
+        cat_col, x_col = resolved["category_col"], resolved["x_col"]
+        y_col, count_col = resolved["y_col"], resolved["count_col"]
+
+        xs, ys, sizes, labels = [], [], [], []
+        for r in rows:
+            x, y = _to_float(r.get(x_col)), _to_float(r.get(y_col))
+            if x is None or y is None:
+                continue
+            n = _to_float(r.get(count_col)) or 0
+            xs.append(x)
+            ys.append(y)
+            sizes.append(n * 6 + 40)
+            labels.append(str(r.get(cat_col)))
+        if not xs:
+            return None
+
+        fig = Figure(figsize=(9.5, 6.2))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.scatter(xs, ys, s=sizes, alpha=0.75, edgecolors="#16213e", linewidths=0.7, zorder=3)
+        for x, y, label in zip(xs, ys, labels):
+            ax.annotate(label, (x, y), textcoords="offset points", xytext=(6, 4), fontsize=8)
+        ax.set_xlabel(_humanize_col(x_col))
+        ax.set_ylabel(_humanize_col(y_col))
+        ax.set_title(
+            f"{_humanize_col(y_col)} vs. {_humanize_col(x_col)}\n"
+            f"(point size = {_humanize_col(count_col)})",
+            fontsize=11,
+        )
+        ax.grid(True, alpha=0.25, zorder=0)
+        fig.tight_layout()
+
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
+# ── LLM glossary (slide 7 — plain-English category meanings) ──────────────────
+
+def _generate_glossary(category_label: str, values: list, llm) -> dict:
+    """One LLM call explaining what each real category value generally MEANS
+    in plain English (e.g. what kind of companies 'Staffing & Outsourcing'
+    covers) — this is general background knowledge the model already has,
+    not a claim derived from the dataset, and is presented to the user framed
+    that way. Never invents a number or a dataset-specific fact. Returns {}
+    (glossary slide is simply skipped) on any failure or malformed response.
+    """
+    if not values:
+        return {}
+    terms_block = "\n".join(f"- {v}" for v in values)
+    prompt = (
+        f"Someone is looking at a chart grouped by \"{category_label}\" and the category "
+        f"labels below aren't self-explanatory. For each one, explain in one short, plain, "
+        f"conversational sentence what that label generally refers to in everyday terms — "
+        f"this is general background knowledge, not something you're deriving from any "
+        f"dataset, so don't state or imply any number, statistic, or dataset-specific fact.\n\n"
+        f"Labels:\n{terms_block}\n\n"
+        f"Respond with exactly one line per label, in this exact format, same order, "
+        f"no numbering, no extra commentary:\n"
+        f"<label> :: <one-sentence plain-English explanation>"
+    )
+    try:
+        text = llm.invoke([("human", prompt)]).content
+        if isinstance(text, list):
+            text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in text if not (isinstance(b, dict) and b.get("type") == "thinking")
+            )
+        glossary = {}
+        for line in text.splitlines():
+            if "::" not in line:
+                continue
+            term, _, explanation = line.partition("::")
+            term = term.strip().lstrip("-").strip()
+            explanation = explanation.strip()
+            if term and explanation:
+                glossary[term] = explanation
+        return glossary
+    except Exception:
+        return {}
+
+
+# ── LLM cleaning-narrative simplification (issue/solution slides) ─────────────
+
+def _simplify_cleaning_narratives(items: list, llm) -> "list | None":
+    """One batched LLM call that rewrites every cleaning fix's technical,
+    code-comment-style note into a short, plain, conversational explanation —
+    same underlying facts, human-sounding delivery. `items` is a list of
+    (issue_text, raw_solution_text) tuples; returns a list of rewritten
+    solution strings in the same order, or None on any failure/shape
+    mismatch (callers must fall back to the original raw text — never drop
+    or fabricate a reason).
+    """
+    if not items:
+        return []
+    blocks = [
+        f"Issue: {issue}\nOriginal fix note: {solution}"
+        for issue, solution in items
+    ]
+    prompt = (
+        f"Below are {len(items)} data-cleaning issues and the technical, code-comment-style "
+        f"notes explaining how each was fixed. Rewrite ONLY the fix explanation for each one "
+        f"in plain, conversational language — like a data analyst talking a colleague through "
+        f"their own reasoning out loud, not writing code comments. Keep each to 1-3 short "
+        f"sentences. Do not invent any new fact or drop the real reason the data was treated "
+        f"the way it was.\n\n"
+        f"Respond with exactly {len(items)} rewritten explanations, separated by a line "
+        f"containing only ---, in the same order, with no numbering or extra commentary.\n\n"
+        + "\n\n".join(blocks)
+    )
+    try:
+        text = llm.invoke([("human", prompt)]).content
+        if isinstance(text, list):
+            text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in text if not (isinstance(b, dict) and b.get("type") == "thinking")
+            )
+        parts = [p.strip() for p in text.split("---")]
+        parts = [p for p in parts if p]
+        if len(parts) != len(items):
+            return None
+        return parts
+    except Exception:
+        return None
+
+
+# ── LLM summary (slide 10) ─────────────────────────────────────────────────────
 
 def _generate_summary(entry: dict, cleaning_context: str, llm) -> str:
     question = entry.get("user_question") or entry.get("curated_question") or ""
@@ -201,11 +462,16 @@ def _generate_summary(entry: dict, cleaning_context: str, llm) -> str:
         facts += f"Chart type produced: {entry['chart_type']}\n"
 
     prompt = (
-        f"Write a 3-5 sentence summary for a data presentation. "
-        f"Synthesize ONLY from the facts listed below — do not introduce any number, "
-        f"claim, or interpretation not directly traceable to these facts. "
-        f"If cleaning was performed, briefly note why it was necessary for this analysis. "
-        f"Write plain prose only — no markdown headers, no bullet points, no formatting symbols.\n\n"
+        f"You're a data analyst walking a colleague through what you found and how you got "
+        f"there — talk them through it out loud, plainly, like you're explaining your own "
+        f"reasoning, not writing a formal report. In 4-6 sentences: say what you found in "
+        f"everyday words, AND call out any judgment calls baked into the 'Final answer' "
+        f"facts below (e.g. a minimum sample size, excluded rows, why cleaning was needed "
+        f"first) and briefly say WHY you made that call, not just that you made it. "
+        f"Synthesize ONLY from the facts listed below — never introduce a number, claim, or "
+        f"interpretation not directly traceable to them. "
+        f"Write plain prose only — no markdown headers, no bullet points, no formatting "
+        f"symbols, no jargon you wouldn't actually say out loud.\n\n"
         f"Facts:\n{facts}"
     )
     text = llm.invoke([("human", prompt)]).content
@@ -397,71 +663,104 @@ def _slide_uncleaned_data(all_issues: list) -> str:
     return "\n".join(parts)
 
 
-def _slides_issue_solution(tname: str, file_rec: dict) -> list[str]:
+def _slides_issue_solution(tname: str, file_rec: dict, llm=None) -> list[str]:
     """One slide per resolved fail-level issue, plus one combined slide per
     resolved fail-level BATCH (Spec 4 — a group of 2+ issues that shared an
     identical, mechanically-verified treatment and got one combined fix),
     listing every issue the batch covered together rather than repeating one
-    near-identical slide per column."""
-    slides = []
+    near-identical slide per column.
+
+    Solution text is rewritten into plain, conversational language via ONE
+    batched LLM call (`llm`) covering every issue/batch on this table at
+    once — not one call per slide. Falls back to the original raw
+    code-comment-style text (unchanged behavior) whenever `llm` is None, the
+    call fails, or the response doesn't map 1:1 back onto the real issues."""
     fail_issues = file_rec.get("fail_issues", [])
     resolved_set = set(file_rec.get("issues_resolved", []))
 
+    singleton_entries = []
     for fi in fail_issues:
         issue_text = fi.get("issue", "")
         if issue_text not in resolved_set:
             continue
-
         reasoning = fi.get("reasoning_comments", [])
         if reasoning:
-            solution = " ".join(
-                re.sub(r"^#\s*", "", c) for c in reasoning
-            ).strip()
+            solution = " ".join(re.sub(r"^#\s*", "", c) for c in reasoning).strip()
         else:
             solution = "The issue was resolved — see full report for fix details."
+        singleton_entries.append({"issue_text": issue_text, "solution": solution[:500]})
 
-        slides.append(
-            f'<div class="slide">'
-            f'<div class="label">Data Cleaning — {_esc(tname)}</div>'
-            f'<div class="issue-box">'
-            f'<div class="issue-label">Issue</div>'
-            f'<div class="issue-text">{_esc(issue_text)}</div>'
-            f'</div>'
-            f'<div class="solution-box">'
-            f'<div class="solution-label">Solution</div>'
-            f'<div class="solution-text">{_esc(solution[:500])}</div>'
-            f'</div>'
-            f'</div>'
-        )
-
+    batch_entries = []
     for batch in file_rec.get("fail_batches", []):
         if batch.get("status") != "resolved":
             continue
         batch_issues = batch.get("issues", [])
         if not batch_issues:
             continue
-
         reasoning = batch.get("reasoning_comments", [])
         if reasoning:
-            solution = " ".join(
-                re.sub(r"^#\s*", "", c) for c in reasoning
-            ).strip()
+            solution = " ".join(re.sub(r"^#\s*", "", c) for c in reasoning).strip()
         else:
             solution = "The issue was resolved — see full report for fix details."
-
         issue_text = (
             f"{len(batch_issues)} columns with the identical issue: " + "; ".join(batch_issues)
         )
+        batch_entries.append({
+            "batch_issues": batch_issues,
+            "issue_text": issue_text[:500],
+            "solution": solution[:500],
+        })
+
+    # One batched simplification call covering every real solution text on
+    # this table, in a fixed order — never one LLM call per slide.
+    all_solutions = [e["solution"] for e in singleton_entries] + [e["solution"] for e in batch_entries]
+    simplified = None
+    if llm is not None:
+        pairs = (
+            [(e["issue_text"], e["solution"]) for e in singleton_entries]
+            + [(e["issue_text"], e["solution"]) for e in batch_entries]
+        )
+        simplified = _simplify_cleaning_narratives(pairs, llm)
+    if simplified is not None and len(simplified) == len(all_solutions):
+        cursor = 0
+        for e in singleton_entries:
+            e["display_solution"] = simplified[cursor]
+            cursor += 1
+        for e in batch_entries:
+            e["display_solution"] = simplified[cursor]
+            cursor += 1
+    else:
+        for e in singleton_entries:
+            e["display_solution"] = e["solution"]
+        for e in batch_entries:
+            e["display_solution"] = e["solution"]
+
+    slides = []
+    for e in singleton_entries:
         slides.append(
             f'<div class="slide">'
             f'<div class="label">Data Cleaning — {_esc(tname)}</div>'
             f'<div class="issue-box">'
-            f'<div class="issue-label">Issue (batched, {len(batch_issues)} columns)</div>'
-            f'<div class="issue-text">{_esc(issue_text[:500])}</div>'
+            f'<div class="issue-label">Issue</div>'
+            f'<div class="issue-text">{_esc(e["issue_text"])}</div>'
             f'</div>'
             f'<div class="solution-box">'
             f'<div class="solution-label">Solution</div>'
-            f'<div class="solution-text">{_esc(solution[:500])}</div>'
+            f'<div class="solution-text">{_esc(e["display_solution"][:600])}</div>'
+            f'</div>'
+            f'</div>'
+        )
+    for e in batch_entries:
+        slides.append(
+            f'<div class="slide">'
+            f'<div class="label">Data Cleaning — {_esc(tname)}</div>'
+            f'<div class="issue-box">'
+            f'<div class="issue-label">Issue (batched, {len(e["batch_issues"])} columns)</div>'
+            f'<div class="issue-text">{_esc(e["issue_text"])}</div>'
+            f'</div>'
+            f'<div class="solution-box">'
+            f'<div class="solution-label">Solution</div>'
+            f'<div class="solution-text">{_esc(e["display_solution"][:600])}</div>'
             f'</div>'
             f'</div>'
         )
@@ -495,6 +794,40 @@ def _slide_cleaned_data(tname: str, file_rec: dict) -> str:
     )
     parts.append('</div>')
     return "\n".join(parts)
+
+
+def _slide_glossary(category_label: str, glossary: dict) -> str:
+    parts = [
+        '<div class="slide">',
+        '<div class="label">Making Sense Of The Categories</div>',
+        '<h2 class="title" style="font-size:2em">What do these groups mean?</h2>',
+        f'<p style="color:#8aa8c8;margin-bottom:16px">'
+        f'A quick plain-English explanation of each "{_esc(_humanize_col(category_label))}" '
+        f'value shown next — general background, not something derived from this data.</p>',
+        '<table><thead><tr><th>Category</th><th>What it generally means</th></tr></thead><tbody>',
+    ]
+    for term, explanation in glossary.items():
+        parts.append(f'<tr><td>{_esc(term)}</td><td>{_esc(explanation)}</td></tr>')
+    parts.append('</tbody></table>')
+    parts.append('</div>')
+    return "\n".join(parts)
+
+
+def _slide_scatter(resolved: dict, chart_b64: str) -> str:
+    x_col, y_col, count_col = resolved["x_col"], resolved["y_col"], resolved["count_col"]
+    return (
+        f'<div class="slide">'
+        f'<div class="label">Scatter, Sized By Volume</div>'
+        f'<h2 class="title" style="font-size:1.7em">'
+        f'{_esc(_humanize_col(y_col))} vs. {_esc(_humanize_col(x_col))}</h2>'
+        f'<p style="color:#8aa8c8;margin-bottom:10px">'
+        f'Same result, plotted differently — each point\'s size shows '
+        f'{_esc(_humanize_col(count_col))}, so a category perched on an '
+        f'extreme value backed by very few real records stands out from one '
+        f'backed by a lot of them.</p>'
+        f'<img class="chart" src="data:image/png;base64,{chart_b64}" alt="Scatter chart">'
+        f'</div>'
+    )
 
 
 def _slide_visualization(entry: dict) -> str:
@@ -647,7 +980,7 @@ def generate_presentation(entry: dict) -> str:
             if rec is None:
                 continue
             entry_meta, file_rec = rec
-            slides.extend(_slides_issue_solution(tname, file_rec))
+            slides.extend(_slides_issue_solution(tname, file_rec, llm=llm))
 
         # 6. Cleaned Data (before/after)
         for tname, rec in cleaning_map.items():
@@ -656,11 +989,39 @@ def generate_presentation(entry: dict) -> str:
             entry_meta, file_rec = rec
             slides.append(_slide_cleaned_data(tname, file_rec))
 
-    # 7. Visualization (visualize: entries only)
+    # 7. Making sense of the categories (visualize: entries only, when the
+    # real result has a resolvable category column — never invented).
+    if entry.get("chart_type"):
+        try:
+            resolved_cats = _resolve_category_values(entry)
+        except Exception:
+            resolved_cats = None
+        if resolved_cats:
+            cat_col, values = resolved_cats
+            try:
+                glossary = _generate_glossary(cat_col, values, llm)
+            except Exception:
+                glossary = {}
+            if glossary:
+                slides.append(_slide_glossary(cat_col, glossary))
+
+    # 8. Visualization (visualize: entries only)
     if entry.get("chart_type") and entry.get("output_file_path"):
         slides.append(_slide_visualization(entry))
 
-    # 8. Summary
+    # 9. Scatter, sized by volume (visualize: entries only, when the real
+    # result has the right shape — category + count + 2 numeric measures).
+    if entry.get("chart_type"):
+        try:
+            resolved_scatter = _resolve_scatter_columns(entry)
+        except Exception:
+            resolved_scatter = None
+        if resolved_scatter:
+            chart_b64 = _render_scatter_chart_b64(resolved_scatter)
+            if chart_b64:
+                slides.append(_slide_scatter(resolved_scatter, chart_b64))
+
+    # 10. Summary
     slides.append(_slide_summary(summary_text))
 
     # ── Write to disk ──────────────────────────────────────────────────────────
