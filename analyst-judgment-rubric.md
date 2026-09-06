@@ -1,10 +1,10 @@
 # Analyst Judgment Rubric
 
 Every SQL analyst answer applies the rules below. Rules 1–8 are enforced mechanically
-through prompt constraints and deterministic post-execution disclosure. Rules 9–11 are
-enforced through the prompt only (no post-execution extraction possible). Every
-triggered rule is disclosed in the "How this answer was computed" block that appears
-at the bottom of the answer when one or more rules fire.
+through prompt constraints and deterministic post-execution disclosure. Rules 9–11,
+13, and 14 are enforced through the prompt only (no post-execution extraction
+possible). Every triggered rule is disclosed in the "How this answer was computed"
+block that appears at the bottom of the answer when one or more rules fire.
 
 ---
 
@@ -167,6 +167,26 @@ composite structure must be visible in the schema sample rows).
 
 This is a rewrite, not just a disclaimer bolted on: a reader who stops reading
 early should not still see the false causal claim.
+
+---
+
+### Rule 14 — NULL-filter placement for per-category rankings
+For any query that ranks/compares categories by an averaged or rate-based metric,
+every `col IS NOT NULL` filter feeding that metric must be applied in ONE `WHERE`
+clause in the query's base CTE/subquery, before any `GROUP BY` — never split across
+stages, and never applied only after an earlier stage has already aggregated.
+Splitting or relocating these filters changes which underlying rows count toward
+each group's average, silently producing a different row count and average for the
+exact same question across separate runs — the same class of bug Rule 1's fixed
+`HAVING COUNT(*) >= 5` threshold exists to prevent, applied to filter placement
+instead of the sample-size threshold.
+
+**Enforcement:** SQL-generation prompt rule (no post-execution extraction — filter
+placement relative to `GROUP BY` isn't mechanically distinguishable from the SQL
+text alone the way Rule 3's `IS NOT NULL` presence is). Regression-tested live in
+`tests/test_null_filter_placement_consistency.py`, which runs the exact "Of the 5
+highest-paying industries..., which offer the highest employee satisfaction?"
+question 3 times and asserts identical per-industry job_count/avg_salary across runs.
 
 ---
 

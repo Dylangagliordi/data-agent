@@ -143,10 +143,39 @@ def _parse_placeholder_issue(issue_text: str) -> "dict | None":
     return {"column": col, "count": count, "placeholders": placeholders}
 
 
-def _biggest_fail_placeholder(file_rec: dict) -> "dict | None":
+def _normalize_col_name(s: str) -> str:
+    """Normalize a column name for cross-format comparison: lowercase, non-
+    alphanumeric runs collapsed to a single underscore. Lets a cleaning-log
+    column like 'Type of ownership' match a Postgres column like
+    'type_of_ownership'."""
+    return re.sub(r"[^a-z0-9]+", "_", str(s).lower()).strip("_")
+
+
+def _detect_touched_columns(sql: str, column_names: list) -> set:
+    """Return the normalized subset of column_names that actually appear (as
+    whole words) in sql. Used to scope the cleaning-impact comparison to
+    columns the executed query actually used, instead of picking whichever
+    fail-level issue affected the most rows table-wide regardless of
+    relevance to this specific analysis."""
+    if not sql:
+        return set()
+    sql_upper = sql.upper()
+    return {
+        _normalize_col_name(c)
+        for c in column_names
+        if re.search(r"\b" + re.escape(str(c).upper()) + r"\b", sql_upper)
+    }
+
+
+def _biggest_fail_placeholder(file_rec: dict, touched_columns: "set | None" = None) -> "dict | None":
     """Return the parsed placeholder issue with the highest affected-value count
     among all fail-severity issues in file_rec["issues_found"], or None if there
     is no parseable placeholder issue.
+
+    When touched_columns is a non-empty set, only issues whose column actually
+    appears in that set are considered — this scopes the comparison to columns
+    the executed query actually touched, rather than surfacing an unrelated
+    column just because it had the largest table-wide impact.
     """
     fail_issues = [i for i in file_rec.get("issues_found", []) if i.get("severity") == "fail"]
     parsed = []
@@ -155,6 +184,11 @@ def _biggest_fail_placeholder(file_rec: dict) -> "dict | None":
         if p:
             parsed.append(p)
     if not parsed:
+        return None
+    if touched_columns:
+        scoped = [p for p in parsed if _normalize_col_name(p["column"]) in touched_columns]
+        if scoped:
+            return max(scoped, key=lambda p: p["count"])
         return None
     return max(parsed, key=lambda p: p["count"])
 
@@ -340,6 +374,96 @@ def _extract_query_assumptions(sql_query: str) -> list:
     return assumptions
 
 
+# ── Results table (the single deterministic source of truth for the answer) ────
+
+def _humanize_col(col: str) -> str:
+    """Convert a SQL alias like 'avg_payment_value' -> 'Average Payment Value'.
+    Mirrors agents.sql_analyst._humanize_column exactly (duplicated here, not
+    imported, to avoid a utils -> agents import cycle) so column labels match
+    the CSV/chart the query already produced.
+    """
+    return col.replace("_", " ").title()
+
+
+def _parse_result_rows(result_str: str) -> tuple[list, bool]:
+    """Parse execute_sql's {"columns": [...], "rows": [[...], ...], "truncated": bool}
+    JSON payload into a list of row dicts. Returns ([], False) for an error string
+    or unparseable input. Deliberately independent of agents.sql_analyst's own
+    _parse_sql_result (same shape, no cross-package import needed for this).
+    """
+    if not result_str or result_str.startswith("SQL_EXECUTION_ERROR"):
+        return [], False
+    try:
+        payload = json.loads(result_str)
+    except (json.JSONDecodeError, TypeError):
+        return [], False
+    if not isinstance(payload, dict):
+        return [], False
+    columns = payload.get("columns") or []
+    rows = payload.get("rows") or []
+    truncated = bool(payload.get("truncated", False))
+    if not columns or not isinstance(rows, list):
+        return [], truncated
+    return [dict(zip(columns, r)) for r in rows], truncated
+
+
+def _section_results(entry: dict) -> str:
+    """Render the actual query result as a plain HTML table — the single
+    deterministic, checkable source of truth for the answer. Every other
+    section (chart, Topic Focus prose, Summary prose) can be verified against
+    this table; nothing here is synthesized or interpreted, it's the real rows
+    the executed SQL returned.
+    """
+    result_str = entry.get("sql_query_execution_result", "")
+    rows, was_truncated = _parse_result_rows(result_str)
+
+    if not rows:
+        return (
+            "<h2>Results</h2>\n"
+            "<div class='note'>No result rows are available for this entry "
+            "(the query returned nothing, or this entry predates structured "
+            "result logging).</div>"
+        )
+
+    cols = list(rows[0].keys())
+    human_cols = [_humanize_col(c) for c in cols]
+
+    parts = ["<h2>Results</h2>"]
+    if was_truncated:
+        parts.append(
+            "<div class='note'>This result was capped before reaching this table — "
+            "the rows below are a partial sample, not the complete result set.</div>"
+        )
+    parts.append("<table><thead><tr>" + "".join(f"<th>{_esc(h)}</th>" for h in human_cols) + "</tr></thead><tbody>")
+    for row in rows:
+        cells = "".join(f"<td>{_esc(row.get(c))}</td>" for c in cols)
+        parts.append(f"<tr>{cells}</tr>")
+    parts.append("</tbody></table>")
+    return "\n".join(parts)
+
+
+def _results_text_for_prompt(entry: dict, max_rows: int = 15) -> str:
+    """Plain-text rendering of the same rows _section_results shows, for
+    grounding the two LLM prose sections in the exact same numbers a reader
+    sees in the Results table above — rather than each independently re-parsing
+    a truncated raw JSON snippet of sql_query_execution_result.
+    """
+    rows, was_truncated = _parse_result_rows(entry.get("sql_query_execution_result", ""))
+    if not rows:
+        return ""
+    cols = list(rows[0].keys())
+    human_cols = [_humanize_col(c) for c in cols]
+    lines = [", ".join(human_cols)]
+    for row in rows[:max_rows]:
+        lines.append(", ".join(str(row.get(c)) for c in cols))
+    text = "\n".join(lines)
+    if was_truncated:
+        text += "\n(result was truncated — shown rows are a partial sample)"
+    elif len(rows) > max_rows:
+        text += f"\n(... {len(rows) - max_rows} more row(s) not shown here)"
+    return text
+
+
 # ── Cleaning narrative helpers ─────────────────────────────────────────────────
 
 def _issue_category(issue_text: str) -> str:
@@ -457,13 +581,20 @@ def _section_introduction(entry: dict, table_meta: list) -> str:
     return "<h2>Introduction</h2>\n" + "\n".join(rows)
 
 
-def _section_data_cleaning(cleaning_map: dict) -> str:
+def _section_data_cleaning(cleaning_map: dict, sql_query: str = "", table_columns: "dict | None" = None) -> str:
     """Narrative data cleaning section.
 
     Tells the story in order: what was audited → what was found (by severity) →
     what was decided for each critical issue → advisory fixes → numeric impact.
     Same real data as before; restructured as a process, not a flat list.
+
+    sql_query + table_columns (table_name -> real column names from
+    information_schema), when both provided, scope the Before/After Cleaning
+    Impact table (Step 5 below) to a column the executed query actually
+    touched, instead of surfacing whichever fail-level issue affected the most
+    rows table-wide regardless of relevance to this specific analysis.
     """
+    table_columns = table_columns or {}
     parts = ["<h2>Data Cleaning</h2>"]
 
     if not cleaning_map:
@@ -644,12 +775,14 @@ def _section_data_cleaning(cleaning_map: dict) -> str:
 
         # ── Step 5: Concrete before/after impact for the biggest fail issue ───
         parts.append("<h4 style='margin-top:18px'>Before/After Cleaning Impact</h4>")
-        biggest = _biggest_fail_placeholder(file_rec)
+        touched_cols = _detect_touched_columns(sql_query, table_columns.get(tname, []))
+        biggest = _biggest_fail_placeholder(file_rec, touched_columns=touched_cols)
         if biggest is None:
             parts.append(
-                "<div class='note'>No placeholder-value fail issue was found for this table "
-                "— a concrete before/after numeric comparison cannot be automatically "
-                "computed for other issue types (e.g. column misalignment).</div>"
+                "<div class='note'>No placeholder-value fail issue was found for a column "
+                "this query actually touched — a concrete before/after numeric comparison "
+                "cannot be automatically computed for other issue types (e.g. column "
+                "misalignment) or for columns not relevant to this specific analysis.</div>"
             )
         else:
             try:
@@ -693,8 +826,7 @@ def _section_data_cleaning(cleaning_map: dict) -> str:
 
 def _section_topic_focus(entry: dict, llm, cleaning_context: str = "") -> str:
     question = entry.get("user_question") or entry.get("curated_question") or ""
-    result_snippet = (entry.get("sql_query_execution_result") or "")[:500]
-    final_answer = (entry.get("final_answer") or "")[:800]
+    results_text = _results_text_for_prompt(entry)
 
     cleaning_clause = ""
     if cleaning_context:
@@ -708,13 +840,16 @@ def _section_topic_focus(entry: dict, llm, cleaning_context: str = "") -> str:
 
     prompt = (
         f"A data analyst asked this question: \"{question}\"\n\n"
-        f"The query returned: {result_snippet}\n\n"
-        f"The final answer given was: {final_answer}\n\n"
+        f"The query returned this exact result (already shown to the reader in a table "
+        f"above — do not restate these numbers, reference them only in service of your "
+        f"explanation):\n{results_text or '(no rows returned)'}\n\n"
         f"{cleaning_clause}"
         f"In 2-4 sentences, explain why this is a meaningful question to ask of this dataset. "
         f"Be specific and grounded in what the data actually showed — do not invent "
         f"business context or mention anything not directly present in the question, result, "
-        f"and cleaning context above. "
+        f"and cleaning context above. Do not repeat the specific numbers already shown in the "
+        f"Results table — focus on why the question matters and, if cleaning was performed, "
+        f"why it mattered here. "
         f"Write plain prose only — no markdown headers, no bullet points, no formatting symbols."
     )
     explanation = llm.invoke([("human", prompt)]).content
@@ -801,43 +936,32 @@ def _section_visualization(entry: dict) -> str:
     return "\n".join(lines)
 
 
-def _section_summary(intro_html: str, cleaning_html: str, topic_html: str,
-                     viz_html: str, entry: dict, llm,
-                     cleaning_context: str = "") -> str:
-    question = entry.get("user_question") or entry.get("curated_question") or ""
-    final_answer = (entry.get("final_answer") or "")[:1000]
-    route = entry.get("route_response", "")
+def _section_summary(entry: dict, cleaning_context: str = "") -> str:
+    """Summary section: quotes the already-computed final_answer (deterministic
+    relative to the executed SQL, produced once by represent_final_answer /
+    build_visualization) as the primary content, lightly reformatted — instead
+    of firing a second independent LLM call that re-synthesizes the same
+    numbers from scratch and risks drifting from what the Results table and
+    final_answer already say. A short deterministic cleaning-context line is
+    prepended when cleaning was performed, so the sequence (clean -> analyze)
+    is still visible without inventing new prose.
+    """
+    final_answer = (entry.get("final_answer") or "").strip()
 
-    facts = (
-        f"Question: {question}\n"
-        f"Run type: {route}\n"
-        f"Final answer: {final_answer}\n"
-    )
+    parts = ["<h2>Summary</h2>"]
     if cleaning_context:
-        facts += f"Data cleaning performed: {cleaning_context}\n"
-    if entry.get("chart_type"):
-        facts += f"Chart type produced: {entry['chart_type']}\n"
-    if entry.get("output_file_path"):
-        facts += f"Output file: {entry['output_file_path']}\n"
-
-    prompt = (
-        f"Write a 3-5 sentence summary for a data report, narrating the full analytical "
-        f"process in sequence: what data quality issues were found and why they mattered, "
-        f"how they were resolved, and what the analysis ultimately showed. "
-        f"Synthesize ONLY from the facts listed below — do not introduce any number, "
-        f"claim, or interpretation not directly traceable to these facts. "
-        f"If no cleaning was performed, focus on the analysis result. "
-        f"Write plain prose only — no markdown headers, no bullet points, no formatting symbols.\n\n"
-        f"Facts:\n{facts}"
-    )
-    summary_text = llm.invoke([("human", prompt)]).content
-    if isinstance(summary_text, list):
-        summary_text = "".join(
-            b.get("text", "") if isinstance(b, dict) else str(b)
-            for b in summary_text if not (isinstance(b, dict) and b.get("type") == "thinking")
+        parts.append(
+            f"<p><strong>Data cleaning performed:</strong> {_esc(cleaning_context)}</p>"
         )
+    if final_answer:
+        for para in re.split(r"\n\s*\n", final_answer):
+            para = para.strip()
+            if para:
+                parts.append(f"<p>{_esc(para)}</p>")
+    else:
+        parts.append("<p>No final answer was recorded for this entry.</p>")
 
-    return f"<h2>Summary</h2>\n<p>{_esc(summary_text)}</p>"
+    return "\n".join(parts)
 
 
 # ── Public entry point ─────────────────────────────────────────────────────────
@@ -846,9 +970,14 @@ def generate_report(entry: dict) -> str:
     """Build an HTML report from a query_log.jsonl entry dict.
     Returns the path to the written HTML file.
     """
-    from utils.llm_pick import pick_llm
-
     question = entry.get("user_question") or entry.get("curated_question") or "report"
+    # Prefer the cleaned-up question for the human-facing title — user_question
+    # still carries any router prefix (e.g. "Visualize: ") verbatim, which reads
+    # poorly truncated to 60 chars; curated_question is the same question with
+    # only wording cleanup applied (see curate_question), so it's what a reader
+    # actually wants to see as the report's title.
+    title_question = entry.get("curated_question") or question
+    from utils.llm_pick import pick_llm
     sql = entry.get("generated_sql_query", "")
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -865,6 +994,7 @@ def generate_report(entry: dict) -> str:
         table_meta = _table_metadata(touched_tables)
     except Exception:
         table_meta = []
+    table_columns = {tm["table"]: [c["name"] for c in tm["columns"]] for tm in table_meta}
 
     # Cleaning history for each touched table.
     try:
@@ -878,18 +1008,19 @@ def generate_report(entry: dict) -> str:
     llm = pick_llm("cheap")
 
     intro = _section_introduction(entry, table_meta)
-    cleaning = _section_data_cleaning(cleaning_map)
+    results = _section_results(entry)
+    cleaning = _section_data_cleaning(cleaning_map, sql_query=sql, table_columns=table_columns)
     topic = _section_topic_focus(entry, llm, cleaning_context)
     viz = _section_visualization(entry)
-    summary = _section_summary(intro, cleaning, topic, viz, entry, llm, cleaning_context)
+    summary = _section_summary(entry, cleaning_context)
 
-    body_parts = [intro, cleaning, topic]
+    body_parts = [intro, results, cleaning, topic]
     if viz:
         body_parts.append(viz)
     body_parts.append(summary)
     body = "\n\n".join(body_parts)
 
-    title = f"Report: {question[:60]}"
+    title = f"Report: {title_question[:60]}"
     full_html = _html_page(title, body, generated_at)
 
     _REPORTS_DIR.mkdir(parents=True, exist_ok=True)

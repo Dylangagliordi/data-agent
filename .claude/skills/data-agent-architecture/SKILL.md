@@ -422,15 +422,25 @@ JS navigation: `show(n)`, ArrowRight/ArrowLeft keyboard support, `show(0)` on lo
 
 Public API: `generate_report(entry: dict) -> str` (returns path to written `.html`). `last_query_log_entry() -> dict | None`.
 
+Report section order: Introduction → **Results** → Data Cleaning → Topic Focus → Visualization (visualize entries only) → Summary.
+
 Key internal functions:
 
 | Function | Role |
 |---|---|
+| `_section_results(entry)` | **The single deterministic source of truth for the answer.** Renders `sql_query_execution_result` as a plain HTML table (all columns, all rows, human-readable headers via `_humanize_col`) — no LLM involved. States honestly when no rows are available (empty result or an entry that predates structured result logging), and flags a truncated result. Every other section (chart, Topic Focus prose, Summary prose) is checkable against this table. |
+| `_parse_result_rows(result_str)` | Parses execute_sql's `{"columns", "rows", "truncated"}` JSON into a list of row dicts. Deliberately independent of `agents.sql_analyst._parse_sql_result` (same shape) to avoid a `utils` → `agents` import cycle. |
+| `_results_text_for_prompt(entry, max_rows=15)` | Plain-text rendering of the same rows `_section_results` shows — used to ground `_section_topic_focus`'s LLM call in the exact numbers a reader already sees, instead of a separately-truncated raw JSON snippet. |
 | `_section_visualization(entry)` | Embeds chart image as inline base64 `<img>` if `chart_image_path` present; otherwise states "no chart image available". Extracts query assumptions via `_extract_query_assumptions`. |
-| `_section_data_cleaning(cleaning_map)` | Shows issues/resolved/unresolved per table + a live before/after comparison computed by `_compute_before_after`. **Spec 4:** builds a lookup from issue text to its `fail_batches` entry (if any) alongside the existing `fail_issues` lookup; iterates the flat found-issues list in order, rendering ONE combined block the first time any of a batch's member issues is encountered (tracked via `id(batch)` to avoid re-rendering), listing every issue the batch covered with its shared reasoning shown once — replacing what would otherwise be N near-identical blocks. Iterates `file_rec["warn_batches"]` (plural) rather than a single `warn_batch`, rendering each batch's own reasoning in turn. |
+| `_section_data_cleaning(cleaning_map, sql_query="", table_columns=None)` | Shows issues/resolved/unresolved per table + a live before/after comparison computed by `_compute_before_after`. **Scoped to relevance:** `sql_query` + `table_columns` (table → real column names from `information_schema`) are used to compute `touched_columns` via `_detect_touched_columns`, and `_biggest_fail_placeholder(file_rec, touched_columns=...)` only considers fail-level issues whose column the executed query actually touched — it no longer surfaces whichever column had the largest table-wide impact regardless of relevance to this specific analysis; falls back to an honest "no relevant issue found" note when none of the touched columns had one. **Spec 4:** builds a lookup from issue text to its `fail_batches` entry (if any) alongside the existing `fail_issues` lookup; iterates the flat found-issues list in order, rendering ONE combined block the first time any of a batch's member issues is encountered (tracked via `id(batch)` to avoid re-rendering), listing every issue the batch covered with its shared reasoning shown once — replacing what would otherwise be N near-identical blocks. Iterates `file_rec["warn_batches"]` (plural) rather than a single `warn_batch`, rendering each batch's own reasoning in turn. |
+| `_detect_touched_columns(sql, column_names)` / `_normalize_col_name(s)` | Case/punctuation-insensitive match of real column names against the executed SQL text — lets a cleaning-log column like `'Type of ownership'` match a Postgres column like `type_of_ownership`. |
+| `_section_topic_focus(entry, llm, cleaning_context)` | One `pick_llm("cheap")` call grounded in `_results_text_for_prompt` (not a raw truncated snippet), explicitly instructed NOT to restate numbers already in the Results table — its job is "why does this question matter", not re-deriving the answer. |
+| `_section_summary(entry, cleaning_context)` | **No longer an LLM call.** Quotes `entry["final_answer"]` (already computed once, deterministically relative to the executed SQL, by `represent_final_answer`/`build_visualization`) directly, split into paragraphs, with a short deterministic `cleaning_context` line prepended when cleaning was performed. This closes the "three independent LLM re-syntheses of the same numbers can silently drift from each other" gap — the Results table, chart, and Summary are now all traceable back to the one real computed answer instead of three separately-generated paraphrases. |
 | `_extract_query_assumptions(sql_query)` | Parses WHERE/HAVING for non-obvious filters: `<> 'placeholder'`, `NOT IN (literals)`, `~ 'regex'`, `HAVING COUNT(*) >= N`. Returns plain-English strings. |
 | `_compute_before_after(db_table, biggest)` | Runs two real `COUNT(*)` queries against the live DB to produce a before/after row-count comparison for a placeholder issue. Uses `get_app_reader_connection()`. |
 | `_parse_placeholder_issue(issue_text)` | Parses cleaning log issue text to extract `{"column", "count", "placeholders"}`. |
+
+The report's `<title>`/`<h1>` prefers `curated_question` over `user_question` (falls back to `user_question` only if `curated_question` is absent) — `user_question` still carries any router prefix (e.g. `"Visualize: "`) verbatim, which reads poorly when hard-truncated to 60 chars; the output filename slug still uses `user_question`/`curated_question` fallback unchanged.
 
 ---
 
@@ -457,7 +467,7 @@ Key internal functions:
 - `presentations/` — HTML slideshows from `generate_presentation`. Same naming convention.
 - `logs/` — `query_log.jsonl` and `cleaning_log.jsonl`.
 
-**Analyst judgment rubric:** `analyst-judgment-rubric.md` at the project root documents all 13 rules enforced by `GENERATE_SQL_SYSTEM_PROMPT` and the disclosure helpers. Rules 1–8 and 12 have post-execution disclosure via `_analyst_judgment_disclosure`; Rules 9–11 and 13 are prompt-only enforcement.
+**Analyst judgment rubric:** `analyst-judgment-rubric.md` at the project root documents all 14 rules enforced by `GENERATE_SQL_SYSTEM_PROMPT` and the disclosure helpers. Rules 1–8 and 12 have post-execution disclosure via `_analyst_judgment_disclosure`; Rules 9–11, 13, and 14 are prompt-only enforcement. Rule 14 (NULL-filter placement for per-category rankings — all `IS NOT NULL` filters feeding a ranking metric must live in one `WHERE` clause in the base CTE, before `GROUP BY`) is regression-tested live in `tests/test_null_filter_placement_consistency.py`.
 
 ---
 

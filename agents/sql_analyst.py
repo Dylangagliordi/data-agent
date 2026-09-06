@@ -867,6 +867,17 @@ functions (SUM, AVG, COUNT(col)) already skip NULLs — do not wrap a metric col
 in COALESCE(col, 0) unless the question explicitly asks to treat missing as zero. \
 When you filter NULLs out (e.g. WHERE col IS NOT NULL), the filter appears literally \
 in the SQL text, which is how it gets extracted and disclosed automatically.
+- Null-filter placement for per-category ranking (FIXED PROJECT CONVENTION — same \
+rationale as the HAVING COUNT(*) >= 5 rule above): for any query that ranks/compares \
+categories by an averaged or rate-based metric, every `col IS NOT NULL` filter on a \
+column feeding that metric MUST be applied in ONE WHERE clause in the query's base \
+CTE/subquery (the one selecting raw rows), before any GROUP BY — never split across \
+multiple stages, and never applied only in a later CTE after an earlier stage already \
+aggregated. Splitting or relocating these filters changes which underlying rows count \
+toward each group's average, silently producing different row counts and averages for \
+the exact same question across separate runs. This is exactly as serious as an \
+inconsistent HAVING threshold and must be fixed the same way: one fixed, literal \
+placement, every time.
 - Unit normalization: when comparing a total or summed metric across groups of \
 different sizes (e.g. total revenue by region), prefer a per-unit metric (AVG revenue \
 per order) unless the question explicitly asks for totals. Never mix total for one \
