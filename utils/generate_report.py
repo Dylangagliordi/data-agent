@@ -5,16 +5,22 @@ Public interface: generate_report(entry) -> str (path to the written HTML file).
 Every section is built ONLY from real, traceable data — never invented:
 1. Introduction — dataset name, live row/column counts, the actual question asked,
    and which cleaning issues (if any) were found for the relevant table(s).
-2. Data Cleaning — pulled directly from cleaning_log.jsonl for the touched tables;
+3. Data Cleaning — pulled directly from cleaning_log.jsonl for the touched tables;
    narrates the real sequence of what was checked, found, and decided. If no
    cleaning history exists, states that honestly.
-3. Topic Focus — one pick_llm("cheap") call grounded in the actual question + result
+4. Question-Specific Data Shaping — deterministic breakdown (from
+   utils/sql_transform_extraction.py) of the SQL transformations unique to
+   answering THIS question: computed metrics, grouping, minimum sample size,
+   ranking/limiting logic, and scope filters — separate from the general,
+   dataset-wide cleaning in section 3. States honestly when the query used
+   the source data directly with no such shaping.
+5. Topic Focus — one pick_llm("cheap") call grounded in the actual question + result
    + cleaning context, explaining why the question matters AND why cleaning was
    necessary before the result could be trusted.
-4. Visualization — ONLY for visualize: entries with chart_type/output_file_path set.
+6. Visualization — ONLY for visualize: entries with chart_type/output_file_path set.
    Embeds the chart image directly when chart_image_path is present. Derives
    plain-English "Assumptions" from the real WHERE/HAVING clauses in generated_sql_query.
-5. Summary — one pick_llm("cheap") call synthesizing only from assembled facts,
+7. Summary — one pick_llm("cheap") call synthesizing only from assembled facts,
    narrating the full process from data quality check to final answer.
 """
 
@@ -824,6 +830,103 @@ def _section_data_cleaning(cleaning_map: dict, sql_query: str = "", table_column
     return "\n".join(parts)
 
 
+def _section_question_transformations(sql_query: str) -> str:
+    """Render the deterministic, question-specific shaping this query
+    applies — the metrics computed, how rows were grouped, any minimum-
+    sample threshold, the ranking/limiting logic, and any scope filter that
+    narrows the dataset to what this specific question is about. This is
+    separate from — and comes after — the general dataset-wide cleaning
+    covered in `_section_data_cleaning`; nothing here overlaps with that
+    section's placeholder/duplicate/misalignment fixes. Every fact comes
+    from `extract_question_transformations`, itself a pure parse of the
+    real executed SQL — nothing invented or LLM-derived.
+    """
+    from utils.sql_transform_extraction import (
+        extract_question_transformations,
+        has_any_transformation,
+    )
+
+    parts = ["<h2>Question-Specific Data Shaping</h2>"]
+    if not sql_query:
+        parts.append(
+            "<div class='note'>No SQL was generated for this entry, so there is no "
+            "question-specific shaping to describe.</div>"
+        )
+        return "\n".join(parts)
+
+    t = extract_question_transformations(sql_query)
+    if not has_any_transformation(t):
+        parts.append(
+            "<div class='note'>This query used the source data directly with no "
+            "additional shaping beyond the general cleaning above — no computed "
+            "metrics, grouping, sampling threshold, ranking, or scope filter was "
+            "needed to answer this specific question.</div>"
+        )
+        return "\n".join(parts)
+
+    parts.append(
+        "<p>This is separate from the general cleaning above — these are the "
+        "transformations applied specifically to shape the data for <em>this</em> "
+        "question and its chart, not fixes to bad data.</p>"
+    )
+
+    if t["cte_steps"]:
+        chips = " &rarr; ".join(_esc(s) for s in t["cte_steps"])
+        parts.append(
+            f"<p><strong>Built in {len(t['cte_steps'])} step(s):</strong> {chips}</p>"
+        )
+
+    if t["scope_filters"]:
+        parts.append("<h4 style='margin-top:16px'>Scoped to this question</h4><ul>")
+        for f in t["scope_filters"]:
+            parts.append(f"<li>{_esc(f)}</li>")
+        parts.append("</ul>")
+
+    if t["computed_columns"]:
+        parts.append("<h4 style='margin-top:16px'>Metrics computed for this answer</h4>")
+        parts.append(
+            "<table><thead><tr><th>Metric</th><th>How it was computed</th>"
+            "</tr></thead><tbody>"
+        )
+        for c in t["computed_columns"]:
+            parts.append(
+                f"<tr><td>{_esc(_humanize_col(c['alias']))}</td>"
+                f"<td><code>{_esc(c['expression'])}</code></td></tr>"
+            )
+        parts.append("</tbody></table>")
+
+    if t["grouping_columns"]:
+        for group in t["grouping_columns"]:
+            cols_fmt = ", ".join(_esc(c) for c in group)
+            parts.append(
+                f"<p><strong>Grouped by:</strong> {cols_fmt} — each result row "
+                f"summarizes one of these groups, not one raw source record.</p>"
+            )
+
+    if t["having_threshold"] is not None:
+        parts.append(
+            f"<p><strong>Minimum sample size:</strong> groups with fewer than "
+            f"{t['having_threshold']} underlying rows were excluded from the "
+            f"ranking, to avoid basing an average on too little data.</p>"
+        )
+
+    if t["ranking_stages"]:
+        parts.append("<h4 style='margin-top:16px'>Ranking &amp; limiting logic</h4><ol>")
+        for stage in t["ranking_stages"]:
+            if stage["limit"] is not None:
+                parts.append(
+                    f"<li>Ranked by <code>{_esc(stage['order_by'])}</code>, "
+                    f"then capped to the top {stage['limit']} result(s).</li>"
+                )
+            else:
+                parts.append(
+                    f"<li>Presented in order of <code>{_esc(stage['order_by'])}</code>.</li>"
+                )
+        parts.append("</ol>")
+
+    return "\n".join(parts)
+
+
 def _section_topic_focus(entry: dict, llm, cleaning_context: str = "") -> str:
     question = entry.get("user_question") or entry.get("curated_question") or ""
     results_text = _results_text_for_prompt(entry)
@@ -1010,11 +1113,12 @@ def generate_report(entry: dict) -> str:
     intro = _section_introduction(entry, table_meta)
     results = _section_results(entry)
     cleaning = _section_data_cleaning(cleaning_map, sql_query=sql, table_columns=table_columns)
+    question_shaping = _section_question_transformations(sql)
     topic = _section_topic_focus(entry, llm, cleaning_context)
     viz = _section_visualization(entry)
     summary = _section_summary(entry, cleaning_context)
 
-    body_parts = [intro, results, cleaning, topic]
+    body_parts = [intro, results, cleaning, question_shaping, topic]
     if viz:
         body_parts.append(viz)
     body_parts.append(summary)

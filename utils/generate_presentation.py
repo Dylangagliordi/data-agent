@@ -10,6 +10,12 @@ Slide structure — every fact traced to real logged data, nothing invented:
   5. One slide per real resolved fail-level issue (Issue / Solution format).
      Omitted entirely when no cleaning history exists.
   6. "Cleaned Data" — real before/after row-count comparison.
+  6.5. "How we shaped the data for this answer" — deterministic breakdown of
+       the SQL transformations unique to answering THIS question (computed
+       metrics, grouping, minimum sample size, ranking/limiting, scope
+       filters) — separate from the general cleaning above. Present for both
+       sql_analyst and visualize: entries whenever the executed SQL has real
+       shaping to show; skipped when it's a plain passthrough query.
   7. "Making sense of the categories" — plain-English glossary of the real
      category values (e.g. industry names) that appear in the result, when
      the result has a resolvable category column. Only present for
@@ -796,6 +802,90 @@ def _slide_cleaned_data(tname: str, file_rec: dict) -> str:
     return "\n".join(parts)
 
 
+def _slide_question_shaping(sql_query: str) -> "str | None":
+    """One slide showing the deterministic, question-specific SQL shaping —
+    metrics computed, grouping, minimum sample size, ranking/limiting, and
+    scope filters — separate from the general cleaning slides above. Returns
+    None (slide skipped) when the query has no such shaping to show, rather
+    than rendering an empty slide.
+    """
+    from utils.sql_transform_extraction import (
+        extract_question_transformations,
+        has_any_transformation,
+    )
+
+    if not sql_query:
+        return None
+    t = extract_question_transformations(sql_query)
+    if not has_any_transformation(t):
+        return None
+
+    parts = [
+        '<div class="slide">',
+        '<div class="label">Question-Specific Shaping</div>',
+        '<h2 class="title" style="font-size:1.9em">How we shaped the data for this answer</h2>',
+        '<p style="color:#8aa8c8;margin-bottom:14px;max-width:800px">'
+        'Separate from the general cleaning above — this is the transformation '
+        'work specific to this question and its chart.</p>',
+    ]
+
+    if t["scope_filters"] or t["cte_steps"]:
+        if t["cte_steps"]:
+            chips = "".join(
+                f'<span class="chip">{_esc(s)}</span>' for s in t["cte_steps"]
+            )
+            parts.append(
+                f'<p style="margin-top:6px"><strong style="color:#c8dff0">'
+                f'Built in {len(t["cte_steps"])} step(s):</strong> {chips}</p>'
+            )
+        for f in t["scope_filters"]:
+            parts.append(f'<p style="color:#c0d4e8;margin-top:8px">&#9656; {_esc(f)}</p>')
+
+    if t["computed_columns"]:
+        parts.append(
+            '<table style="margin-top:14px"><thead><tr><th>Metric</th>'
+            '<th>How it was computed</th></tr></thead><tbody>'
+        )
+        for c in t["computed_columns"]:
+            parts.append(
+                f'<tr><td>{_esc(_humanize_col(c["alias"]))}</td>'
+                f'<td>{_esc(c["expression"])}</td></tr>'
+            )
+        parts.append("</tbody></table>")
+
+    if t["grouping_columns"]:
+        for group in t["grouping_columns"]:
+            cols_fmt = ", ".join(_esc(c) for c in group)
+            parts.append(
+                f'<p style="color:#c0d4e8;margin-top:10px"><strong style="color:#c8dff0">'
+                f'Grouped by:</strong> {cols_fmt}</p>'
+            )
+
+    if t["having_threshold"] is not None:
+        parts.append(
+            f'<p style="color:#c0d4e8;margin-top:6px"><strong style="color:#c8dff0">'
+            f'Minimum sample size:</strong> groups with fewer than '
+            f'{t["having_threshold"]} rows were excluded.</p>'
+        )
+
+    if t["ranking_stages"]:
+        stage_lines = []
+        for stage in t["ranking_stages"]:
+            if stage["limit"] is not None:
+                stage_lines.append(
+                    f'ranked by {_esc(stage["order_by"])}, top {stage["limit"]} kept'
+                )
+            else:
+                stage_lines.append(f'ordered by {_esc(stage["order_by"])}')
+        parts.append(
+            f'<p style="color:#c0d4e8;margin-top:6px"><strong style="color:#c8dff0">'
+            f'Ranking:</strong> {" &rarr; ".join(stage_lines)}</p>'
+        )
+
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
 def _slide_glossary(category_label: str, glossary: dict) -> str:
     parts = [
         '<div class="slide">',
@@ -988,6 +1078,16 @@ def generate_presentation(entry: dict) -> str:
                 continue
             entry_meta, file_rec = rec
             slides.append(_slide_cleaned_data(tname, file_rec))
+
+    # 6.5. Question-specific data shaping — deterministic, separate from the
+    # general cleaning slides above (present for both sql_analyst and
+    # visualize: entries whenever the executed SQL has real shaping to show).
+    try:
+        shaping_slide = _slide_question_shaping(sql)
+    except Exception:
+        shaping_slide = None
+    if shaping_slide:
+        slides.append(shaping_slide)
 
     # 7. Making sense of the categories (visualize: entries only, when the
     # real result has a resolvable category column — never invented).
