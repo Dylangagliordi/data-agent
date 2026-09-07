@@ -268,6 +268,7 @@ WARN_LEVEL_PREFIXES = (
     "Trailing empty column:",
     "Special characters in headers:",
     "Inconsistent granularity:",
+    "Structural noise in prose:",
 )
 
 
@@ -384,9 +385,34 @@ def _check_missing_values(df: pd.DataFrame) -> list:
     return issues
 
 
+_ROW_INDEX_NAME_HINTS = ("index", "row_id", "rownum", "row_number")
+
+
+def _looks_like_row_index_column(name: str, series: pd.Series) -> bool:
+    """True when a column is an obvious raw row-index carried over from the
+    source file (e.g. pandas' own default index re-saved as a real 'index'
+    column, or an 'Unnamed: 0' column from a CSV written with index=True) —
+    not real data. Requires BOTH the name to look index-like AND the values to
+    actually be sequential (_is_sequential_id_like_column) so a genuine data
+    column that happens to be named 'index' but doesn't behave like one is
+    never excluded on name alone.
+
+    A raw leading index column like this makes every row look artificially
+    unique to a plain df.duplicated() call, structurally hiding real duplicate
+    rows (e.g. the reference notebook for this dataset loads with
+    index_col="index", excluding it before comparing; this project's loader
+    doesn't, so this column must be excluded from the comparison instead).
+    """
+    name_lower = name.strip().lower()
+    name_matches = name_lower in _ROW_INDEX_NAME_HINTS or name_lower.startswith("unnamed:")
+    return name_matches and _is_sequential_id_like_column(series)
+
+
 def _check_duplicates(df: pd.DataFrame) -> list:
     issues = []
-    dup_row_count = df.duplicated().sum()
+    index_like_cols = [c for c in df.columns if _looks_like_row_index_column(c, df[c])]
+    compare_df = df.drop(columns=index_like_cols) if index_like_cols else df
+    dup_row_count = compare_df.duplicated().sum()
     if dup_row_count:
         issues.append(f"Duplicate rows: {dup_row_count} fully duplicate rows found.")
 
@@ -494,6 +520,46 @@ def _check_formatting_noise(df: pd.DataFrame) -> list:
                 f"Formatting noise: column '{col}' has {stripped_diff} values with stray "
                 "leading/trailing whitespace."
             )
+    return issues
+
+
+_PROSE_BULLET_CHARS = ("•", "◦", "▪", "‣", "●", "∙")
+
+
+def _check_prose_structural_noise(df: pd.DataFrame) -> list:
+    """Bullet characters and embedded newlines inside long-form prose columns
+    (e.g. a free-text "Job Description" field). This is structurally invisible
+    to every other static check (none target prose specifically) AND to
+    discovery (_is_long_form_prose_column makes explore_column skip prose
+    columns entirely — see its docstring), so without this check the pattern
+    is never caught anywhere in the pipeline.
+
+    Deliberately a fixed-pattern MECHANICAL check, not exploratory: bullets
+    should become periods and embedded newlines should collapse to spaces —
+    there's one clearly correct fix (mirroring what the reference notebook for
+    this dataset does), so this belongs in the static warn-level rubric like
+    _check_formatting_noise, not routed through the LLM-driven discovery pass.
+    """
+    issues = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str)
+        if series.empty or not _is_long_form_prose_column(df[col]):
+            continue
+        has_bullet = series.apply(lambda v: any(ch in v for ch in _PROSE_BULLET_CHARS))
+        bullet_count = has_bullet.sum()
+        newline_count = series.str.contains("\n").sum()
+        if not bullet_count and not newline_count:
+            continue
+        parts = []
+        if bullet_count:
+            parts.append(f"{bullet_count} value(s) contain bullet characters")
+        if newline_count:
+            parts.append(f"{newline_count} value(s) contain embedded newlines")
+        issues.append(
+            f"Structural noise in prose: column '{col}' has " + " and ".join(parts) +
+            " — bullet characters should become periods and embedded newlines should "
+            "collapse to spaces."
+        )
     return issues
 
 
@@ -1023,6 +1089,7 @@ def check_rubric(file_path) -> list:
     issues += _check_dtypes(df)
     issues += _check_categorical_inconsistency(df)
     issues += _check_formatting_noise(df)
+    issues += _check_prose_structural_noise(df)
     issues += _check_impossible_values(df)
     issues += _check_placeholder_values(df)
     issues += _check_boolean_inconsistency(df)
@@ -1140,7 +1207,33 @@ def _extract_spreadsheet_artifact_kind(issue: str) -> "str | None":
     return None
 
 
-def _issue_treatment_signature(issue: str) -> "tuple | None":
+def _column_value_type_category(series: pd.Series) -> str:
+    """Coarse general value-type classification for a column's real non-null
+    values, used to keep batching (see _issue_treatment_signature below) from
+    grouping a numeric column together with a text column that merely happens
+    to share the same placeholder/symbol tokens. Every column in this project
+    is read with dtype=str (see _read_csv_robust), so pandas' own dtype is
+    always "object" and can't distinguish these — this infers the real value
+    shape from content instead.
+
+    Returns "numeric" when at least _NUMERIC_TYPE_CATEGORY_THRESHOLD of real
+    values parse as numbers, else "text". Two categories, not more: the one
+    real, observed batching bug this fixes (Rating batched with Headquarters/
+    Founded) is a numeric/text mismatch, not a finer-grained type distinction.
+    """
+    non_null = series.dropna().astype(str).str.strip()
+    non_null = non_null[non_null != ""]
+    if non_null.empty:
+        return "text"
+    numeric = pd.to_numeric(non_null, errors="coerce")
+    numeric_frac = numeric.notna().mean()
+    return "numeric" if numeric_frac >= _NUMERIC_TYPE_CATEGORY_THRESHOLD else "text"
+
+
+_NUMERIC_TYPE_CATEGORY_THRESHOLD = 0.8
+
+
+def _issue_treatment_signature(issue: str, df: "pd.DataFrame | None" = None) -> "tuple | None":
     """Return a hashable signature identifying the exact fix treatment this
     issue requires, or None if this issue type has no defined signature
     (meaning: never group it — always process alone). Two issues with equal,
@@ -1156,35 +1249,55 @@ def _issue_treatment_signature(issue: str) -> "tuple | None":
     values, inconsistent delimiters, inconsistent granularity, formatting
     noise, control characters, and the discovery-phase "(discovered)" issues —
     returns None here and always stays on the one-at-a-time path.
+
+    dtype-aware (safety fix): when df is given, the flagged column's real
+    value-type category (_column_value_type_category — "numeric" or "text")
+    is appended to the signature, so two issues only batch together when both
+    the tokens AND the general value type genuinely match — otherwise a
+    numeric column (e.g. Rating) could batch with a text column (e.g.
+    Headquarters) purely by coincidence of sharing a token set (e.g. both
+    using "-1" as a placeholder), producing a type-mismatched fix. df is
+    optional and defaults to None (no dtype narrowing) so direct signature-only
+    callers/tests that only care about token extraction, not batching safety,
+    are unaffected.
     """
+    base = None
     if issue.startswith("Placeholder values:"):
         tokens = _extract_placeholder_tokens(issue)
-        return ("placeholder", tokens) if tokens else None
+        base = ("placeholder", tokens) if tokens else None
 
-    if issue.startswith("Currency/unit symbols:"):
+    elif issue.startswith("Currency/unit symbols:"):
         symbols = _extract_currency_unit_symbols(issue)
-        return ("currency_unit", symbols) if symbols else None
+        base = ("currency_unit", symbols) if symbols else None
 
-    if issue.startswith("Spreadsheet artifacts:"):
+    elif issue.startswith("Spreadsheet artifacts:"):
         kind = _extract_spreadsheet_artifact_kind(issue)
-        return ("spreadsheet_artifact", kind) if kind is not None else None
+        base = ("spreadsheet_artifact", kind) if kind is not None else None
 
-    if issue.startswith("Locale-specific number formatting:"):
+    elif issue.startswith("Locale-specific number formatting:"):
         pair = _extract_locale_format_pair(issue)
-        return ("locale_format", pair) if pair else None
+        base = ("locale_format", pair) if pair else None
 
-    if issue.startswith("Inconsistent boolean representations:"):
+    elif issue.startswith("Inconsistent boolean representations:"):
         families = _extract_boolean_families(issue)
-        return ("boolean_families", families) if families else None
+        base = ("boolean_families", families) if families else None
 
-    if issue.startswith("Lost leading zeros:"):
+    elif issue.startswith("Lost leading zeros:"):
         length = _extract_leading_zero_target_length(issue)
-        return ("leading_zeros", length) if length is not None else None
+        base = ("leading_zeros", length) if length is not None else None
 
-    return None
+    if base is None or df is None:
+        return base
+
+    col_match = _ISSUE_COLUMN_RE.search(issue)
+    if not col_match or col_match.group(1) not in df.columns:
+        return base
+
+    dtype_category = _column_value_type_category(df[col_match.group(1)])
+    return base + (dtype_category,)
 
 
-def _group_issues_by_signature(issues: list) -> list:
+def _group_issues_by_signature(issues: list, df: "pd.DataFrame | None" = None) -> list:
     """Partition issues into groups for processing. Issues whose
     _issue_treatment_signature matches (non-None and equal) are grouped
     together (2+ issues per group); every issue with signature None, or with a
@@ -1192,12 +1305,18 @@ def _group_issues_by_signature(issues: list) -> list:
     group. Order of groups follows the order the first issue in each group was
     originally found — preserves check_rubric's original ordering for anything
     not grouped.
+
+    df: optional, forwarded to _issue_treatment_signature so grouping is
+    dtype-aware (see its docstring) — pass the file's real DataFrame to
+    prevent a numeric column batching with a text column that merely shares
+    the same tokens. Defaults to None (no dtype narrowing) for direct callers
+    that only need the pre-existing token-based grouping.
     """
     groups: dict = {}
     order: list = []
 
     for issue in issues:
-        sig = _issue_treatment_signature(issue)
+        sig = _issue_treatment_signature(issue, df=df)
         if sig is None:
             order.append(("single", issue))
             continue
@@ -1215,7 +1334,7 @@ def _group_issues_by_signature(issues: list) -> list:
     return result
 
 
-def _partition_warn_groups(warn_issues: list) -> list:
+def _partition_warn_groups(warn_issues: list, df: "pd.DataFrame | None" = None) -> list:
     """Warn-level counterpart to the fail-level grouping above, but with one
     deliberate difference: warn-level issues have ALWAYS been processed as one
     single combined batch (unlike fail-level, which was always one-at-a-time) —
@@ -1227,10 +1346,13 @@ def _partition_warn_groups(warn_issues: list) -> list:
     final combined batch, preserving the original "always one whole-file warn
     batch" behavior for anything that isn't a genuine multi-issue signature
     match. Returns [] for an empty input (no warn issues at all).
+
+    df: optional, forwarded to _group_issues_by_signature for dtype-aware
+    grouping — see its docstring.
     """
     if not warn_issues:
         return []
-    raw_groups = _group_issues_by_signature(warn_issues)
+    raw_groups = _group_issues_by_signature(warn_issues, df=df)
     real_batches = [g for g in raw_groups if len(g) >= 2]
     leftover = [issue for g in raw_groups if len(g) < 2 for issue in g]
     return real_batches + [leftover] if leftover else real_batches
@@ -1861,13 +1983,16 @@ def _signature_to_jsonable(signature: "tuple | None"):
     """Convert a treatment signature (which may contain a frozenset — not
     JSON-serializable on its own) into a plain, JSON-serializable form for the
     cleaning log, e.g. ("placeholder", frozenset({'-1'})) -> ["placeholder", ["-1"]].
+
+    A dtype-aware signature (see _issue_treatment_signature) carries a third
+    element (the value-type category string, e.g. "numeric") — passed through
+    as-is since it's already JSON-serializable.
     """
     if signature is None:
         return None
-    kind, payload = signature
-    if isinstance(payload, frozenset):
-        return [kind, sorted(payload)]
-    return [kind, payload]
+    kind, payload, *rest = signature
+    payload_jsonable = sorted(payload) if isinstance(payload, frozenset) else payload
+    return [kind, payload_jsonable, *rest]
 
 
 @dataclass
@@ -2783,22 +2908,46 @@ _RANGE_PAIR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Open-ended range shapes (Spec 1, Part 6) — a real range value with only ONE
+# bound known, not a pair. Seen live in this dataset's own Revenue column
+# ("$10+ billion (USD)", "Less than $1 million (USD)"), which a pair-only
+# regex structurally cannot recognize as range-shaped at all — this is exactly
+# the gap that caused Revenue's real match fraction to undercount before this
+# fix (a "-" or "to" pair is not the only legitimate range shape).
+# Unbounded minimum: a number immediately followed by "+", e.g. "$10+ billion".
+_RANGE_OPEN_MIN_RE = re.compile(
+    rf"^\s*[{re.escape(CURRENCY_SYMBOLS)}]?\s*\d[\d,]*(?:\.\d+)?\+\s*(?:{_RANGE_SCALE_ALT})?",
+    re.IGNORECASE,
+)
+# Unbounded maximum: "less than" (or "under") followed by one number part,
+# e.g. "Less than $1 million".
+_RANGE_OPEN_MAX_RE = re.compile(
+    rf"^\s*(?:less\s+than|under)\s+{_RANGE_NUMBER_PART}",
+    re.IGNORECASE,
+)
+
 
 def _detect_range_columns(df: pd.DataFrame) -> list:
     """Deterministic, no-LLM detector for columns that consistently hold a
-    numeric min-max range (e.g. "$137K-$171K (Glassdoor est.)", "$1 to $2
-    billion (USD)") — a candidate for OPT-IN structured decomposition (see
-    decompose_range_column below), never automatically triggered and never
-    added to check_rubric's issue list (see this section's module comment for
-    why: this is a schema-enrichment option, not a data-quality problem).
+    numeric range — a closed pair (e.g. "$137K-$171K (Glassdoor est.)", "$1 to
+    $2 billion (USD)") or an open-ended bound (e.g. "$10+ billion (USD)",
+    "Less than $1 million (USD)" — Spec 1, Part 6: seen live in this dataset's
+    own Revenue column, and structurally invisible to a pair-only pattern). A
+    candidate for OPT-IN structured decomposition (see decompose_range_column
+    below), never automatically triggered and never added to check_rubric's
+    issue list (see this section's module comment for why: this is a
+    schema-enrichment option, not a data-quality problem).
 
-    _RANGE_PAIR_RE tolerates an optional leading currency symbol and scale
-    suffix on each side of the range, so this correctly recognizes a range
-    shape whether or not upstream currency/unit cleanup has already stripped
-    the surrounding $/K symbols by the time this runs (clean_dataset() runs
-    this AFTER a file's normal cleaning finishes — see its wiring below) — no
-    separate "has this column's currency issue already been resolved" check is
-    needed, since the pattern itself already handles both forms.
+    A value counts as a match if it matches ANY of: _RANGE_PAIR_RE (a closed
+    "X-Y"/"X to Y" pair), _RANGE_OPEN_MIN_RE (an unbounded minimum, "X+"), or
+    _RANGE_OPEN_MAX_RE ("less than X" / "under X", an unbounded maximum). All
+    three tolerate an optional leading currency symbol and scale suffix, so
+    this correctly recognizes a range shape whether or not upstream currency/
+    unit cleanup has already stripped the surrounding $/K symbols by the time
+    this runs (clean_dataset() runs this AFTER a file's normal cleaning
+    finishes — see its wiring below) — no separate "has this column's
+    currency issue already been resolved" check is needed, since the patterns
+    themselves already handle both forms.
 
     Returns a list of {"column": str, "match_fraction": float,
     "sample_pattern": str} dicts for every column clearing
@@ -2810,7 +2959,11 @@ def _detect_range_columns(df: pd.DataFrame) -> list:
         series = df[col].dropna().astype(str).str.strip()
         if series.empty:
             continue
-        matches = series.str.match(_RANGE_PAIR_RE)
+        matches = (
+            series.str.match(_RANGE_PAIR_RE)
+            | series.str.match(_RANGE_OPEN_MIN_RE)
+            | series.str.match(_RANGE_OPEN_MAX_RE)
+        )
         match_count = int(matches.sum())
         match_fraction = match_count / len(series)
         if match_fraction >= RANGE_DECOMPOSITION_MATCH_THRESHOLD:
@@ -2853,6 +3006,11 @@ rules below:
 - All added columns must use ONE consistent unit (e.g. convert "billion" ranges to the
   same unit as "million" ranges before writing the numeric value) — state your chosen
   unit in a one-line code comment.
+- Some real values are OPEN-ENDED, not a closed pair — e.g. "$10+ billion" (a known
+  minimum, no known maximum) or "Less than $1 million" (a known maximum, no known
+  minimum). For these: fill in the ONE bound that's actually known, leave the OTHER
+  bound null/NaN (never guess it), and leave the average null/NaN too (an average
+  needs both real bounds — do not average a known bound with a guessed one).
 - For any value that doesn't match a clean numeric range (unparseable, a single value
   with no range, a non-numeric placeholder), leave the new columns as null/NaN for that
   row rather than guessing.
@@ -3090,6 +3248,281 @@ def decompose_range_column(file_path: Path, candidate: dict, llm=None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Spec 1, Part 8: verbose categorical label simplification (e.g. "51 to 200
+# employees" -> "51-200"). Purely a STYLE choice, not a correctness fix or an
+# enrichment — nothing is objectively wrong with the verbose form, and no new
+# column is added; the same column is rewritten in place with shorter,
+# equivalent values. Kept out of check_rubric's issue list (same reasoning as
+# range decomposition above: this is a judgment call, not a data-quality
+# problem), detected purely mechanically (no LLM), and offered through
+# Transformation Options only when relevant to the current question's
+# category/grouping dimension (see utils.transformation_options.
+# surface_relevant_transformations, which already does this generically via
+# chart_category_column — no special-casing needed for this kind).
+# ---------------------------------------------------------------------------
+
+LABEL_SIMPLIFICATION_MATCH_THRESHOLD = 0.8
+
+# A verbose "N [to M] <unit word>" categorical label — e.g. "51 to 200
+# employees", "10000+ employees". Deliberately narrower than "any column
+# whose values share a common trailing word" (which would over-fire on any
+# descriptive categorical column) — this targets the specific redundant-
+# numeric-range-plus-repeated-unit-word shape the reference notebook actually
+# shortens.
+_VERBOSE_LABEL_RE = re.compile(
+    r"^\d[\d,]*\+?\s*(?:to\s+\d[\d,]*\+?)?\s+[A-Za-z]+$",
+    re.IGNORECASE,
+)
+
+
+def _detect_label_simplification_columns(df: pd.DataFrame) -> list:
+    """Deterministic, no-LLM detector (same discipline as
+    _detect_range_columns): a categorical column where
+    LABEL_SIMPLIFICATION_MATCH_THRESHOLD or more of its real non-null values
+    match the verbose "N [to M] <unit>" shape. Returns
+    [{"column", "match_fraction", "sample_value"}, ...]. Never modifies df.
+    """
+    candidates = []
+    for col in df.columns:
+        series = df[col].dropna().astype(str).str.strip()
+        if series.empty:
+            continue
+        matches = series.str.match(_VERBOSE_LABEL_RE)
+        match_fraction = int(matches.sum()) / len(series)
+        if match_fraction >= LABEL_SIMPLIFICATION_MATCH_THRESHOLD:
+            candidates.append({
+                "column": col,
+                "match_fraction": match_fraction,
+                "sample_value": series[matches].iloc[0],
+            })
+    return candidates
+
+
+LABEL_SIMPLIFICATION_SYSTEM_PROMPT = """You are simplifying the STYLE of one verbose
+categorical column, named below, into shorter, equivalent labels — e.g. "51 to 200
+employees" -> "51-200", "10000+ employees" -> "10000+". This is NOT a correctness fix
+(the verbose form is not wrong) and NOT an enrichment (no new column) — it's a pure
+style/readability choice, rewriting the SAME column's values in place.
+
+IMPORTANT — check this first: the verbose pattern was matched mechanically and can be a
+false positive. Look at the real sample values given below. If this column does NOT
+actually hold a genuinely redundant/verbose label worth shortening, output exactly this
+and nothing else:
+
+# NO_SIMPLIFICATION: <one-sentence reason this column should not be simplified>
+
+Do not force a simplification just because the pattern matched. A correct "no
+simplification needed" response is a successful outcome, not a failure — you will not be
+asked to retry if you decline for a real reason.
+
+If the column DOES genuinely hold verbose labels worth shortening, follow these rules:
+- Rewrite the SAME column's values in place — do not add a new column, do not rename the
+  column, do not touch any other column.
+- Preserve every real distinction between values (a range must stay recognizable as that
+  range, e.g. "-" between the two numbers) — never collapse two genuinely different
+  values into the same simplified label.
+- A value that does NOT match the verbose pattern (a placeholder like "-1"/"Unknown", or
+  anything else already short) must be left completely unchanged.
+- Output ONLY raw Python code — no explanation, no markdown fences, no backticks —
+  UNLESS you are declining, in which case output ONLY the "# NO_SIMPLIFICATION: ..." line
+  above.
+- The script must read the CSV at the exact path given, rewrite the column's values, and
+  write the result back to that same path (overwrite in place).
+"""
+
+_NO_SIMPLIFICATION_RE = re.compile(r"^#\s*NO_SIMPLIFICATION:\s*(.+)$", re.IGNORECASE)
+
+
+def _extract_no_simplification_reason(code: str) -> "str | None":
+    """Same discipline as _extract_no_decomposition_reason — returns the
+    reason if `code` is exactly a NO_SIMPLIFICATION sentinel response, else
+    None."""
+    stripped = (code or "").strip()
+    match = _NO_SIMPLIFICATION_RE.match(stripped)
+    if match and "\n" not in stripped:
+        return match.group(1).strip()
+    return None
+
+
+def _generate_label_simplification_code(
+    file_path: Path, column: str, candidate: dict, llm,
+    previous_code: str = "", previous_error: str = "",
+) -> str:
+    """Mirrors _generate_range_decomposition_code's shape exactly, but for
+    the label-simplification prompt."""
+    df = _read_csv_robust(file_path)
+    file_context = _describe_file_for_prompt(file_path, df=df)
+    match_fraction = candidate.get("match_fraction", 0.0)
+    sample_value = candidate.get("sample_value", "")
+
+    human_content = (
+        f"File to restyle (read and overwrite this exact path): {file_path}\n\n"
+        f"{file_context}\n\n"
+        f"The candidate column for label simplification: '{column}'\n"
+        f"Mechanically detected: {match_fraction:.0%} of its real non-null values match "
+        f"a verbose 'N [to M] <unit>' shape (e.g. {sample_value!r}).\n\n"
+        "Inspect the real sample values above for this column before deciding whether "
+        "to simplify it or decline."
+    )
+
+    hints_path = file_path.parent.parent / "hints.txt"
+    if hints_path.exists():
+        hints_text = hints_path.read_text().strip()
+        if hints_text:
+            human_content += (
+                f"\n\nDataset-specific context (domain knowledge about this data — "
+                f"treat these facts as authoritative when generating code):\n{hints_text}"
+            )
+
+    if previous_error:
+        human_content += (
+            "\n\nA previous attempt at this file's simplification script did not fully "
+            f"succeed — fix the script so it actually works:\n{previous_error}"
+            f"\n\nPrevious script was:\n{previous_code}"
+        )
+
+    response = llm.invoke(
+        [
+            ("system", LABEL_SIMPLIFICATION_SYSTEM_PROMPT),
+            ("human", human_content),
+        ]
+    )
+    content = response.content
+    if isinstance(content, list):
+        text = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+            if not (isinstance(block, dict) and block.get("type") == "thinking")
+        )
+    else:
+        text = content
+    return _strip_code_formatting(text)
+
+
+def _label_simplification_shape_ok(file_path: Path, original_columns: list, flagged_column: str) -> tuple:
+    """Post-fix verification for a style-only in-place rewrite — unlike range
+    decomposition/feature derivation (which ADD columns), this must add and
+    drop NOTHING: the exact same columns must still be present, and the
+    flagged column's values must no longer be MOSTLY verbose (allowing for
+    genuinely non-matching values like "-1"/"Unknown" that were never
+    supposed to change). Returns (ok, reason).
+    """
+    try:
+        current_df = _read_csv_robust(file_path)
+    except Exception as e:
+        return False, f"Could not re-read the file after the fix: {e}"
+
+    current_columns = list(current_df.columns)
+    if current_columns != original_columns:
+        return False, (
+            f"Expected the exact same columns as before (a style-only rewrite adds/drops "
+            f"no columns), found {current_columns} vs original {original_columns}."
+        )
+    if flagged_column not in current_df.columns:
+        return False, f"Column '{flagged_column}' is missing after the fix."
+
+    series = current_df[flagged_column].dropna().astype(str).str.strip()
+    if series.empty:
+        return False, f"Column '{flagged_column}' has no real values after the fix."
+    still_verbose_fraction = series.str.match(_VERBOSE_LABEL_RE).mean()
+    if still_verbose_fraction > (1 - LABEL_SIMPLIFICATION_MATCH_THRESHOLD):
+        return False, (
+            f"Expected the verbose pattern mostly replaced, but "
+            f"{still_verbose_fraction:.0%} of values still match the original verbose shape."
+        )
+    return True, ""
+
+
+def simplify_labels(file_path: Path, candidate: dict, llm=None) -> dict:
+    """Opt-in style-only label simplification for ONE candidate column (see
+    _detect_label_simplification_columns). Own generate -> approve -> execute
+    -> re-check cycle, entirely separate from clean_dataset()'s fail/warn
+    loop and from range decomposition/feature derivation's add-a-column
+    shape — this REWRITES the flagged column's values in place, adding
+    nothing. NEVER called automatically. Reuses the exact same
+    _request_approval/_execute_cleaning_code as every other fix in this
+    pipeline.
+
+    Returns {"column", "status", "attempts", "error", "generated_code"};
+    status uses the same vocabulary as decompose_range_column's, including
+    "declined_false_positive" for a legitimate NO_SIMPLIFICATION decline —
+    checked immediately after generation, BEFORE any approval prompt or
+    execution, on every attempt (Spec 2.1's retry-pressure lesson, applied
+    here from the start).
+    """
+    column = candidate["column"]
+    if llm is None:
+        from utils.llm_pick import pick_llm
+        llm = pick_llm("high")
+
+    try:
+        original_columns = list(_read_csv_robust(file_path).columns)
+    except Exception as e:
+        return {
+            "column": column, "status": "skipped_failed", "attempts": 0,
+            "error": f"Could not read {file_path} to establish a baseline: {e}",
+            "generated_code": "",
+        }
+
+    previous_code = ""
+    previous_error = ""
+    attempt = 0
+    last_code = ""
+
+    while attempt < MAX_CLEAN_ATTEMPTS:
+        attempt += 1
+        code = _generate_label_simplification_code(
+            file_path, column, candidate, llm, previous_code, previous_error
+        )
+
+        no_simplification_reason = _extract_no_simplification_reason(code)
+        if no_simplification_reason is not None:
+            return {
+                "column": column, "status": "declined_false_positive", "attempts": attempt,
+                "error": no_simplification_reason, "generated_code": "",
+            }
+
+        approved = _request_approval(code, file_path)
+        if not approved:
+            return {
+                "column": column, "status": "skipped_declined", "attempts": attempt,
+                "error": "", "generated_code": "",
+            }
+
+        success, error = _execute_cleaning_code(code, file_path)
+        if not success:
+            previous_code, previous_error = code, error
+            last_code = code
+            if attempt >= MAX_CLEAN_ATTEMPTS:
+                return {
+                    "column": column, "status": "skipped_failed", "attempts": attempt,
+                    "error": error, "generated_code": last_code,
+                }
+            continue
+
+        last_code = code
+        shape_ok, shape_reason = _label_simplification_shape_ok(file_path, original_columns, column)
+        if shape_ok:
+            return {
+                "column": column, "status": "resolved", "attempts": attempt,
+                "error": "", "generated_code": last_code,
+            }
+
+        previous_code = code
+        previous_error = shape_reason
+        if attempt >= MAX_CLEAN_ATTEMPTS:
+            return {
+                "column": column, "status": "skipped_incomplete", "attempts": attempt,
+                "error": shape_reason, "generated_code": last_code,
+            }
+
+    return {
+        "column": column, "status": "skipped_incomplete", "attempts": attempt,
+        "error": previous_error, "generated_code": last_code,
+    }
+
+
 def _extract_reasoning_comments(code: str) -> list:
     """Pull the # comment lines from a generated cleaning script — these are the LLM's
     reasoning about WHY each transformation was applied, not just what it did."""
@@ -3263,7 +3696,7 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
         # signature unique among this file's fail issues) is still processed exactly
         # as before — its own cycle, one at a time (-> IssueCleaningRecord), in the
         # order check_rubric() found them.
-        for group in _group_issues_by_signature(fail_issues):
+        for group in _group_issues_by_signature(fail_issues, df=exploration_df):
             status, attempts, error, remaining, code = _clean_issue_group(
                 cloned_path, group, resolved_llm, pattern_lookup=pattern_lookup
             )
@@ -3278,7 +3711,7 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
                 fail_batch_records.append(
                     FailBatchRecord(
                         issues=group,
-                        signature=_issue_treatment_signature(group[0]),
+                        signature=_issue_treatment_signature(group[0], df=exploration_df),
                         status=status,
                         attempts=attempts,
                         error=error,
@@ -3300,7 +3733,7 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
         # _partition_warn_groups. Skipped entirely if a fail-level issue was declined
         # above.
         if not declined:
-            warn_groups = _partition_warn_groups(warn_issues)
+            warn_groups = _partition_warn_groups(warn_issues, df=exploration_df)
             if warn_groups:
                 for group in warn_groups:
                     status, attempts, error, remaining, code = _clean_issue_group(

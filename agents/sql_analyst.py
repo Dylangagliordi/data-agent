@@ -359,10 +359,14 @@ def add_context(state: SQLAnalystState) -> dict:
                 SELECT table_name, column_name, data_type
                 FROM information_schema.columns
                 WHERE table_schema = %s
-                  AND table_name NOT IN (%s, %s)
+                  AND table_name NOT IN (%s, %s, %s, %s, %s)
                 ORDER BY table_name, ordinal_position
                 """,
-                ("public", "_data_quality_status", "_fanout_status"),
+                (
+                    "public", "_data_quality_status", "_fanout_status",
+                    "_transformation_candidates", "_transformation_decisions",
+                    "_derived_columns",
+                ),
             )
             rows = cur.fetchall()
 
@@ -445,7 +449,20 @@ def add_context(state: SQLAnalystState) -> dict:
         sections = []
         with conn.cursor() as cur:
             for table_name, columns in tables.items():
-                col_lines = "\n".join(f"  - {c} ({t})" for c, t in columns)
+                # Spec 1, Part 7: any column previously added by a Transformation
+                # Options fix (feature derivation, range decomposition, label
+                # simplification) is marked "derived, not source" here, straight in
+                # the schema context generate_sql reads — so a derived value (e.g. a
+                # computed company_age) is never presented, generated against, or
+                # disclosed as an originally-observed fact.
+                from utils.load_data import get_derived_columns
+
+                derived_cols = get_derived_columns(conn, table_name)
+                col_lines = "\n".join(
+                    f"  - {c} ({t})"
+                    + (f" [DERIVED via {derived_cols[c]} — not an observed source value]" if c in derived_cols else "")
+                    for c, t in columns
+                )
 
                 # Table identifiers can't be bound as %s placeholders (Postgres only
                 # parameterizes values, not identifiers) but table_name here comes
@@ -2747,19 +2764,25 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
     import sys as _sys
     from pathlib import Path
 
-    from utils.data_cleaning import clean_dataset, unresolved_issues_for_record
+    from utils.data_cleaning import _read_csv_robust, clean_dataset, unresolved_issues_for_record
     from utils.load_data import (
         check_source_freshness,
         compute_and_write_fanout_status,
         compute_file_checksum,
         compute_quality_status,
         ensure_data_quality_status_table,
+        ensure_derived_columns_table,
         ensure_fanout_status_table,
+        ensure_transformation_candidates_table,
+        ensure_transformation_decisions_table,
         get_admin_connection,
+        invalidate_cached_decisions_for_table,
         load_csv_to_table,
         sanitize_identifier,
         write_data_quality_status,
+        write_transformation_candidates,
     )
+    from utils.transformation_options import detect_transformation_candidates
 
     if not _sys.stdin.isatty():
         table_names_all = [item["table"] for item in state.tables_to_clean]
@@ -2787,6 +2810,9 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
     try:
         ensure_data_quality_status_table(conn)
         ensure_fanout_status_table(conn)
+        ensure_transformation_candidates_table(conn)
+        ensure_transformation_decisions_table(conn)
+        ensure_derived_columns_table(conn)
 
         for source_folder, table_names in folder_to_tables.items():
             folder_path = Path(source_folder)
@@ -2851,6 +2877,16 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
                     source_checksum=compute_file_checksum(target_csv),
                 )
                 compute_and_write_fanout_status(conn, table_name)
+
+                # Spec 1, Part 0: (re-)detect Transformation Options candidates on
+                # this fresh reload and invalidate any previously-cached decisions
+                # for this table — see the reload-invalidation rule in
+                # utils/transformation_options.py's module docstring.
+                reloaded_df = _read_csv_robust(load_path)
+                candidates = detect_transformation_candidates(reloaded_df, table_name)
+                write_transformation_candidates(conn, table_name, candidates)
+                invalidate_cached_decisions_for_table(conn, table_name)
+
                 newly_attempted.append(table_name)
     finally:
         conn.close()
@@ -2872,14 +2908,240 @@ def route_after_clean_and_reload(state: SQLAnalystState) -> str:
     return "add_context"
 
 
+_TABLE_CONTEXT_RE = re.compile(r"^Table: (\S+)$", re.MULTILINE)
+
+
+def _transformation_menu_for(candidate) -> tuple:
+    """Builds the (context, options) pair for present_transformation_options
+    for one candidate. Every kind gets a plain "Apply now" option except
+    "company_age", which gets Part 7's own explicit missing-Founded
+    sub-choice — the "age 0" option is labeled as a deliberate assumption,
+    never presented as an observed fact."""
+    context = {
+        "title": f"{candidate.kind.replace('_', ' ').title()} for {', '.join(candidate.columns)}?",
+        "what_was_found": candidate.description,
+        "why_optional": (
+            "This is a judgment call (schema enrichment or style choice), not a "
+            "correctness fix — reasonable people could choose differently, or skip "
+            "it entirely."
+        ),
+    }
+    if candidate.kind == "company_age":
+        options = [
+            {
+                "id": "apply_null",
+                "label": "Apply (missing founding year -> null age)",
+                "description": "Rows with no usable founding year get a null company_age.",
+            },
+            {
+                "id": "apply_age_zero",
+                "label": "Apply (missing founding year -> age 0 — DELIBERATE ASSUMPTION)",
+                "description": (
+                    "Rows with no usable founding year are ASSUMED founded this year — "
+                    "this is a deliberate assumption, not an observed fact."
+                ),
+            },
+        ]
+    else:
+        options = [
+            {"id": "apply", "label": "Apply now", "description": "Add/apply this transformation now."}
+        ]
+    return context, options
+
+
+def _apply_chosen_transformation(conn, table_name: str, source_folder: str, candidate, chosen_option_id: str) -> bool:
+    """Actually runs the chosen Transformation Options fix (Spec 1, Parts 6/7/8)
+    against the table's real cleaned CSV, reloads the table, marks any new
+    columns "derived, not source" (Part 7), and refreshes the stored
+    candidate list against the now-current file — mirrors clean_and_reload's
+    own mutate -> reload -> refresh-bookkeeping sequence, but for an opt-in
+    enrichment/style decision instead of a mandatory correctness fix.
+
+    Deliberately does NOT call invalidate_cached_decisions_for_table here —
+    that's reserved for a genuine source-file reload/re-clean (see
+    utils/transformation_options.py's module docstring); the decision just
+    made for THIS candidate must survive this same reload, not be wiped by it.
+
+    Returns True if something was actually applied (schema may have
+    changed), False for "skip" or a decline/failure outcome.
+    """
+    if chosen_option_id == "skip":
+        return False
+
+    from utils.data_cleaning import (
+        _detect_label_simplification_columns,
+        _detect_range_columns,
+        _read_csv_robust,
+        decompose_range_column,
+        simplify_labels,
+    )
+    from utils.feature_derivation import derive_features
+    from utils.load_data import load_csv_to_table, mark_derived_columns, sanitize_identifier
+    from utils.transformation_options import detect_transformation_candidates, write_transformation_candidates
+
+    target_csv = _find_source_csv(Path(source_folder), table_name, sanitize_identifier)
+    if target_csv is None:
+        return False
+    load_path = target_csv.parent / "cleaned" / target_csv.name
+    if not load_path.exists():
+        load_path = target_csv
+
+    column = candidate.columns[0]
+    df = _read_csv_robust(load_path)
+    mark_kind = None
+    new_columns: list = []
+
+    if candidate.kind == "range_decomposition":
+        entry = next((e for e in _detect_range_columns(df) if e["column"] == column), None)
+        if entry is None:
+            return False
+        result = decompose_range_column(load_path, entry)
+        new_columns = result.get("new_columns", [])
+        mark_kind = "range_decomposition"
+    elif candidate.kind == "label_simplification":
+        entry = next((e for e in _detect_label_simplification_columns(df) if e["column"] == column), None)
+        if entry is None:
+            return False
+        result = simplify_labels(load_path, entry)
+    else:
+        feature_spec = {"kind": candidate.kind, "columns": candidate.columns}
+        if candidate.kind == "company_age":
+            feature_spec["missing_founded_choice"] = (
+                "age_zero" if chosen_option_id == "apply_age_zero" else "null"
+            )
+        result = derive_features(load_path, feature_spec)
+        new_columns = result.get("new_columns", [])
+        mark_kind = candidate.kind
+
+    if result.get("status") != "resolved":
+        return False
+
+    load_csv_to_table(conn, load_path)
+    if new_columns and mark_kind:
+        mark_derived_columns(conn, table_name, new_columns, mark_kind)
+
+    refreshed_df = _read_csv_robust(load_path)
+    write_transformation_candidates(
+        conn, table_name, detect_transformation_candidates(refreshed_df, table_name)
+    )
+    return True
+
+
+def surface_transformations(state: SQLAnalystState) -> dict:
+    """Node (Spec 1, Parts 0.5/1 — live wiring): runs right after add_context,
+    before generate_sql/determine_chart_type.
+
+    For every real table currently in prompt_query_context (parsed from its
+    own "Table: <name>" lines — no extra schema query needed), reads that
+    table's STORED Transformation Options candidates (read_transformation_candidates
+    — never re-detects live, per Part 0's own discipline) and filters them to
+    THIS question via surface_relevant_transformations. A table still needing
+    Phase 1 cleaning (status "fail", or no known source_folder) is skipped —
+    route_after_add_context already sends those to clean_and_reload first;
+    Transformation Options only ever applies to an already-clean table.
+
+    Any relevant candidate not already decided (read_transformation_decision
+    against the durable _transformation_decisions cache) is presented via
+    present_transformation_options; if "apply" is chosen, the fix is applied
+    and the table reloaded immediately (_apply_chosen_transformation) so a
+    newly-derived column can be available to THIS SAME question's SQL
+    generation, not just the next one.
+
+    chart_category_column/chart_value_column are not yet known at this point
+    in the graph (resolved later, after execute_sql, on the visualization
+    path only) — surfacing here relies on surface_relevant_transformations'
+    other two signals instead: a touched-column match against
+    curated_question's own text, and a relevance_tags match against
+    curated_question directly.
+
+    Deliberately does NOT fail closed like clean_and_reload: Transformation
+    Options is optional enrichment, never required to answer a question, so a
+    non-interactive session (sys.stdin.isatty() is False) simply SKIPS
+    surfacing entirely (logged to stderr) rather than blocking or aborting —
+    a real, deliberate difference from clean_and_reload's mandatory,
+    fail-closed remediation gate.
+
+    If anything was actually applied, re-runs add_context itself to refresh
+    prompt_query_context/data_quality_warnings/data_quality_action/
+    tables_to_clean before generate_sql/route_after_add_context ever see
+    them; otherwise returns {} (a plain pass-through, no state change).
+    """
+    import sys as _sys
+
+    from utils.load_data import get_admin_connection, read_transformation_candidates, read_transformation_decision
+    from utils.transformation_options import present_transformation_options, surface_relevant_transformations
+
+    if not _sys.stdin.isatty():
+        print(
+            "[transformation-options] no interactive terminal available — skipping "
+            "Transformation Options surfacing for this question.",
+            file=_sys.stderr,
+        )
+        return {}
+
+    table_names = _TABLE_CONTEXT_RE.findall(state.prompt_query_context or "")
+    if not table_names:
+        return {}
+
+    conn = get_admin_connection()
+    applied_anything = False
+    try:
+        status_by_table = _fetch_data_quality_status(conn, table_names)
+        for table_name in table_names:
+            entry = status_by_table.get(table_name)
+            if entry is None:
+                continue
+            status, _issues, source_folder = entry
+            if status == "fail" or source_folder is None:
+                continue
+
+            candidates = read_transformation_candidates(conn, table_name)
+            if not candidates:
+                continue
+
+            relevant = surface_relevant_transformations(
+                curated_question=state.curated_question,
+                chart_category_column="",
+                chart_value_column="",
+                touched_columns=[],
+                candidates=candidates,
+            )
+            for candidate in relevant:
+                if read_transformation_decision(conn, table_name, candidate.candidate_id) is not None:
+                    continue  # already decided — reused silently, never re-asked (Part 1)
+                context, options = _transformation_menu_for(candidate)
+                decision = present_transformation_options(
+                    table_name=table_name,
+                    candidate_id=candidate.candidate_id,
+                    context=context,
+                    options=options,
+                    conn=conn,
+                )
+                if _apply_chosen_transformation(
+                    conn, table_name, source_folder, candidate, decision["chosen_option_id"]
+                ):
+                    applied_anything = True
+    finally:
+        conn.close()
+
+    if not applied_anything:
+        return {}
+    return add_context(state)
+
+
 def build_sql_analyst_graph():
     """Wire all nodes into a StateGraph using SQLAnalystState, and compile it.
 
     Graph shape (normal ask: path, wants_visualization=False):
-        START -> curate_question -> add_context
-        add_context --(route_after_add_context)--> generate_sql | clean_and_reload
-        clean_and_reload --(route_after_clean_and_reload)--> add_context (loop; stop
-            condition via cleaning_attempted_tables) | END (fail-closed: no interactive
+        START -> curate_question -> add_context -> surface_transformations
+        surface_transformations --(route_after_add_context)--> generate_sql | clean_and_reload
+            (Spec 1, Parts 0.5/1: surfaces/applies any relevant Transformation
+            Options candidate for an already-clean table before generate_sql
+            ever runs — see surface_transformations' own docstring. A plain
+            pass-through, {} state update, when nothing was applied.)
+        clean_and_reload --(route_after_clean_and_reload)--> add_context (loop, via
+            surface_transformations again; stop condition via
+            cleaning_attempted_tables) | END (fail-closed: no interactive
             stdin available to grant cleaning approval, see ApprovalUnavailableError)
         generate_sql -> is_safe
         is_safe --(route_after_safety_check)--> execute_sql | cancel_sql
@@ -2888,7 +3150,7 @@ def build_sql_analyst_graph():
         represent_final_answer -> END
 
     Additional visualization path (wants_visualization=True):
-        add_context --(route_after_add_context)--> determine_chart_type
+        surface_transformations --(route_after_add_context)--> determine_chart_type
         determine_chart_type -> generate_sql  (same generate_sql, extended prompt)
         execute_sql --(route_after_execute_sql)--> resolve_chart_columns
         resolve_chart_columns -> validate_chart_shape -> build_visualization
@@ -2898,6 +3160,7 @@ def build_sql_analyst_graph():
 
     graph.add_node("curate_question", curate_question)
     graph.add_node("add_context", add_context)
+    graph.add_node("surface_transformations", surface_transformations)
     graph.add_node("clean_and_reload", clean_and_reload)
     graph.add_node("determine_chart_type", determine_chart_type)
     graph.add_node("generate_sql", generate_sql)
@@ -2911,8 +3174,9 @@ def build_sql_analyst_graph():
 
     graph.add_edge(START, "curate_question")
     graph.add_edge("curate_question", "add_context")
+    graph.add_edge("add_context", "surface_transformations")
     graph.add_conditional_edges(
-        "add_context",
+        "surface_transformations",
         route_after_add_context,
         {
             "generate_sql": "generate_sql",

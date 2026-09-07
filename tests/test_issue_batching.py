@@ -263,7 +263,7 @@ try:
     batch3 = rec3.fail_batch_records[0]
     assert len(batch3.issues) == N_COLS
     assert batch3.status == "resolved", f"expected the batch resolved, got {batch3}"
-    assert batch3.signature == ("placeholder", frozenset({"-1"}))
+    assert batch3.signature == ("placeholder", frozenset({"-1"}), "text")
     print("PASS: all 8 issues landed in exactly ONE FailBatchRecord, resolved.\n")
 
     result_df3 = pd.read_csv(tmp_dir3 / "cleaned" / "data.csv", dtype=str)
@@ -571,6 +571,54 @@ assert "Stripped the $ symbol from column x" in html7 and "Stripped the $ symbol
 )
 print("PASS: report renders one combined block per fail batch (shared reasoning shown once) "
       "and correctly handles multiple warn batches.\n")
+
+print("=" * 70)
+print("TEST 8: dtype-aware signature (Part 4 safety fix) — a numeric column")
+print("and a text column sharing the same placeholder tokens must NOT batch")
+print("=" * 70)
+
+# Reproduces the real observed bug: 'Rating' (numeric) and 'Headquarters'
+# (text) each had a minority '-1' placeholder and were batched together under
+# one {'-1'} signature purely because the tokens matched, with no check that
+# the columns held the same general kind of value. 'City' is a second text
+# column with the same placeholder, added so the surviving text-side group
+# still has something real to batch.
+df_mixed_dtype = pd.DataFrame({
+    "rating": ["4.1", "3.9", "-1", "4.5", "3.2"],
+    "headquarters": ["New York, NY", "-1", "Boston, MA", "Austin, TX", "Denver, CO"],
+    "city": ["Chicago", "Miami", "-1", "Seattle", "Dallas"],
+})
+mixed_issues = dc._check_placeholder_values(df_mixed_dtype)
+by_col_mixed = {re.search(r"column '([^']+)'", i).group(1): i for i in mixed_issues}
+assert set(by_col_mixed) == {"rating", "headquarters", "city"}
+
+# Without a df, signatures are token-only (pre-existing behavior) and all three
+# still match — this is the exact hole Part 4 closes.
+sig_rating_no_df = dc._issue_treatment_signature(by_col_mixed["rating"])
+sig_hq_no_df = dc._issue_treatment_signature(by_col_mixed["headquarters"])
+assert sig_rating_no_df == sig_hq_no_df == ("placeholder", frozenset({"-1"}))
+
+# With the real df, the numeric 'rating' column and the text 'headquarters'/
+# 'city' columns must diverge by dtype category even though the token set is
+# identical.
+sig_rating = dc._issue_treatment_signature(by_col_mixed["rating"], df=df_mixed_dtype)
+sig_hq = dc._issue_treatment_signature(by_col_mixed["headquarters"], df=df_mixed_dtype)
+sig_city = dc._issue_treatment_signature(by_col_mixed["city"], df=df_mixed_dtype)
+assert sig_rating == ("placeholder", frozenset({"-1"}), "numeric"), sig_rating
+assert sig_hq == ("placeholder", frozenset({"-1"}), "text"), sig_hq
+assert sig_hq == sig_city, "headquarters and city are both text-shaped and should still match"
+assert sig_rating != sig_hq, "a numeric column must not share a signature with a text column"
+print("PASS: dtype category is appended to the signature and separates numeric from text.\n")
+
+mixed_groups = dc._group_issues_by_signature(list(mixed_issues), df=df_mixed_dtype)
+sizes_mixed = sorted(len(g) for g in mixed_groups)
+assert sizes_mixed == [1, 2], (
+    f"expected 'rating' alone (numeric, unique signature) and "
+    f"'headquarters'+'city' grouped (text, shared signature), got sizes {sizes_mixed}"
+)
+text_group = next(g for g in mixed_groups if len(g) == 2)
+assert set(text_group) == {by_col_mixed["headquarters"], by_col_mixed["city"]}
+print("PASS: dtype-aware grouping keeps the numeric column out of the text columns' batch.\n")
 
 print("=" * 70)
 print("ALL ISSUE-BATCHING (SPEC 4) ASSERTIONS PASSED")

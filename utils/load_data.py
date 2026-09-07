@@ -59,6 +59,7 @@ from dotenv import load_dotenv
 
 from utils.data_cleaning import (
     _issue_severity,
+    _read_csv_robust,
     clean_dataset,
     unresolved_issues_for_record,
 )
@@ -318,6 +319,211 @@ def write_data_quality_status(
             ),
         )
     conn.commit()
+
+
+def ensure_transformation_candidates_table(conn) -> None:
+    """Create _transformation_candidates if it doesn't already exist, and grant
+    SELECT to app_reader (read at question time via the read-only connection —
+    see utils.transformation_options.surface_relevant_transformations).
+
+    One row per table_name, holding the FULL current list of
+    TransformationCandidate dicts (Spec 1, Part 0) as JSONB — replaced wholesale
+    on every genuine reload/re-clean of that table (never merged/appended), so a
+    stale candidate that no longer applies to the new data can never linger.
+    """
+    app_reader = os.environ.get("PG_APP_READER_USER", "app_reader")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _transformation_candidates (
+                table_name  TEXT PRIMARY KEY,
+                detected_at TIMESTAMPTZ NOT NULL,
+                candidates  JSONB NOT NULL
+            );
+            """
+        )
+        cur.execute(f'GRANT SELECT ON _transformation_candidates TO "{app_reader}";')
+    conn.commit()
+
+
+def write_transformation_candidates(conn, table_name: str, candidates: list) -> None:
+    """Replace table_name's stored candidate list wholesale (Spec 1, Part 0 —
+    detection runs once per table and its result is persisted, never
+    re-detected live at question time). `candidates` is a list of
+    TransformationCandidate (or plain dict) objects."""
+    payload = [c.to_dict() if hasattr(c, "to_dict") else c for c in candidates]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO _transformation_candidates (table_name, detected_at, candidates)
+            VALUES (%s, now(), %s)
+            ON CONFLICT (table_name) DO UPDATE SET
+                detected_at = EXCLUDED.detected_at,
+                candidates = EXCLUDED.candidates
+            """,
+            (table_name, psycopg2.extras.Json(payload)),
+        )
+    conn.commit()
+
+
+def read_transformation_candidates(conn, table_name: str) -> list:
+    """Return table_name's stored candidates as a list of TransformationCandidate
+    objects (empty list if none have ever been detected for this table)."""
+    from utils.transformation_options import TransformationCandidate
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT candidates FROM _transformation_candidates WHERE table_name = %s",
+            (table_name,),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    if not row:
+        return []
+    return [TransformationCandidate.from_dict(d) for d in row[0]]
+
+
+def ensure_transformation_decisions_table(conn) -> None:
+    """Create _transformation_decisions if it doesn't already exist, and grant
+    SELECT to app_reader.
+
+    One row per (table_name, candidate_id) — the durable decision cache behind
+    Spec 1, Part 1: once a human answers present_transformation_options for a
+    given candidate, the answer is reused silently for every future question
+    touching that same candidate, until invalidate_cached_decisions_for_table
+    clears it on a genuine reload.
+    """
+    app_reader = os.environ.get("PG_APP_READER_USER", "app_reader")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _transformation_decisions (
+                table_name       TEXT NOT NULL,
+                candidate_id     TEXT NOT NULL,
+                chosen_option_id TEXT NOT NULL,
+                reasoning_shown  JSONB NOT NULL,
+                decided_at       TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (table_name, candidate_id)
+            );
+            """
+        )
+        cur.execute(f'GRANT SELECT ON _transformation_decisions TO "{app_reader}";')
+    conn.commit()
+
+
+def write_transformation_decision(conn, table_name: str, candidate_id: str, decision: dict) -> None:
+    """Persist one present_transformation_options() answer. `decision` is
+    {"chosen_option_id": str, "reasoning_shown": dict} — the full context and
+    options shown are preserved (reasoning_shown) so the decision is fully
+    reconstructable later, not just "user said B" (Spec 1, Part 1)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO _transformation_decisions
+                (table_name, candidate_id, chosen_option_id, reasoning_shown, decided_at)
+            VALUES (%s, %s, %s, %s, now())
+            ON CONFLICT (table_name, candidate_id) DO UPDATE SET
+                chosen_option_id = EXCLUDED.chosen_option_id,
+                reasoning_shown = EXCLUDED.reasoning_shown,
+                decided_at = EXCLUDED.decided_at
+            """,
+            (table_name, candidate_id, decision["chosen_option_id"],
+             psycopg2.extras.Json(decision["reasoning_shown"])),
+        )
+    conn.commit()
+
+
+def read_transformation_decision(conn, table_name: str, candidate_id: str) -> "dict | None":
+    """Return the cached decision for (table_name, candidate_id), or None if
+    this candidate has never been decided (or was invalidated by a reload)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT chosen_option_id, reasoning_shown FROM _transformation_decisions
+            WHERE table_name = %s AND candidate_id = %s
+            """,
+            (table_name, candidate_id),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    if not row:
+        return None
+    return {"chosen_option_id": row[0], "reasoning_shown": row[1]}
+
+
+def invalidate_cached_decisions_for_table(conn, table_name: str) -> None:
+    """Clear every cached Transformation Options decision for table_name.
+    Called on a genuine reload/re-clean (Spec 1, Part 0): rather than guessing
+    whether an old decision still applies to possibly-different underlying
+    data, the simplest safe default is to invalidate everything and let
+    surface_relevant_transformations ask again next time a question needs it."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM _transformation_decisions WHERE table_name = %s", (table_name,))
+    conn.commit()
+
+
+def ensure_derived_columns_table(conn) -> None:
+    """Create _derived_columns if it doesn't already exist, and grant SELECT
+    to app_reader.
+
+    Spec 1, Part 7: every column added by a Transformation Options fix
+    (feature derivation, range decomposition, label simplification counts as
+    a rewrite of an existing column rather than a new one, so it doesn't need
+    an entry) is marked here as "derived, not source" — one row per
+    (table_name, column_name) — so add_context can annotate it in the schema
+    context `generate_sql` sees, and neither `generate_sql` nor any
+    disclosure logic ever mistakes a computed value for an observed one.
+    """
+    app_reader = os.environ.get("PG_APP_READER_USER", "app_reader")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _derived_columns (
+                table_name  TEXT NOT NULL,
+                column_name TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                derived_at  TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (table_name, column_name)
+            );
+            """
+        )
+        cur.execute(f'GRANT SELECT ON _derived_columns TO "{app_reader}";')
+    conn.commit()
+
+
+def mark_derived_columns(conn, table_name: str, column_names: list, kind: str) -> None:
+    """Record that `column_names` in `table_name` were added by a
+    Transformation Options fix of the given `kind` (e.g.
+    "range_decomposition", "company_age") — never an observed source value.
+    Upserts one row per column; safe to call again after a reload (a fresh
+    detection+apply cycle just re-marks the same columns)."""
+    with conn.cursor() as cur:
+        for column_name in column_names:
+            cur.execute(
+                """
+                INSERT INTO _derived_columns (table_name, column_name, kind, derived_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (table_name, column_name) DO UPDATE SET
+                    kind = EXCLUDED.kind,
+                    derived_at = EXCLUDED.derived_at
+                """,
+                (table_name, column_name, kind),
+            )
+    conn.commit()
+
+
+def get_derived_columns(conn, table_name: str) -> dict:
+    """Returns {column_name: kind} for every column of `table_name` marked
+    derived — empty dict if none. Used by add_context to annotate the schema
+    context it builds for generate_sql."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name, kind FROM _derived_columns WHERE table_name = %s",
+            (table_name,),
+        )
+        rows = cur.fetchall()
+    conn.commit()
+    return dict(rows)
 
 
 def compute_file_checksum(path) -> str:
@@ -604,6 +810,9 @@ def main() -> None:
     try:
         ensure_data_quality_status_table(conn)
         ensure_fanout_status_table(conn)
+        ensure_transformation_candidates_table(conn)
+        ensure_transformation_decisions_table(conn)
+        ensure_derived_columns_table(conn)
 
         # Source-checksum freshness check (architecture review point #20): before
         # this manual re-clean runs, compare each file's CURRENT raw bytes against the
@@ -670,6 +879,19 @@ def main() -> None:
             print(f"  -> data quality status: {status} ({len(issues_found)} unresolved issue(s))")
             compute_and_write_fanout_status(conn, table_name)
             print(f"  -> fan-out status computed for '{table_name}'")
+
+            # Spec 1, Part 0: (re-)detect Transformation Options candidates on this
+            # fresh load and invalidate any previously-cached decisions for this
+            # table — a genuine reload never guesses whether an old decision still
+            # applies to possibly-different underlying data (Part 0's reload-
+            # invalidation rule).
+            from utils.transformation_options import detect_transformation_candidates
+
+            loaded_df = _read_csv_robust(load_path)
+            candidates = detect_transformation_candidates(loaded_df, table_name)
+            write_transformation_candidates(conn, table_name, candidates)
+            invalidate_cached_decisions_for_table(conn, table_name)
+            print(f"  -> {len(candidates)} transformation candidate(s) detected for '{table_name}'")
     finally:
         conn.close()
 
