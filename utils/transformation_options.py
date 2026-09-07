@@ -241,6 +241,58 @@ def _detect_label_simplification_wrapped_candidates(df, table_name: str) -> list
     return out
 
 
+_CATEGORICAL_CONSOLIDATION_TAG_HINTS = {
+    "industry": ["industry", "industry category", "sector"],
+    "sector": ["industry", "industry category", "sector"],
+    "job title": ["job title", "role", "position category"],
+    "title": ["job title", "role", "position category"],
+}
+
+
+def _relevance_tags_for_categorical_consolidation(column: str) -> list:
+    """Generic relevance tags for a categorical_consolidation candidate
+    (Spec 3, Part 2), derived from the column's own name — e.g. "Industry"
+    -> ["industry", "industry category", "sector"], "Job Title" -> ["job
+    title", "role", "position category"] (the spec's own two example tag
+    sets). Falls back to the lowercased column name alone when no hint
+    matches, so an unanticipated high-cardinality column still gets SOME
+    real tag."""
+    col_lower = column.lower()
+    tags = set()
+    for hint, hint_tags in _CATEGORICAL_CONSOLIDATION_TAG_HINTS.items():
+        if hint in col_lower:
+            tags.update(hint_tags)
+    if not tags:
+        tags.add(col_lower)
+    return sorted(tags)
+
+
+def _detect_categorical_consolidation_wrapped_candidates(df, table_name: str) -> list:
+    """Wraps utils.categorical_consolidation.detect_categorical_consolidation_candidates
+    (Spec 3, Part 2) into the shared TransformationCandidate shape — no
+    detection logic duplicated."""
+    from utils.categorical_consolidation import detect_categorical_consolidation_candidates
+
+    out = []
+    for entry in detect_categorical_consolidation_candidates(df):
+        column = entry["column"]
+        description = (
+            f"Column '{column}' has {entry['distinct_count']} distinct real values "
+            f"across {entry['row_count']} rows (sample: {entry['sample_values'][:5]!r}) "
+            "— could be consolidated into a smaller set of grouped categories."
+        )
+        out.append(
+            TransformationCandidate(
+                candidate_id=compute_candidate_id(table_name, "categorical_consolidation", [column]),
+                kind="categorical_consolidation",
+                columns=[column],
+                description=description,
+                relevance_tags=_relevance_tags_for_categorical_consolidation(column),
+            )
+        )
+    return out
+
+
 def detect_transformation_candidates(df, table_name: str) -> list:
     """Runs ONCE per table, immediately after clean_dataset() finishes on a
     genuinely fresh load — never per-question, never per-decision-check.
@@ -251,13 +303,15 @@ def detect_transformation_candidates(df, table_name: str) -> list:
 
     Calls _detect_range_decomposition_candidates (Part 6),
     _detect_feature_derivation_wrapped_candidates (Part 7, 5 independent
-    kinds), and _detect_label_simplification_wrapped_candidates (Part 8) —
+    kinds), _detect_label_simplification_wrapped_candidates (Part 8), and
+    _detect_categorical_consolidation_wrapped_candidates (Spec 3, Part 2) —
     every candidate kind this spec defines.
     """
     candidates = []
     candidates.extend(_detect_range_decomposition_candidates(df, table_name))
     candidates.extend(_detect_feature_derivation_wrapped_candidates(df, table_name))
     candidates.extend(_detect_label_simplification_wrapped_candidates(df, table_name))
+    candidates.extend(_detect_categorical_consolidation_wrapped_candidates(df, table_name))
     return candidates
 
 
