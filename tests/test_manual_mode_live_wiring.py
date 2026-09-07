@@ -10,19 +10,20 @@ monkeypatched True, real answers piped to actual shell stdin. Run as:
     printf 'skip\\n%.0s' {1..20} | PYTHONPATH=. uv run python tests/test_manual_mode_live_wiring.py
 
 Test 1 (acceptance test 1): apply_manual_mode with a COMPLETE override for
-the categorical_consolidation(Job Title) candidate skips
+the categorical_consolidation(Industry) candidate skips
 present_transformation_options entirely (no "TRANSFORMATION OPTION:" banner
 for it) and logs the decision to _transformation_decisions with
 reasoning_shown.source == "manual_mode".
 
-Test 2 (acceptance test 2): a candidate with no override present (Salary
-Estimate range_decomposition) still goes through the normal live menu flow,
-unaffected by manual mode being active for the OTHER candidate in the same
-run.
+Test 2 (acceptance test 2): a candidate with no override present
+(range_decomposition for size) still goes through the normal live menu
+flow, unaffected by manual mode being active for the OTHER candidate
+(Industry) in the same run.
 
 Test 3 (acceptance test 3): the applied categorical_consolidation actually
 wrote the real column using supplied_data exactly — spot-checked against
->= 15 of the real distinct Job Title values.
+>= 15 of the real 57 distinct Industry values, per the spec's own acceptance
+criterion.
 
 Seeds/restores _transformation_candidates/_transformation_decisions and the
 real table's CSV/DB state around the test so it leaves no residue.
@@ -77,19 +78,17 @@ try:
     candidates = detect_transformation_candidates(seed_df, TABLE)
     write_transformation_candidates(conn, TABLE, candidates)
 
-    job_title_cc = next(
-        c for c in candidates if c.kind == "categorical_consolidation" and c.columns == ["job_title"]
+    industry_cc = next(
+        c for c in candidates if c.kind == "categorical_consolidation" and c.columns == ["industry"]
     )
-    real_job_titles = seed_df["job_title"].dropna().unique().tolist()
-    assert len(real_job_titles) >= 15
+    real_industries = seed_df["industry"].dropna().unique().tolist()
+    assert len(real_industries) == 57, f"expected the real 57 distinct Industry values, got {len(real_industries)}"
 
     # Complete, deterministic supplied_data covering every real distinct
-    # value (a real, if crude, mapping — every title assigned to one of two
-    # groups by a simple substring rule, so we can assert on it precisely).
-    supplied_data = {
-        v: ("Senior/Lead" if re.search(r"\b(sr|senior|lead|principal|staff)\b", v, re.IGNORECASE) else "Individual Contributor")
-        for v in real_job_titles
-    }
+    # value (a real, if arbitrary, mapping — split by name length parity so
+    # the exact assignment is trivially checkable, not a judgment call the
+    # test would need to trust).
+    supplied_data = {v: ("Group A" if len(v) % 2 == 0 else "Group B") for v in real_industries}
 
     print("=" * 70)
     print("TEST 1: apply_manual_mode with a complete override skips the live")
@@ -99,16 +98,16 @@ try:
     clear_manual_mode()
     apply_manual_mode([
         ManualModeOverride(
-            candidate_id=job_title_cc.candidate_id,
+            candidate_id=industry_cc.candidate_id,
             chosen_option_id="apply",
-            reference_source="Test-supplied deterministic seniority split",
+            reference_source="Test-supplied deterministic industry name-length split",
             supplied_data=supplied_data,
         )
     ])
 
     state1 = SQLAnalystState(
-        user_question="Consolidate job title categories and show average company size",
-        curated_question="Consolidate job title categories and show average company size.",
+        user_question="Consolidate industry categories and show average company size",
+        curated_question="Consolidate industry categories and show average company size.",
     )
     ctx1 = add_context(state1)
     state1_with_ctx = state1.model_copy(update=ctx1)
@@ -125,20 +124,20 @@ try:
     offered1 = _offered_titles(printed1)
     print("offered (live menu banners):", offered1)
 
-    assert not any("Categorical Consolidation for Job Title" in t for t in offered1), (
+    assert not any("Categorical Consolidation for industry" in t for t in offered1), (
         f"manual mode must skip the live present_transformation_options banner entirely, got {offered1}"
     )
 
     manual_entries = [
         e for e in result1["transformation_narrative_log"]
-        if e["candidate"]["candidate_id"] == job_title_cc.candidate_id
+        if e["candidate"]["candidate_id"] == industry_cc.candidate_id
     ]
     assert len(manual_entries) == 1, manual_entries
     assert manual_entries[0]["reasoning_shown"]["source"] == "manual_mode"
-    assert manual_entries[0]["reasoning_shown"]["reference"] == "Test-supplied deterministic seniority split"
+    assert manual_entries[0]["reasoning_shown"]["reference"] == "Test-supplied deterministic industry name-length split"
     assert manual_entries[0]["chosen_option_id"] == "apply"
 
-    decision_row = read_transformation_decision(conn, TABLE, job_title_cc.candidate_id)
+    decision_row = read_transformation_decision(conn, TABLE, industry_cc.candidate_id)
     assert decision_row is not None, "the manual-mode decision must be persisted to _transformation_decisions"
     assert decision_row["reasoning_shown"]["source"] == "manual_mode"
     print("PASS: manual mode skipped present_transformation_options entirely and logged the decision "
@@ -165,26 +164,26 @@ try:
         f"the size candidate (no override registered) must still show its live menu banner, got {offered1}"
     )
     print("PASS: the size candidate (no manual-mode override registered) went through the ordinary "
-          "live present_transformation_options menu, unaffected by manual mode being active for Job Title.\n")
+          "live present_transformation_options menu, unaffected by manual mode being active for Industry.\n")
 
     print("=" * 70)
     print("TEST 3: the applied categorical_consolidation used supplied_data")
-    print("exactly — spot-check >= 15 of the real Job Title mappings")
+    print("exactly — spot-check >= 15 of the real 57 Industry mappings")
     print("=" * 70)
 
     written_df = _read_csv_robust(str(CLEANED_PATH))
-    assert "job_title_category" in written_df.columns, (
-        f"expected a new 'job_title_category' column, got {list(written_df.columns)}"
+    assert "industry_category" in written_df.columns, (
+        f"expected a new 'industry_category' column, got {list(written_df.columns)}"
     )
 
     checked = 0
-    for _, row in written_df.head(200).iterrows():
-        raw = row.get("job_title")
+    for _, row in written_df.head(400).iterrows():
+        raw = row.get("industry")
         if raw not in supplied_data:
             continue
         expected = supplied_data[raw]
-        actual = row.get("job_title_category")
-        assert actual == expected, f"row with job_title={raw!r}: expected {expected!r}, got {actual!r}"
+        actual = row.get("industry_category")
+        assert actual == expected, f"row with industry={raw!r}: expected {expected!r}, got {actual!r}"
         checked += 1
         if checked >= 15:
             break
@@ -203,7 +202,7 @@ finally:
         CLEANED_PATH.write_bytes(cleaned_backup)
         # _apply_chosen_transformation's categorical_consolidation branch
         # reloads the live table (load_csv_to_table) with the new
-        # job_title_category column — restore the file first, then reload
+        # industry_category column — restore the file first, then reload
         # the DB table back to its original schema too, so this test leaves
         # no residue in either the file or the live table.
         from utils.load_data import load_csv_to_table
