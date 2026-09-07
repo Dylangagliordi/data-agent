@@ -160,6 +160,26 @@ def _slide_divider(part: str) -> str:
     )
 
 
+def _slide_checklist(entries: list) -> "str | None":
+    """Spec 3, Part 4: one compact checklist slide per part, before the
+    detailed narrative slides — None (slide omitted) for a part with zero
+    steps, e.g. Part B on an entry with nothing surfaced."""
+    if not entries:
+        return None
+    rows = []
+    for e in entries:
+        ref = f' — <span style="color:#6a8aaa">{_esc(e["reference_source"])}</span>' if e["reference_source"] else ""
+        rows.append(f'<tr><td>{e["step_number"]}</td><td>{_esc(e["title"])}</td><td>{_esc(e["outcome"])}{ref}</td></tr>')
+    return (
+        '<div class="slide">'
+        '<div class="label">Checklist</div>'
+        '<h2 class="title" style="font-size:1.7em">At a glance</h2>'
+        '<table><thead><tr><th>#</th><th>Step</th><th>Outcome</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+        '</div>'
+    )
+
+
 def _split_words(text: str, max_words: int = _MAX_WORDS_PER_SLIDE) -> list:
     words = (text or "").split()
     if len(words) <= max_words:
@@ -282,6 +302,7 @@ def generate_presentation(entry: dict) -> str:
     Returns the path to the written HTML file.
     """
     from utils.llm_pick import pick_llm
+    from utils.manual_mode import build_step_checklist
     from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
 
     question = entry.get("user_question") or entry.get("curated_question") or "presentation"
@@ -299,6 +320,8 @@ def generate_presentation(entry: dict) -> str:
     except Exception:
         steps = build_narrative_walkthrough(entry)  # deterministic fallback, never fully fails
 
+    checklist = build_step_checklist(steps)
+
     slides: list = [_slide_title(entry, touched_tables, generated_at)]
 
     current_part = None
@@ -306,6 +329,13 @@ def generate_presentation(entry: dict) -> str:
         if step.part != current_part:
             current_part = step.part
             slides.append(_slide_divider(current_part))
+            # Spec 3, Part 4: one checklist-style slide per part, before the
+            # detailed narrative slides — derived from the exact same
+            # checklist entries, never a second source of truth.
+            part_entries = [c for c in checklist if c["part"] == current_part]
+            checklist_slide = _slide_checklist(part_entries)
+            if checklist_slide:
+                slides.append(checklist_slide)
         slides.extend(_slides_for_step(step))
 
     _PRESENTATIONS_DIR.mkdir(parents=True, exist_ok=True)

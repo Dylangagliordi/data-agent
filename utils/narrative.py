@@ -445,17 +445,51 @@ def _add_transformation_step(add, item: dict) -> None:
     candidate = item.get("candidate", {}) or {}
     chosen = item.get("chosen_option_id", "")
     reasoning_shown = item.get("reasoning_shown") or {}
-    context = reasoning_shown.get("context", {}) or {}
-    options = reasoning_shown.get("options", []) or []
     fresh = bool(item.get("fresh", False))
     reload_reask = bool(item.get("reload_reask", False))
     decided_at = item.get("decided_at")
 
+    kind_label = str(candidate.get("kind", "")).replace("_", " ").title()
+    columns = candidate.get("columns", [])
+
+    if reasoning_shown.get("source") == "manual_mode":
+        # Spec 3, Part 1: this decision never went through present_
+        # transformation_options at all — chosen_option_id and the mapping
+        # came straight from a supplied ManualModeOverride instead of a live
+        # human answer. Never say "no reason was recorded" here — the
+        # reference citation IS the reason, and it's always real (Part 1
+        # requires reasoning_shown to carry it).
+        reference = reasoning_shown.get("reference", "") or "an unnamed reference"
+        supplied_data = reasoning_shown.get("supplied_data") or {}
+        title = f"{kind_label} for {', '.join(columns)} — {table_name}"
+        lines = [
+            f"For '{', '.join(columns)}' in {table_name}, I didn't ask this live — it was "
+            f"pinned directly to a supplied reference: {reference}."
+        ]
+        if supplied_data:
+            n_groups = len(set(supplied_data.values())) if all(isinstance(v, str) for v in supplied_data.values()) else None
+            if n_groups is not None:
+                lines.append(
+                    f"That reference supplied {len(supplied_data)} value-to-category assignments "
+                    f"across {n_groups} groups, applied exactly as given."
+                )
+        add(
+            "transformation", title, " ".join(lines),
+            technical_detail=json.dumps({"chosen_option_id": chosen, "reasoning_shown": reasoning_shown}, default=str),
+            stats={
+                "table_name": table_name, "kind": candidate.get("kind", ""), "columns": columns,
+                "fresh": fresh, "reload_reask": reload_reask, "decided_at": decided_at,
+                "manual_mode": True, "reference_source": reasoning_shown.get("reference", ""),
+            },
+        )
+        return
+
+    context = reasoning_shown.get("context", {}) or {}
+    options = reasoning_shown.get("options", []) or []
+
     chosen_opt = next((o for o in options if o.get("id") == chosen), None)
     chosen_label = chosen_opt["label"] if chosen_opt else chosen
 
-    kind_label = str(candidate.get("kind", "")).replace("_", " ").title()
-    columns = candidate.get("columns", [])
     title = context.get("title") or f"{kind_label} for {', '.join(columns)} — {table_name}"
 
     lines = []

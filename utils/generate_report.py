@@ -60,6 +60,9 @@ pre{font-family:'SFMono-Regular',Consolas,monospace;background:#f6f8fa;padding:1
 .bad{color:#c62828;font-weight:600}
 ul{margin:8px 0;padding-left:22px}
 li{margin:3px 0}
+table.checklist{font-size:0.85em;background:#fafbfc;margin:8px 0 24px}
+table.checklist th{background:#eef2f7;font-weight:600;color:#444}
+table.checklist td{color:#555}
 """
 
 
@@ -116,6 +119,26 @@ def _render_chart_image(stats: dict) -> str:
         f'<img src="data:image/png;base64,{b64}" '
         f'style="max-width:100%;height:auto;border:1px solid #ddd;'
         f'border-radius:6px;margin:12px 0;display:block" alt="Chart">'
+    )
+
+
+def _checklist_html(entries: list) -> str:
+    """Spec 3, Part 4: a compact, scannable checklist for one part, rendered
+    from build_step_checklist's output (itself derived purely from the same
+    NarrativeStep.stats every step below is rendered from — never a second
+    source of truth). Empty for a part with zero steps."""
+    if not entries:
+        return ""
+    rows = []
+    for e in entries:
+        ref = f" — <em>{_esc(e['reference_source'])}</em>" if e["reference_source"] else ""
+        rows.append(
+            f"<tr><td>{e['step_number']}</td><td>{_esc(e['title'])}</td>"
+            f"<td>{_esc(e['outcome'])}{ref}</td></tr>"
+        )
+    return (
+        "<table class='checklist'><thead><tr><th>#</th><th>Step</th><th>Outcome</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
     )
 
 
@@ -181,6 +204,7 @@ def generate_report(entry: dict) -> str:
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     from utils.llm_pick import pick_llm
+    from utils.manual_mode import build_step_checklist
     from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
 
     try:
@@ -188,12 +212,20 @@ def generate_report(entry: dict) -> str:
     except Exception:
         steps = build_narrative_walkthrough(entry)  # deterministic fallback, never fully fails
 
+    checklist = build_step_checklist(steps)
+
     body_parts = []
     current_part = None
     for step in steps:
         if step.part != current_part:
             current_part = step.part
             body_parts.append(f"<h1>{_esc(_PART_TITLES.get(current_part, current_part.title()))}</h1>")
+            # Part 4: a compact checklist at the top of each part, immediately
+            # followed by the full prose below — derived from the SAME
+            # checklist entries every step below also came from, never a
+            # second source of truth.
+            part_entries = [c for c in checklist if c["part"] == current_part]
+            body_parts.append(_checklist_html(part_entries))
         body_parts.append(_step_html(step))
     body = "\n\n".join(body_parts) if body_parts else "<p>No narrative steps could be built for this entry.</p>"
 
