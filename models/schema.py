@@ -176,3 +176,26 @@ class VerifiedPatternProposal(BaseModel):
     pattern: str
     match_threshold: float
     description: str
+
+
+class CategoricalAssignment(BaseModel):
+    """One raw_value -> group assignment inside a CategoricalConsolidationProposal."""
+
+    raw_value: str
+    group: str
+
+
+class CategoricalConsolidationProposal(BaseModel):
+    """Structured output schema for utils/categorical_consolidation.py's
+    _generate_categorical_consolidation_mapping (Spec 3, Part 2) — used via
+    with_structured_output only, for the live AI-driven clustering path.
+
+    A list of (raw_value, group) pairs rather than a single dict[str,str]
+    field — more reliable for an LLM to produce completely and correctly for
+    a large (dozens-of-entries) mapping than one big dict blob. The caller
+    mechanically verifies the returned assignments cover every real distinct
+    value exactly (no LLM-side guarantee is trusted on its own) before
+    accepting the mapping.
+    """
+
+    assignments: list[CategoricalAssignment]
