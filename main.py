@@ -63,6 +63,10 @@ def log_run(user_question: str, result: dict) -> None:
                 "comments": sql_state.get("comments", ""),
                 "sql_query_execution_result": sql_state.get("sql_query_execution_result", ""),
                 "final_answer": result.get("final_answer", ""),
+                "transformation_narrative_log": sql_state.get("transformation_narrative_log", []),
+                "transformation_candidates_not_relevant": sql_state.get(
+                    "transformation_candidates_not_relevant", []
+                ),
             }
         )
     elif route_response == "visualize":
@@ -83,6 +87,10 @@ def log_run(user_question: str, result: dict) -> None:
                 "output_file_path": sql_state.get("output_file_path", ""),
                 "chart_image_path": sql_state.get("chart_image_path", ""),
                 "final_answer": result.get("final_answer", ""),
+                "transformation_narrative_log": sql_state.get("transformation_narrative_log", []),
+                "transformation_candidates_not_relevant": sql_state.get(
+                    "transformation_candidates_not_relevant", []
+                ),
             }
         )
     elif route_response == "etl_analyst":

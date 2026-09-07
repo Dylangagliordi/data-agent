@@ -99,6 +99,28 @@ class SQLAnalystState(BaseModel):
     # needed. Appended to final_answer by build_visualization.
     chart_type_override_note: str = ""
 
+    # Populated by surface_transformations (Spec 2, Part B narration source):
+    # one entry per real TransformationCandidate that was actually surfaced
+    # and decided for THIS question via surface_relevant_transformations /
+    # present_transformation_options / the _transformation_decisions cache.
+    # Each entry: {"table_name", "candidate" (TransformationCandidate.to_dict()),
+    # "chosen_option_id", "reasoning_shown" (the real context/options shown),
+    # "fresh" (True if decided during THIS call, False if pulled from the
+    # decision cache), "reload_reask" (True only when "fresh" is also True AND
+    # this table was actually cleaned/reloaded earlier in this same run —
+    # never inferred from cross-session log archaeology)}.
+    # utils/narrative.py's build_narrative_walkthrough reads this directly
+    # from the logged query_log.jsonl entry — never re-derives it.
+    transformation_narrative_log: list = Field(default_factory=list)
+
+    # Populated alongside transformation_narrative_log: every real stored
+    # TransformationCandidate for a table touched by this question that
+    # surface_relevant_transformations did NOT surface (i.e. existed but
+    # wasn't relevant here). Each entry: {"table_name", "candidate"
+    # (TransformationCandidate.to_dict())}. Used by build_narrative_walkthrough
+    # for the low-emphasis "other optional transformations exist" note.
+    transformation_candidates_not_relevant: list = Field(default_factory=list)
+
 
 class JudgeSchema(BaseModel):
     """Structured output schema for the safety-judge node only.

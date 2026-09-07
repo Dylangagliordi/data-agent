@@ -110,10 +110,16 @@ try:
     assert not any("Same State Flag" in t for t in offered1), (
         f"same-state-flag is irrelevant to this question and must NOT be offered, got {offered1}"
     )
-    assert result1 == {}, f"everything was skipped, so nothing should have been applied, got {result1}"
+    assert set(result1.keys()) == {"transformation_narrative_log", "transformation_candidates_not_relevant"}, (
+        f"nothing was applied (everything skipped), so only the Spec 2 narrative-log "
+        f"fields should be returned — no prompt_query_context refresh, got {result1.keys()}"
+    )
+    assert len(result1["transformation_narrative_log"]) == 2, result1["transformation_narrative_log"]
+    assert all(e["chosen_option_id"] == "skip" and e["fresh"] is True for e in result1["transformation_narrative_log"])
     print("PASS: exactly the relevant candidates (salary, job title) were offered; "
           "irrelevant ones (company age, skill keywords, same-state) were not; "
-          "nothing was applied since everything was skipped.\n")
+          "nothing was applied since everything was skipped (both real 'skip' decisions "
+          "were still recorded to transformation_narrative_log for Spec 2 narration).\n")
 
     print("=" * 70)
     print("TEST 2: a company-age question surfaces company-age (new), while")
@@ -150,7 +156,14 @@ try:
         f"the job-title candidate was already decided in Test 1 — must be reused silently, "
         f"not re-asked, got {offered2}"
     )
-    assert result2 == {}, f"everything was skipped, so nothing should have been applied, got {result2}"
+    assert set(result2.keys()) == {"transformation_narrative_log", "transformation_candidates_not_relevant"}, (
+        f"nothing was applied (everything skipped), so only the Spec 2 narrative-log "
+        f"fields should be returned, got {result2.keys()}"
+    )
+    assert len(result2["transformation_narrative_log"]) == 1, result2["transformation_narrative_log"]
+    assert result2["transformation_narrative_log"][0]["candidate"]["kind"] == "company_age"
+    assert result2["transformation_narrative_log"][0]["chosen_option_id"] == "skip"
+    assert result2["transformation_narrative_log"][0]["fresh"] is True
     print("PASS: company-age is offered for the first time; salary/job-title decisions from "
           "Test 1 are reused silently, never re-asked.\n")
 

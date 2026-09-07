@@ -3064,12 +3064,28 @@ def surface_transformations(state: SQLAnalystState) -> dict:
     If anything was actually applied, re-runs add_context itself to refresh
     prompt_query_context/data_quality_warnings/data_quality_action/
     tables_to_clean before generate_sql/route_after_add_context ever see
-    them; otherwise returns {} (a plain pass-through, no state change).
+    them; the accumulated narrative-log fields (see below) are always merged
+    into whatever is returned, applied or not.
+
+    Narrative logging (Spec 2, Part B): every candidate this call actually
+    surfaces (via surface_relevant_transformations) and its real decision —
+    freshly asked this call, or pulled from the _transformation_decisions
+    cache — is appended to state.transformation_narrative_log, and every
+    candidate that EXISTS for a touched table but was NOT surfaced is
+    appended to state.transformation_candidates_not_relevant. Both lists
+    accumulate across repeat calls within the same run (e.g. after a
+    clean_and_reload loop) rather than being overwritten, since this node has
+    no LangGraph reducer for them. utils/narrative.py's
+    build_narrative_walkthrough reads these two fields straight off the
+    logged query_log.jsonl entry — nothing here is re-derived downstream.
     """
     import sys as _sys
 
     from utils.load_data import get_admin_connection, read_transformation_candidates, read_transformation_decision
     from utils.transformation_options import present_transformation_options, surface_relevant_transformations
+
+    narrative_log = list(state.transformation_narrative_log)
+    not_relevant_log = list(state.transformation_candidates_not_relevant)
 
     if not _sys.stdin.isatty():
         print(
@@ -3106,9 +3122,29 @@ def surface_transformations(state: SQLAnalystState) -> dict:
                 touched_columns=[],
                 candidates=candidates,
             )
+            relevant_ids = {c.candidate_id for c in relevant}
+            for candidate in candidates:
+                if candidate.candidate_id not in relevant_ids:
+                    not_relevant_log.append(
+                        {"table_name": table_name, "candidate": candidate.to_dict()}
+                    )
+
             for candidate in relevant:
-                if read_transformation_decision(conn, table_name, candidate.candidate_id) is not None:
-                    continue  # already decided — reused silently, never re-asked (Part 1)
+                cached = read_transformation_decision(conn, table_name, candidate.candidate_id)
+                if cached is not None:
+                    # Already decided — reused silently, never re-asked (Part 1).
+                    narrative_log.append(
+                        {
+                            "table_name": table_name,
+                            "candidate": candidate.to_dict(),
+                            "chosen_option_id": cached["chosen_option_id"],
+                            "reasoning_shown": cached["reasoning_shown"],
+                            "fresh": False,
+                            "reload_reask": False,
+                            "decided_at": cached.get("decided_at"),
+                        }
+                    )
+                    continue
                 context, options = _transformation_menu_for(candidate)
                 decision = present_transformation_options(
                     table_name=table_name,
@@ -3117,6 +3153,23 @@ def surface_transformations(state: SQLAnalystState) -> dict:
                     options=options,
                     conn=conn,
                 )
+                # A "reload re-ask" is only ever claimed when it's actually
+                # knowable within THIS run — never inferred from cross-session
+                # log archaeology (Spec 2's own anti-fabrication rule): this
+                # table must have genuinely gone through clean_and_reload
+                # earlier in this same run.
+                reload_reask = table_name in state.cleaning_attempted_tables
+                narrative_log.append(
+                    {
+                        "table_name": table_name,
+                        "candidate": candidate.to_dict(),
+                        "chosen_option_id": decision["chosen_option_id"],
+                        "reasoning_shown": decision["reasoning_shown"],
+                        "fresh": True,
+                        "reload_reask": reload_reask,
+                        "decided_at": None,
+                    }
+                )
                 if _apply_chosen_transformation(
                     conn, table_name, source_folder, candidate, decision["chosen_option_id"]
                 ):
@@ -3124,9 +3177,13 @@ def surface_transformations(state: SQLAnalystState) -> dict:
     finally:
         conn.close()
 
+    narrative_fields = {
+        "transformation_narrative_log": narrative_log,
+        "transformation_candidates_not_relevant": not_relevant_log,
+    }
     if not applied_anything:
-        return {}
-    return add_context(state)
+        return narrative_fields
+    return {**add_context(state), **narrative_fields}
 
 
 def build_sql_analyst_graph():

@@ -435,11 +435,16 @@ def write_transformation_decision(conn, table_name: str, candidate_id: str, deci
 
 def read_transformation_decision(conn, table_name: str, candidate_id: str) -> "dict | None":
     """Return the cached decision for (table_name, candidate_id), or None if
-    this candidate has never been decided (or was invalidated by a reload)."""
+    this candidate has never been decided (or was invalidated by a reload).
+
+    Includes the real decided_at timestamp (Spec 2, Part B) — needed to
+    narrate a reused decision honestly ("this had already been decided
+    earlier") rather than presenting it as freshly asked in this run.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT chosen_option_id, reasoning_shown FROM _transformation_decisions
+            SELECT chosen_option_id, reasoning_shown, decided_at FROM _transformation_decisions
             WHERE table_name = %s AND candidate_id = %s
             """,
             (table_name, candidate_id),
@@ -448,7 +453,11 @@ def read_transformation_decision(conn, table_name: str, candidate_id: str) -> "d
     conn.commit()
     if not row:
         return None
-    return {"chosen_option_id": row[0], "reasoning_shown": row[1]}
+    return {
+        "chosen_option_id": row[0],
+        "reasoning_shown": row[1],
+        "decided_at": row[2].isoformat() if row[2] is not None else None,
+    }
 
 
 def invalidate_cached_decisions_for_table(conn, table_name: str) -> None:
