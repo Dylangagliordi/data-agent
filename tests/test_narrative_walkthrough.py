@@ -266,5 +266,47 @@ assert narrate_steps([], _GoodLLM(0)) == []
 print("PASS: an empty step list is a no-op.\n")
 
 print("=" * 70)
+print("TEST 4: a decision with genuinely empty/absent reasoning_shown states")
+print("only the choice, never a fabricated reason (Spec 2's explicit rule)")
+print("=" * 70)
+
+from utils.narrative import _add_transformation_step
+
+for label, reasoning_shown_value in [("empty dict", {}), ("None", None)]:
+    empty_steps: list = []
+    empty_counter = {"n": 0}
+
+    def _empty_add(part, title, explanation, technical_detail="", stats=None):
+        empty_counter["n"] += 1
+        empty_steps.append(NarrativeStep(empty_counter["n"], part, title, explanation, technical_detail, stats or {}))
+
+    _add_transformation_step(_empty_add, {
+        "table_name": "uncleaned_ds_jobs",
+        "candidate": {"candidate_id": "x", "kind": "categorical_consolidation", "columns": ["Industry"],
+                      "description": "Column 'Industry' has 57 distinct real values across 672 rows.",
+                      "relevance_tags": []},
+        "chosen_option_id": "apply", "reasoning_shown": reasoning_shown_value,
+        "fresh": True, "reload_reask": False, "decided_at": None,
+    })
+    step = empty_steps[0]
+    assert "No additional reason beyond this choice was recorded in the decision log." in step.explanation, (
+        f"reasoning_shown={label!r}: deterministic explanation must explicitly state no reason was recorded"
+    )
+    assert "I chose: apply." in step.explanation
+    for word in ("because", "in order to", "since this", "so that"):
+        assert word not in step.explanation.lower(), (
+            f"reasoning_shown={label!r}: deterministic explanation must never invent a rationale, "
+            f"found {word!r} in {step.explanation!r}"
+        )
+    assert not step.stats.get("manual_mode"), f"reasoning_shown={label!r} must not be treated as manual mode"
+
+print("PASS: for both reasoning_shown={} and reasoning_shown=None, the deterministic explanation "
+      "states only the choice and explicitly discloses no reason was recorded — never a fabricated "
+      "rationale. (The LLM narration pass's adherence to this same rule was verified empirically "
+      "against live pick_llm output as part of this check — see the Spec 3 follow-up report; not "
+      "re-run here as a scripted assertion, per this suite's existing convention of live-LLM checks "
+      "being manual smoke tests, not baked into the deterministic regression run.)\n")
+
+print("=" * 70)
 print("ALL NARRATIVE-WALKTHROUGH (SPEC 2) ASSERTIONS PASSED")
 print("=" * 70)
