@@ -2949,13 +2949,23 @@ def _transformation_menu_for(candidate) -> tuple:
     return context, options
 
 
-def _apply_chosen_transformation(conn, table_name: str, source_folder: str, candidate, chosen_option_id: str) -> bool:
-    """Actually runs the chosen Transformation Options fix (Spec 1, Parts 6/7/8)
-    against the table's real cleaned CSV, reloads the table, marks any new
-    columns "derived, not source" (Part 7), and refreshes the stored
-    candidate list against the now-current file — mirrors clean_and_reload's
-    own mutate -> reload -> refresh-bookkeeping sequence, but for an opt-in
-    enrichment/style decision instead of a mandatory correctness fix.
+def _apply_chosen_transformation(
+    conn, table_name: str, source_folder: str, candidate, chosen_option_id: str,
+    manual_mapping: "dict | None" = None,
+) -> bool:
+    """Actually runs the chosen Transformation Options fix (Spec 1, Parts 6/7/8;
+    Spec 3, Part 2's categorical_consolidation) against the table's real
+    cleaned CSV, reloads the table, marks any new columns "derived, not
+    source" (Part 7), and refreshes the stored candidate list against the
+    now-current file — mirrors clean_and_reload's own mutate -> reload ->
+    refresh-bookkeeping sequence, but for an opt-in enrichment/style
+    decision instead of a mandatory correctness fix.
+
+    manual_mapping (Spec 3, Part 1): when given for a categorical_
+    consolidation candidate, IS the raw_value->group mapping to apply
+    directly — the live AI-clustering call is skipped entirely (Part 2's own
+    "manual-mode behavior" requirement). None (the normal, non-manual path)
+    means generate the mapping live via _generate_categorical_consolidation_mapping.
 
     Deliberately does NOT call invalidate_cached_decisions_for_table here —
     that's reserved for a genuine source-file reload/re-clean (see
@@ -2976,8 +2986,13 @@ def _apply_chosen_transformation(conn, table_name: str, source_folder: str, cand
         simplify_labels,
     )
     from utils.feature_derivation import derive_features
-    from utils.load_data import load_csv_to_table, mark_derived_columns, sanitize_identifier
-    from utils.transformation_options import detect_transformation_candidates, write_transformation_candidates
+    from utils.load_data import (
+        load_csv_to_table,
+        mark_derived_columns,
+        sanitize_identifier,
+        write_transformation_candidates,
+    )
+    from utils.transformation_options import detect_transformation_candidates
 
     target_csv = _find_source_csv(Path(source_folder), table_name, sanitize_identifier)
     if target_csv is None:
@@ -3003,6 +3018,23 @@ def _apply_chosen_transformation(conn, table_name: str, source_folder: str, cand
         if entry is None:
             return False
         result = simplify_labels(load_path, entry)
+    elif candidate.kind == "categorical_consolidation":
+        from utils.categorical_consolidation import (
+            _generate_categorical_consolidation_mapping,
+            consolidate_categorical_column,
+        )
+
+        if manual_mapping:
+            mapping = manual_mapping
+        else:
+            distinct_values = df[column].dropna().unique().tolist()
+            mapping = _generate_categorical_consolidation_mapping(distinct_values, pick_llm("cheap"))
+        if not mapping:
+            return False
+        result = consolidate_categorical_column(load_path, candidate, mapping)
+        if result.get("status") == "resolved":
+            new_columns = [result["new_column"]]
+        mark_kind = "categorical_consolidation"
     else:
         feature_spec = {"kind": candidate.kind, "columns": candidate.columns}
         if candidate.kind == "company_age":
@@ -3025,6 +3057,28 @@ def _apply_chosen_transformation(conn, table_name: str, source_folder: str, cand
         conn, table_name, detect_transformation_candidates(refreshed_df, table_name)
     )
     return True
+
+
+def _distinct_values_for_candidate(source_folder: str, table_name: str, candidate) -> list:
+    """Loads the real distinct values of a candidate's flagged column from
+    its cleaned CSV — needed by manual mode (Spec 3) to check override
+    completeness / drive resolve_manual_mode_candidate for
+    categorical_consolidation, without requiring surface_transformations to
+    always load the CSV for every candidate kind."""
+    from utils.data_cleaning import _read_csv_robust
+    from utils.load_data import sanitize_identifier
+
+    target_csv = _find_source_csv(Path(source_folder), table_name, sanitize_identifier)
+    if target_csv is None:
+        return []
+    load_path = target_csv.parent / "cleaned" / target_csv.name
+    if not load_path.exists():
+        load_path = target_csv
+    df = _read_csv_robust(load_path)
+    column = candidate.columns[0]
+    if column not in df.columns:
+        return []
+    return df[column].dropna().unique().tolist()
 
 
 def surface_transformations(state: SQLAnalystState) -> dict:
@@ -3078,10 +3132,31 @@ def surface_transformations(state: SQLAnalystState) -> dict:
     no LangGraph reducer for them. utils/narrative.py's
     build_narrative_walkthrough reads these two fields straight off the
     logged query_log.jsonl entry — nothing here is re-derived downstream.
+
+    Manual mode (Spec 3, Part 1): for each relevant candidate not already
+    cached, checks utils.manual_mode.get_manual_mode_override before ever
+    reaching present_transformation_options. A registered override (even an
+    incomplete one) resolves it via resolve_manual_mode_candidate (Part 5's
+    progressive disclosure — asks only about genuine gaps) instead of
+    blocking on the normal live menu; the resolved decision is logged to
+    _transformation_decisions with reasoning_shown={"source": "manual_mode",
+    ...} exactly like Part 1 specifies, and applied through the same
+    _apply_chosen_transformation path (with manual_mapping threaded through
+    for categorical_consolidation, skipping the live AI-clustering call).
+    Choosing option [3]/[4] in that interactive flow returns None, which
+    falls through to the ordinary live present_transformation_options menu
+    below — manual mode never silently blocks a candidate it declines to
+    resolve.
     """
     import sys as _sys
 
-    from utils.load_data import get_admin_connection, read_transformation_candidates, read_transformation_decision
+    from utils.load_data import (
+        get_admin_connection,
+        read_transformation_candidates,
+        read_transformation_decision,
+        write_transformation_decision,
+    )
+    from utils.manual_mode import _is_override_complete, get_manual_mode_override, resolve_manual_mode_candidate
     from utils.transformation_options import present_transformation_options, surface_relevant_transformations
 
     narrative_log = list(state.transformation_narrative_log)
@@ -3145,6 +3220,57 @@ def surface_transformations(state: SQLAnalystState) -> dict:
                         }
                     )
                     continue
+
+                # Spec 3, Part 1: manual mode. A registered override for this
+                # candidate_id (even if incomplete) means "under manual mode"
+                # — resolve it (progressively filling gaps, Part 5) instead
+                # of falling straight to the live present_transformation_options
+                # menu below.
+                override = get_manual_mode_override(candidate.candidate_id)
+                if override is not None:
+                    distinct_values = None
+                    if candidate.kind == "categorical_consolidation":
+                        distinct_values = _distinct_values_for_candidate(source_folder, table_name, candidate)
+                    if not _is_override_complete(candidate, override, distinct_values):
+                        override = resolve_manual_mode_candidate(
+                            candidate, partial_override=override, distinct_values=distinct_values,
+                            llm=pick_llm("cheap"),
+                        )
+                        # None means the operator chose option [3]/[4] — an
+                        # explicit, one-time opt-out for THIS candidate this
+                        # run; falls through to the normal live menu below,
+                        # exactly like manual mode was never active for it.
+                    if override is not None:
+                        decision = {
+                            "chosen_option_id": override.chosen_option_id,
+                            "reasoning_shown": {
+                                "source": "manual_mode",
+                                "reference": override.reference_source,
+                                "supplied_data": override.supplied_data,
+                            },
+                        }
+                        write_transformation_decision(conn, table_name, candidate.candidate_id, decision)
+                        narrative_log.append(
+                            {
+                                "table_name": table_name,
+                                "candidate": candidate.to_dict(),
+                                "chosen_option_id": decision["chosen_option_id"],
+                                "reasoning_shown": decision["reasoning_shown"],
+                                "fresh": True,
+                                "reload_reask": False,
+                                "decided_at": None,
+                            }
+                        )
+                        manual_mapping = (
+                            override.supplied_data if candidate.kind == "categorical_consolidation" else None
+                        )
+                        if _apply_chosen_transformation(
+                            conn, table_name, source_folder, candidate, decision["chosen_option_id"],
+                            manual_mapping=manual_mapping,
+                        ):
+                            applied_anything = True
+                        continue
+
                 context, options = _transformation_menu_for(candidate)
                 decision = present_transformation_options(
                     table_name=table_name,

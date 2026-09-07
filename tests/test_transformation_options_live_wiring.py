@@ -18,11 +18,12 @@ object isatty() is patched on. Run as:
     printf 'skip\\n%.0s' {1..20} | PYTHONPATH=. uv run python tests/test_transformation_options_live_wiring.py
 
 Test 1 (acceptance test 1): a question touching salary and job title surfaces
-the range-decomposition (Salary Estimate) and job-title-categorization
-candidates, but NOT company-age, skill-keyword, or same-state-flag —
-confirmed by inspecting exactly which "TRANSFORMATION OPTION:" banners are
-printed. All candidates are answered "skip" so nothing is actually applied
-and the real table is left untouched.
+the range-decomposition (Salary Estimate), job-title-categorization, and
+(Spec 3) categorical_consolidation (Job Title) candidates, but NOT
+company-age, skill-keyword, or same-state-flag — confirmed by inspecting
+exactly which "TRANSFORMATION OPTION:" banners are printed. All candidates
+are answered "skip" so nothing is actually applied and the real table is
+left untouched.
 
 Test 2 (acceptance test 2): a second, different question mentioning "company
 age" surfaces company-age (now, for the first time) while the salary/
@@ -101,6 +102,9 @@ try:
     assert any("Job Title Categorization" in t for t in offered1), (
         f"expected the job-title-categorization candidate offered, got {offered1}"
     )
+    assert any("Categorical Consolidation for Job Title" in t for t in offered1), (
+        f"expected the Spec 3 categorical_consolidation candidate for Job Title offered, got {offered1}"
+    )
     assert not any("Company Age" in t for t in offered1), (
         f"company-age is irrelevant to this question and must NOT be offered, got {offered1}"
     )
@@ -114,9 +118,10 @@ try:
         f"nothing was applied (everything skipped), so only the Spec 2 narrative-log "
         f"fields should be returned — no prompt_query_context refresh, got {result1.keys()}"
     )
-    assert len(result1["transformation_narrative_log"]) == 2, result1["transformation_narrative_log"]
+    assert len(result1["transformation_narrative_log"]) == 3, result1["transformation_narrative_log"]
     assert all(e["chosen_option_id"] == "skip" and e["fresh"] is True for e in result1["transformation_narrative_log"])
-    print("PASS: exactly the relevant candidates (salary, job title) were offered; "
+    print("PASS: exactly the relevant candidates (salary, job title x2 including Spec 3's "
+          "categorical_consolidation) were offered; "
           "irrelevant ones (company age, skill keywords, same-state) were not; "
           "nothing was applied since everything was skipped (both real 'skip' decisions "
           "were still recorded to transformation_narrative_log for Spec 2 narration).\n")
@@ -155,6 +160,10 @@ try:
     assert not any("Job Title Categorization" in t for t in offered2), (
         f"the job-title candidate was already decided in Test 1 — must be reused silently, "
         f"not re-asked, got {offered2}"
+    )
+    assert not any("Categorical Consolidation for Job Title" in t for t in offered2), (
+        f"the Spec 3 categorical_consolidation candidate was already decided in Test 1 — "
+        f"must be reused silently, not re-asked, got {offered2}"
     )
     assert set(result2.keys()) == {"transformation_narrative_log", "transformation_candidates_not_relevant"}, (
         f"nothing was applied (everything skipped), so only the Spec 2 narrative-log "
