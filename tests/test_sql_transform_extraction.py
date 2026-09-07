@@ -1,6 +1,7 @@
-"""Tests for utils/sql_transform_extraction.py and its wiring into
-utils/generate_report.py (`_section_question_transformations`) and
-utils/generate_presentation.py (`_slide_question_shaping`).
+"""Tests for utils/sql_transform_extraction.py and its wiring into the
+shared narrative walkthrough (utils/narrative.py:_add_question_shaping_step,
+Spec 2) that both utils/generate_report.py and utils/generate_presentation.py
+render from.
 
 Test 1: extract_question_transformations on the real multi-CTE
         highest-paying-industries query — every field parsed correctly.
@@ -8,12 +9,12 @@ Test 2: has_any_transformation is False for a plain passthrough query with
         no computed columns, grouping, having, ranking limit, or scope filter.
 Test 3: _extract_scope_filters excludes NULL-check/placeholder-exclusion
         noise that belongs to the general cleaning story, not this one.
-Test 4: generate_report() embeds a real "Question-Specific Data Shaping"
-        section with the real metrics table for a shaping-rich query, and
-        an honest "no shaping" note for a plain passthrough query.
-Test 5: generate_presentation() embeds a real "How we shaped the data for
-        this answer" slide for the same shaping-rich query, and omits the
-        slide entirely for a plain passthrough query.
+Test 4: build_narrative_walkthrough's "Shape the data for this question" step
+        reflects the real metrics/grouping/threshold for a shaping-rich
+        query, and states honestly that no shaping was needed for a plain
+        passthrough query — and generate_report() renders that step inside
+        Part C: Analysis.
+Test 5: generate_presentation() renders the exact same step as a slide.
 """
 
 import json
@@ -23,8 +24,9 @@ from utils.sql_transform_extraction import (
     extract_question_transformations,
     has_any_transformation,
 )
-from utils.generate_report import generate_report, _section_question_transformations
-from utils.generate_presentation import generate_presentation, _slide_question_shaping
+from utils.generate_report import generate_report
+from utils.generate_presentation import generate_presentation
+from utils.narrative import build_narrative_walkthrough
 
 SHAPING_SQL = """WITH base AS (
   SELECT
@@ -126,22 +128,29 @@ assert len(t3["scope_filters"]) == 1, t3["scope_filters"]
 assert "data scientist" in t3["scope_filters"][0]
 print(f"PASS: only the real scope filter surfaced: {t3['scope_filters']}\n")
 
-# ── Test 4: generate_report embeds the section correctly ───────────────────
+# ── Test 4: the shared narrative walkthrough's shaping step is correct ─────
 print("=" * 70)
-print("TEST 4: generate_report() embeds Question-Specific Data Shaping section")
+print("TEST 4: 'Shape the data for this question' narrative step is correct")
 print("=" * 70)
 
-section_shaping = _section_question_transformations(SHAPING_SQL)
-assert "<h2>Question-Specific Data Shaping</h2>" in section_shaping
-assert "Avg Salary K" in section_shaping
-assert "AVG((salary_min_k + salary_max_k) / 2.0)" in section_shaping
-assert "Grouped by:</strong> industry" in section_shaping
-assert "fewer than 5" in section_shaping
-print("PASS: section builder produces real, grounded content.\n")
+shaping_entry = {"generated_sql_query": SHAPING_SQL, "final_answer": "", "chart_type": "",
+                  "transformation_narrative_log": [], "transformation_candidates_not_relevant": []}
+steps_shaping = build_narrative_walkthrough(shaping_entry)
+shaping_step = next(s for s in steps_shaping if s.title == "Shape the data for this question")
+assert "industry" in shaping_step.explanation.lower()
+assert "AVG((salary_min_k + salary_max_k) / 2.0)" in shaping_step.technical_detail
+assert shaping_step.stats["grouping_columns"] == [["industry"]]
+assert shaping_step.stats["having_threshold"] == 5
+assert "grouped the data by industry" in shaping_step.explanation.lower()
+assert "fewer than 5" in shaping_step.explanation
+print("PASS: shaping step produces real, grounded content.\n")
 
-section_plain = _section_question_transformations(PLAIN_SQL)
-assert "no additional shaping" in section_plain.lower()
-print("PASS: plain-query section states honestly that no shaping was needed.\n")
+plain_entry = {"generated_sql_query": PLAIN_SQL, "final_answer": "", "chart_type": "",
+                "transformation_narrative_log": [], "transformation_candidates_not_relevant": []}
+steps_plain = build_narrative_walkthrough(plain_entry)
+plain_step = next(s for s in steps_plain if s.title == "Shape the data for this question")
+assert "no extra grouping" in plain_step.explanation.lower() or "used the source data directly" in plain_step.explanation.lower()
+print("PASS: plain-query step states honestly that no shaping was needed.\n")
 
 viz_entry = {
     "timestamp": "2026-09-06T00:00:00+00:00",
@@ -159,41 +168,42 @@ viz_entry = {
     "output_file_path": "",
     "chart_image_path": "",
     "final_answer": "Staffing & Outsourcing leads in satisfaction.",
+    "transformation_narrative_log": [],
+    "transformation_candidates_not_relevant": [],
 }
 report_path = generate_report(viz_entry)
 report_html = Path(report_path).read_text()
-assert "<h2>Question-Specific Data Shaping</h2>" in report_html
-assert "Avg Salary K" in report_html
-# Section must appear after Data Cleaning and before Topic Focus, in order.
-cleaning_idx = report_html.find("<h2>Data Cleaning</h2>")
-shaping_idx = report_html.find("<h2>Question-Specific Data Shaping</h2>")
-topic_idx = report_html.find("<h2>Topic Focus</h2>")
-assert 0 <= cleaning_idx < shaping_idx < topic_idx, (
-    f"expected order Data Cleaning < Question-Specific Data Shaping < Topic Focus, "
-    f"got {cleaning_idx}, {shaping_idx}, {topic_idx}"
+assert "Shape the data for this question" in report_html
+assert "industry" in report_html
+# The shaping step must appear inside Part C: Analysis, after Part A.
+cleaning_idx = report_html.find("Part A: Data Cleaning")
+shaping_idx = report_html.find("Shape the data for this question")
+analysis_idx = report_html.find("Part C: Analysis")
+assert 0 <= cleaning_idx < analysis_idx < shaping_idx, (
+    f"expected order Part A < Part C < shaping step, "
+    f"got {cleaning_idx}, {analysis_idx}, {shaping_idx}"
 )
-print(f"PASS: report {report_path} has the section in the right position.\n")
+print(f"PASS: report {report_path} has the shaping step in the right position.\n")
 
-# ── Test 5: generate_presentation embeds/omits the slide correctly ─────────
+# ── Test 5: generate_presentation embeds/omits the shaping slide correctly ─
 print("=" * 70)
 print("TEST 5: generate_presentation() embeds/omits the shaping slide")
 print("=" * 70)
 
-slide = _slide_question_shaping(SHAPING_SQL)
-assert slide is not None
-assert "How we shaped the data for this answer" in slide
-assert "Avg Salary K" in slide
-
-no_slide = _slide_question_shaping(PLAIN_SQL)
-assert no_slide is None, "plain passthrough query must not produce a slide"
-print("PASS: slide builder produces content when there's real shaping, "
-      "None otherwise.\n")
-
 pres_path = generate_presentation(viz_entry)
 pres_html = Path(pres_path).read_text()
-assert "How we shaped the data for this answer" in pres_html
-assert "Avg Salary K" in pres_html
+assert "Shape the data for this question" in pres_html
+assert "industry" in pres_html
 print(f"PASS: presentation {pres_path} embeds the shaping slide.\n")
+
+plain_viz_entry = dict(viz_entry, generated_sql_query=PLAIN_SQL)
+pres_path_plain = generate_presentation(plain_viz_entry)
+pres_html_plain = Path(pres_path_plain).read_text()
+assert "Shape the data for this question" in pres_html_plain
+assert "used the source data directly" in pres_html_plain.lower()
+print(f"PASS: presentation {pres_path_plain} states honestly that no shaping was needed "
+      "for a plain passthrough query (the step is still present, per Spec 2's "
+      "'render every step, no omission' rule — it just says nothing extra happened).\n")
 
 print("=" * 70)
 print("ALL SQL_TRANSFORM_EXTRACTION TESTS PASSED")

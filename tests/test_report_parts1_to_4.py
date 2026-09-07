@@ -1,23 +1,29 @@
-"""Tests for the four report improvements.
+"""Chart-image rendering + report chart-image embedding.
 
-Test 1: End-to-end visualize: run produces a real .png and chart_image_path is logged.
-Test 2: Report from a new entry embeds the chart image as inline base64.
-Test 3: Report for an older log entry (no chart_image_path) states honestly no image.
-Test 4: Report with real cleaning history shows a computed before/after comparison.
-Test 5: Report for a query with non-obvious WHERE filters includes an Assumptions line.
+Test 1: End-to-end visualize: run produces a real .png and chart_image_path is
+        logged; every chart type renders without crashing (unchanged, still
+        exercises agents.sql_analyst.build_visualization directly).
+Test 2: Report from a new entry (real chart_image_path) embeds the chart
+        image as inline base64 in its "Visualize the result as a ..." step
+        (Spec 2 — the report body is now the shared narrative walkthrough,
+        not a dedicated "Visualization" section).
+Test 3: Report for an entry with no chart_image_path states honestly that no
+        image is available, in that same narrative step.
+
+Tests 4/5 of the original Parts 1-4 spec (a live-DB before/after placeholder
+comparison, and a general WHERE-filter "Assumptions" line) tested
+utils/generate_report.py internals that Spec 2 (Final) deliberately removed
+when it rewired both documents to render from one shared narrative
+walkthrough (utils/narrative.py) — see that spec for why. Assumption-style
+disclosure now lives in the final_answer text itself
+(agents/sql_analyst.py:_analyst_judgment_disclosure), which the walkthrough's
+"The final result" step quotes verbatim — see tests/test_narrative_walkthrough.py.
 """
 
 import json
-import re
 from pathlib import Path
 
-from utils.generate_report import (
-    _compute_before_after,
-    _extract_query_assumptions,
-    _parse_placeholder_issue,
-    generate_report,
-    last_query_log_entry,
-)
+from utils.generate_report import generate_report
 
 LOG_PATH = Path("logs/query_log.jsonl")
 CLEANING_LOG_PATH = Path("logs/cleaning_log.jsonl")
@@ -112,19 +118,20 @@ synthetic_viz_entry = {
 report2 = generate_report(synthetic_viz_entry)
 html2 = Path(report2).read_text()
 
-assert "<h2>Visualization</h2>" in html2, "Visualization section must be present"
+assert "Visualize the result as a bar chart" in html2, (
+    "the walkthrough's chart step must be present"
+)
 assert "data:image/png;base64," in html2, (
     "Chart image must be embedded as base64 data URI in the report"
 )
 assert "<img " in html2, "An <img> tag must be present"
 print(f"PASS: report {report2} embeds chart image as inline base64.\n")
 
-# ── Test 3: older entry (no chart_image_path) → honest 'no image' note ────────
+# ── Test 3: entry with no chart_image_path → honest 'no image' note ───────────
 print("=" * 70)
-print("TEST 3: older entry (no chart_image_path) → honest 'no image' statement")
+print("TEST 3: entry with no chart_image_path → honest 'no image' statement")
 print("=" * 70)
 
-# Simulate a pre-Part-1 log entry by omitting chart_image_path entirely.
 old_viz_entry = {
     "timestamp": "2026-01-01T00:00:00+00:00",
     "route_response": "visualize",
@@ -138,158 +145,23 @@ old_viz_entry = {
     "is_safe": "yes",
     "sql_query_execution_result": FAKE_RESULT,
     "output_file_path": result["output_file_path"],
-    # chart_image_path deliberately absent (simulates pre-Part-1 entry)
+    # chart_image_path deliberately absent.
     "final_answer": "Visualization data saved to: ...",
 }
 
 report3 = generate_report(old_viz_entry)
 html3 = Path(report3).read_text()
 
-assert "<h2>Visualization</h2>" in html3, "Visualization section must still be present"
+assert "Visualize the result as a bar chart" in html3, "the walkthrough's chart step must still be present"
 assert "data:image/png;base64," not in html3, (
     "No base64 image must appear when chart_image_path is absent"
 )
-assert "no chart image" in html3.lower() or "predates" in html3.lower(), (
-    "Report must state plainly that no chart image is available for older entries"
+assert "no chart image is available" in html3.lower(), (
+    "Report must state plainly that no chart image is available"
 )
 assert "<img " not in html3, "No <img> tag must be present when no chart image is available"
 print(f"PASS: report {report3} states no image available (no broken reference).\n")
 
-# ── Test 4: real cleaning history → computed before/after numbers ─────────────
 print("=" * 70)
-print("TEST 4: real cleaning history → computed before/after comparison")
-print("=" * 70)
-
-# Load entries from query_log to find one that touches a table with cleaning history.
-all_entries = []
-if LOG_PATH.exists():
-    for line in LOG_PATH.read_text().splitlines():
-        try:
-            all_entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-
-# Look for a log entry where the SQL touches a table with cleaning history.
-cleaning_entries = []
-if CLEANING_LOG_PATH.exists():
-    for line in CLEANING_LOG_PATH.read_text().splitlines():
-        try:
-            cleaning_entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-
-cleaned_tables = {
-    f.get("table_name", "").lower()
-    for e in cleaning_entries
-    for f in e.get("files", [])
-    if f.get("issues_found")
-}
-
-entry4 = None
-for e in all_entries:
-    sql = e.get("generated_sql_query", "")
-    for t in cleaned_tables:
-        if t and re.search(r"\b" + re.escape(t) + r"\b", sql, re.IGNORECASE):
-            entry4 = e
-            break
-    if entry4:
-        break
-
-if entry4 is None:
-    print("SKIP: no log entry found that touches a table with cleaning history.\n")
-else:
-    report4 = generate_report(entry4)
-    html4 = Path(report4).read_text()
-
-    assert "<h2>Data Cleaning</h2>" in html4, "Data Cleaning section must be present"
-
-    has_comparison = (
-        "Before cleaning" in html4 and "After cleaning" in html4
-    ) or "before/after" in html4.lower() or "placeholder" in html4.lower()
-
-    # The comparison table contains "Scenario" header
-    has_table = "Scenario" in html4 or "Before cleaning (simulated)" in html4
-
-    assert has_comparison or has_table, (
-        "Data Cleaning section must include a real computed before/after comparison "
-        "for tables with cleaning history.\n"
-        "Hint: check that _compute_before_after() ran and returned a result."
-    )
-    print(f"PASS: report {report4} includes before/after comparison.\n")
-
-# ── Test 5: non-obvious WHERE filters → Assumptions line ─────────────────────
-print("=" * 70)
-print("TEST 5: non-obvious WHERE filter → Assumptions line in report")
-print("=" * 70)
-
-# Use the scatter-plot SQL from the last visualize entry (has <> '-1' and ~ pattern).
-viz_entries = [e for e in all_entries if e.get("route_response") == "visualize"]
-entry5 = next(
-    (e for e in reversed(viz_entries) if e.get("generated_sql_query") and
-     ("<>" in e["generated_sql_query"] or "~" in e["generated_sql_query"])),
-    None,
-)
-
-if entry5 is None:
-    print("SKIP: no visualize log entry with non-obvious WHERE filter found.\n")
-else:
-    sql5 = entry5["generated_sql_query"]
-    print(f"Using entry: {entry5.get('user_question')!r}")
-    print(f"SQL fragment: {sql5[:120].strip()!r}")
-
-    # Unit test the assumption extractor directly first.
-    assumptions5 = _extract_query_assumptions(sql5)
-    print(f"Extracted assumptions: {assumptions5}")
-    assert assumptions5, (
-        f"_extract_query_assumptions must find at least one assumption in this SQL:\n{sql5}"
-    )
-
-    # Now check the full report.
-    report5 = generate_report(entry5)
-    html5 = Path(report5).read_text()
-
-    assert "<strong>Assumptions:</strong>" in html5, (
-        "Visualization section must include an Assumptions block for queries with "
-        "non-obvious WHERE filters."
-    )
-    print(f"PASS: report {report5} includes Assumptions line.\n")
-
-# ── Also unit-test _parse_placeholder_issue and _extract_query_assumptions ────
-print("=" * 70)
-print("Unit tests: _parse_placeholder_issue and _extract_query_assumptions")
-print("=" * 70)
-
-# parse_placeholder_issue
-issue_text = "Placeholder values: column 'Industry' has 71 value(s) that look like placeholders standing in for real data (['-1']), mixed in among otherwise genuine values."
-parsed = _parse_placeholder_issue(issue_text)
-assert parsed is not None, "Should parse placeholder issue"
-assert parsed["column"] == "Industry", f"expected column='Industry', got {parsed['column']!r}"
-assert parsed["count"] == 71, f"expected count=71, got {parsed['count']}"
-assert "-1" in parsed["placeholders"], f"expected '-1' in placeholders, got {parsed['placeholders']}"
-print("PASS: _parse_placeholder_issue parses correctly.")
-
-# extract_query_assumptions
-sql_with_filters = """
-SELECT industry, AVG(rating) AS avg_rating
-FROM uncleaned_ds_jobs
-WHERE industry IS NOT NULL
-  AND industry <> '-1'
-  AND salary_estimate ~ '^[0-9]+-[0-9]+'
-  AND rating IS NOT NULL
-GROUP BY industry
-HAVING COUNT(*) >= 5
-"""
-assumptions = _extract_query_assumptions(sql_with_filters)
-print(f"Assumptions found: {assumptions}")
-assert any("'-1'" in a for a in assumptions), "Must flag industry <> '-1' as non-obvious"
-assert any("pattern" in a.lower() or "~" in a or "matches" in a for a in assumptions), (
-    "Must flag regex pattern filter as non-obvious"
-)
-assert any("5" in a and "fewer" in a.lower() for a in assumptions), (
-    "Must flag HAVING COUNT(*) >= 5 threshold"
-)
-print("PASS: _extract_query_assumptions extracts all three non-obvious filters.\n")
-
-print("=" * 70)
-print("ALL PARTS 1-4 TESTS PASSED")
+print("ALL CHART-IMAGE-RENDERING TESTS PASSED")
 print("=" * 70)

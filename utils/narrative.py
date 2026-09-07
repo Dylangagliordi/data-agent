@@ -256,7 +256,9 @@ def _add_batch_step(add, tname, batch, level="fail"):
     reasoning_text = _clean_reasoning(batch.get("reasoning_comments", []))
     col_list = ", ".join(cols) if cols else f"{len(issues)} columns"
     level_word = "critical" if level == "fail" else "advisory"
-    title = f"Fix the same {level_word} issue across {len(cols) or len(issues)} columns — {tname}"
+    n_cols = len(cols) or len(issues)
+    col_word = "column" if n_cols == 1 else "columns"
+    title = f"Fix the same {level_word} issue across {n_cols} {col_word} — {tname}"
     explanation = (
         f"In {tname}, these columns needed the exact same fix: {col_list}. "
         f"I treated them together in one pass because {reason_phrase}. "
@@ -692,6 +694,257 @@ def _step_facts_block(step: NarrativeStep) -> str:
         except Exception:
             pass
     return block
+
+
+# ── Extra Part C content kept from earlier work, folded into the unified
+# sequence per Spec 2's own "Explicitly out of scope" instruction: "No change
+# to chart generation, chart-type rubric, or the glossary/second-chart
+# presentation additions already working well — keep those, fold their
+# existing output into Part C of the unified sequence." These two each
+# already produce their own natural-language/rendered content via their own
+# dedicated calls, so assemble_full_walkthrough appends them AFTER
+# narrate_steps runs on the core list — they are not narrated a second time.
+
+_COUNT_COL_RE = re.compile(r"^(?:n|count|num\w*|sample_size|total_count|\w+_count)$", re.IGNORECASE)
+_MAX_GLOSSARY_TERMS = 12
+
+
+def _to_float(val):
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_category_values(entry: dict) -> "tuple | None":
+    """Deterministically pick the real category column out of the executed
+    query's actual result (first non-numeric column, by real column order)
+    and return its distinct values in first-seen order. None when the result
+    has no non-numeric column at all.
+    """
+    rows, _truncated = _parse_result_rows(entry.get("sql_query_execution_result", ""))
+    if not rows:
+        return None
+    cols = list(rows[0].keys())
+    numeric_cols = {c for c in cols if any(_to_float(r.get(c)) is not None for r in rows)}
+    non_numeric_cols = [c for c in cols if c not in numeric_cols]
+    if not non_numeric_cols:
+        return None
+    cat_col = non_numeric_cols[0]
+    seen: set = set()
+    values: list = []
+    for r in rows:
+        v = r.get(cat_col)
+        if v is None:
+            continue
+        v = str(v)
+        if v not in seen:
+            seen.add(v)
+            values.append(v)
+    if not values:
+        return None
+    return cat_col, values[:_MAX_GLOSSARY_TERMS]
+
+
+def generate_glossary(category_label: str, values: list, llm) -> dict:
+    """One LLM call explaining what each real category value generally MEANS
+    in plain English — general background knowledge, not a dataset-derived
+    claim. Returns {} on any failure or malformed response."""
+    if not values:
+        return {}
+    terms_block = "\n".join(f"- {v}" for v in values)
+    prompt = (
+        f"Someone is looking at a chart grouped by \"{category_label}\" and the category "
+        f"labels below aren't self-explanatory. For each one, explain in one short, plain, "
+        f"conversational sentence what that label generally refers to in everyday terms — "
+        f"this is general background knowledge, not something you're deriving from any "
+        f"dataset, so don't state or imply any number, statistic, or dataset-specific fact.\n\n"
+        f"Labels:\n{terms_block}\n\n"
+        f"Respond with exactly one line per label, in this exact format, same order, "
+        f"no numbering, no extra commentary:\n"
+        f"<label> :: <one-sentence plain-English explanation>"
+    )
+    try:
+        text = llm.invoke([("human", prompt)]).content
+        if isinstance(text, list):
+            text = "".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in text if not (isinstance(b, dict) and b.get("type") == "thinking")
+            )
+        glossary = {}
+        for line in text.splitlines():
+            if "::" not in line:
+                continue
+            term, _, explanation = line.partition("::")
+            term = term.strip().lstrip("-").strip()
+            explanation = explanation.strip()
+            if term and explanation:
+                glossary[term] = explanation
+        return glossary
+    except Exception:
+        return {}
+
+
+def resolve_scatter_columns(entry: dict) -> "dict | None":
+    """Deterministically resolve category/x/y/count columns for a second,
+    volume-aware scatter view of the SAME already-executed result. None when
+    the real result doesn't have the right shape."""
+    rows, truncated = _parse_result_rows(entry.get("sql_query_execution_result", ""))
+    if not rows or truncated:
+        return None
+    cols = list(rows[0].keys())
+    numeric_cols = [c for c in cols if any(_to_float(r.get(c)) is not None for r in rows)]
+    non_numeric_cols = [c for c in cols if c not in numeric_cols]
+    if not non_numeric_cols:
+        return None
+    category_col = non_numeric_cols[0]
+    count_col = next((c for c in numeric_cols if _COUNT_COL_RE.match(c)), None)
+    if count_col is None:
+        return None
+    measure_cols = [c for c in numeric_cols if c != count_col]
+    if len(measure_cols) < 2:
+        return None
+    return {
+        "rows": rows, "category_col": category_col,
+        "x_col": measure_cols[0], "y_col": measure_cols[1], "count_col": count_col,
+    }
+
+
+def render_scatter_chart_png_b64(resolved: dict) -> "str | None":
+    """Render the volume-aware scatter chart in-memory; return base64 PNG
+    bytes, or None if rendering fails for any reason."""
+    try:
+        import base64
+        import io as _io
+
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        rows = resolved["rows"]
+        cat_col, x_col = resolved["category_col"], resolved["x_col"]
+        y_col, count_col = resolved["y_col"], resolved["count_col"]
+
+        xs, ys, sizes, labels = [], [], [], []
+        for r in rows:
+            x, y = _to_float(r.get(x_col)), _to_float(r.get(y_col))
+            if x is None or y is None:
+                continue
+            n = _to_float(r.get(count_col)) or 0
+            xs.append(x)
+            ys.append(y)
+            sizes.append(n * 6 + 40)
+            labels.append(str(r.get(cat_col)))
+        if not xs:
+            return None
+
+        fig = Figure(figsize=(9.5, 6.2))
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        ax.scatter(xs, ys, s=sizes, alpha=0.75, edgecolors="#16213e", linewidths=0.7, zorder=3)
+        for x, y, label in zip(xs, ys, labels):
+            ax.annotate(label, (x, y), textcoords="offset points", xytext=(6, 4), fontsize=8)
+        ax.set_xlabel(x_col.replace("_", " ").title())
+        ax.set_ylabel(y_col.replace("_", " ").title())
+        ax.set_title(
+            f"{y_col.replace('_', ' ').title()} vs. {x_col.replace('_', ' ').title()}\n"
+            f"(point size = {count_col.replace('_', ' ').title()})",
+            fontsize=11,
+        )
+        ax.grid(True, alpha=0.25, zorder=0)
+        fig.tight_layout()
+
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
+def _build_glossary_step(entry: dict, llm, step_number: int) -> "NarrativeStep | None":
+    resolved = resolve_category_values(entry)
+    if not resolved:
+        return None
+    cat_col, values = resolved
+    glossary = generate_glossary(cat_col, values, llm)
+    if not glossary:
+        return None
+    lines = "; ".join(f"{term}: {expl}" for term, expl in glossary.items())
+    explanation = (
+        f"To make the '{cat_col}' categories easier to follow, here's what each one generally "
+        f"means in everyday terms (general background knowledge, not derived from this "
+        f"dataset): {lines}"
+    )
+    return NarrativeStep(
+        step_number, "analysis", "What do these categories mean?", explanation,
+        stats={"glossary": glossary, "category_col": cat_col},
+    )
+
+
+def _build_scatter_step(entry: dict, step_number: int) -> "NarrativeStep | None":
+    resolved = resolve_scatter_columns(entry)
+    if not resolved:
+        return None
+    chart_b64 = render_scatter_chart_png_b64(resolved)
+    if not chart_b64:
+        return None
+    x_col, y_col, count_col = resolved["x_col"], resolved["y_col"], resolved["count_col"]
+    explanation = (
+        f"Here's the same result plotted a different way — {y_col} against {x_col}, with "
+        f"each point's size showing {count_col}, so a category perched on an extreme value "
+        f"backed by very few real records stands out from one backed by a lot of them."
+    )
+    return NarrativeStep(
+        step_number, "analysis", "Scatter, sized by volume", explanation,
+        stats={
+            "chart_b64": chart_b64, "x_col": x_col, "y_col": y_col, "count_col": count_col,
+            "category_col": resolved["category_col"],
+        },
+    )
+
+
+def assemble_full_walkthrough(entry: dict, llm) -> list:
+    """The single call both generate_report.py and generate_presentation.py
+    use: build_narrative_walkthrough + narrate_steps, THEN fold in the
+    glossary/second-chart additions Spec 2 explicitly keeps (see the module
+    comment above) immediately around the chart step, renumbered into one
+    contiguous sequence — so both documents always render the exact same
+    steps in the exact same order.
+    """
+    steps = build_narrative_walkthrough(entry)
+    steps = narrate_steps(steps, llm)
+
+    if not entry.get("chart_type"):
+        return steps
+
+    chart_idx = next((i for i, s in enumerate(steps) if s.title.startswith("Visualize the result")), None)
+    if chart_idx is None:
+        return steps
+
+    extra_before = []
+    try:
+        glossary_step = _build_glossary_step(entry, llm, 0)
+    except Exception:
+        glossary_step = None
+    if glossary_step is not None:
+        extra_before.append(glossary_step)
+
+    extra_after = []
+    try:
+        scatter_step = _build_scatter_step(entry, 0)
+    except Exception:
+        scatter_step = None
+    if scatter_step is not None:
+        extra_after.append(scatter_step)
+
+    new_order = steps[:chart_idx] + extra_before + [steps[chart_idx]] + extra_after + steps[chart_idx + 1:]
+    return [
+        NarrativeStep(i + 1, s.part, s.title, s.explanation, s.technical_detail, s.stats)
+        for i, s in enumerate(new_order)
+    ]
 
 
 def narrate_steps(steps: list, llm) -> list:

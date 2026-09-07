@@ -50,7 +50,7 @@ from pathlib import Path
 import pandas as pd
 
 import utils.data_cleaning as dc
-import utils.generate_report as gr
+import utils.narrative as nr
 
 
 @contextmanager
@@ -514,8 +514,8 @@ print("PASS: unresolved_issues_for_record correctly reflects both a resolved fai
 
 
 print("=" * 70)
-print("TEST 7: report rendering — one combined block per batch,")
-print("multiple warn batches handled correctly")
+print("TEST 7: narrative-walkthrough rendering (utils/narrative.py, Spec 2) —")
+print("one combined step per batch, multiple warn batches handled correctly")
 print("=" * 70)
 
 file_rec7 = {
@@ -553,24 +553,40 @@ file_rec7 = {
         },
     ],
 }
-entry_meta7 = {"trigger": "manual", "timestamp": "2026-01-01T00:00:00+00:00"}
-html7 = gr._section_data_cleaning({"my_table": (entry_meta7, file_rec7)})
-print(html7[:2000])
+entry_meta7 = {"trigger": "manual", "timestamp": "2026-01-01T00:00:00+00:00", "source_folder": ""}
+table_meta7 = [{"table": "my_table", "row_count": 10, "columns": [{"name": "a"}, {"name": "b"}, {"name": "x"}, {"name": "y"}]}]
+cleaning_map7 = {"my_table": (entry_meta7, file_rec7)}
 
-assert "identical fix applied across 2 columns" in html7, (
-    "expected ONE combined block naming the batch size, not 2 separate near-identical blocks"
+steps7 = []
+counter7 = {"n": 0}
+
+
+def _add7(part, title, explanation, technical_detail="", stats=None):
+    counter7["n"] += 1
+    steps7.append(nr.NarrativeStep(counter7["n"], part, title, explanation, technical_detail, stats or {}))
+
+
+nr._build_cleaning_steps(_add7, table_meta7, cleaning_map7)
+all_text7 = "\n".join(f"{s.title}\n{s.explanation}" for s in steps7)
+print(all_text7[:2000])
+
+batch_step7 = next(s for s in steps7 if s.stats.get("batched") and s.stats.get("columns") == ["a", "b"])
+assert "2 columns" in batch_step7.title, (
+    f"expected ONE combined step naming the batch size, not 2 separate near-identical steps: {batch_step7.title}"
 )
-assert gr._esc(issue_a) in html7 and gr._esc(issue_b) in html7, (
-    "both batched issues must be listed inside the combined block"
+assert "a" in batch_step7.explanation and "b" in batch_step7.explanation, (
+    "the batched fail issue must name both covered columns in the combined step"
 )
-assert html7.count("Replaced the -1 placeholder") == 1, (
+assert all_text7.count("Replaced the -1 placeholder") == 1, (
     "the batch's shared reasoning must be shown exactly ONCE, not once per issue"
 )
-assert "Stripped the $ symbol from column x" in html7 and "Stripped the $ symbol from column y" in html7, (
+warn_steps7 = [s for s in steps7 if s.stats.get("batched") and s.stats.get("columns") in (["x"], ["y"])]
+assert len(warn_steps7) == 2, f"expected two distinct warn-batch steps, got {len(warn_steps7)}"
+assert "Stripped the $ symbol from column x" in all_text7 and "Stripped the $ symbol from column y" in all_text7, (
     "both warn batches' own reasoning must be rendered"
 )
-print("PASS: report renders one combined block per fail batch (shared reasoning shown once) "
-      "and correctly handles multiple warn batches.\n")
+print("PASS: narrative walkthrough renders one combined step per fail batch (shared reasoning "
+      "shown once) and correctly handles multiple warn batches.\n")
 
 print("=" * 70)
 print("TEST 8: dtype-aware signature (Part 4 safety fix) — a numeric column")
