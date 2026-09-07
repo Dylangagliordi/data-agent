@@ -306,6 +306,49 @@ try:
           "source list exactly, and only the manual-mode step shows a reference_source.\n")
 
     print("=" * 70)
+    print("TEST 10: full round trip — an interactive session's saved file")
+    print("makes a SECOND run apply silently with zero prompts")
+    print("=" * 70)
+
+    cand10 = _FakeCandidate("cc_t10", ["Region"], kind="categorical_consolidation")
+    distinct10 = ["North", "South", "East", "West"]
+    lines10 = ["1", "Reference deck: 'Regions', slide 2", '{"North": "N", "South": "S", "East": "E", "West": "W"}']
+    builtins.input = _feed_input(lines10)
+    try:
+        session_result = resolve_manual_mode_candidate(cand10, distinct_values=distinct10)
+    finally:
+        builtins.input = original_input
+    assert session_result is not None
+
+    # Simulate a genuinely SECOND, later run: a fresh registry (clear_manual_mode),
+    # loading the saved file from disk (not reusing the in-memory session_result),
+    # and confirming resolve_manual_mode_candidate is never called again because
+    # the loaded override is already complete.
+    clear_manual_mode()
+    saved_payload = load_latest_reference_mapping_file("Region")
+    assert saved_payload is not None, "the interactive session must have saved a reference file"
+    reloaded_override = override_from_reference_file(cand10, saved_payload)
+    apply_manual_mode([reloaded_override])
+
+    retrieved = get_manual_mode_override(cand10.candidate_id)
+    assert retrieved is not None
+    assert _is_override_complete(cand10, retrieved, distinct_values=distinct10), (
+        "an override rebuilt from a saved reference file must be immediately complete — "
+        "surface_transformations checks this BEFORE ever calling resolve_manual_mode_candidate "
+        "again, so a complete override here guarantees zero prompts on the second run"
+    )
+    assert retrieved.supplied_data == {"North": "N", "South": "S", "East": "E", "West": "W"}
+
+    # Prove it with a real, zero-input call: any input() here would raise EOFError.
+    builtins.input = _feed_input([])
+    try:
+        second_run_result = resolve_manual_mode_candidate(cand10, partial_override=retrieved, distinct_values=distinct10)
+    finally:
+        builtins.input = original_input
+    assert second_run_result is retrieved
+    print("PASS: a second, later run loads the saved reference file and resolves with zero prompts.\n")
+
+    print("=" * 70)
     print("ALL MANUAL-MODE (SPEC 3) ASSERTIONS PASSED")
     print("=" * 70)
 finally:
