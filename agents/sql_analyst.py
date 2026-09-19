@@ -359,13 +359,13 @@ def add_context(state: SQLAnalystState) -> dict:
                 SELECT table_name, column_name, data_type
                 FROM information_schema.columns
                 WHERE table_schema = %s
-                  AND table_name NOT IN (%s, %s, %s, %s, %s)
+                  AND table_name NOT IN (%s, %s, %s, %s, %s, %s)
                 ORDER BY table_name, ordinal_position
                 """,
                 (
                     "public", "_data_quality_status", "_fanout_status",
                     "_transformation_candidates", "_transformation_decisions",
-                    "_derived_columns",
+                    "_derived_columns", "_cleaning_recipes",
                 ),
             )
             rows = cur.fetchall()
@@ -2770,6 +2770,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
         compute_and_write_fanout_status,
         compute_file_checksum,
         compute_quality_status,
+        ensure_cleaning_recipes_table,
         ensure_data_quality_status_table,
         ensure_derived_columns_table,
         ensure_fanout_status_table,
@@ -2777,6 +2778,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
         ensure_transformation_decisions_table,
         get_admin_connection,
         invalidate_cached_decisions_for_table,
+        invalidate_cleaning_recipes_for_table,
         load_csv_to_table,
         sanitize_identifier,
         write_data_quality_status,
@@ -2813,6 +2815,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
         ensure_transformation_candidates_table(conn)
         ensure_transformation_decisions_table(conn)
         ensure_derived_columns_table(conn)
+        ensure_cleaning_recipes_table(conn)
 
         for source_folder, table_names in folder_to_tables.items():
             folder_path = Path(source_folder)
@@ -2838,7 +2841,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
                         file=_sys.stderr,
                     )
 
-            cleaning_result = clean_dataset(folder_path, llm=_llm, trigger="auto_redirect")
+            cleaning_result = clean_dataset(folder_path, llm=_llm, trigger="auto_redirect", recipe_conn=conn)
 
             all_records = {rec.file_name: rec for rec in cleaning_result.cleaned_files}
             all_records.update({rec.file_name: rec for rec in cleaning_result.skipped_files})
@@ -2886,6 +2889,7 @@ def clean_and_reload(state: SQLAnalystState, _llm=None) -> dict:
                 candidates = detect_transformation_candidates(reloaded_df, table_name)
                 write_transformation_candidates(conn, table_name, candidates)
                 invalidate_cached_decisions_for_table(conn, table_name)
+                invalidate_cleaning_recipes_for_table(conn, table_name)
 
                 newly_attempted.append(table_name)
     finally:

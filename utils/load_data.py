@@ -60,6 +60,7 @@ from dotenv import load_dotenv
 from utils.data_cleaning import (
     _issue_severity,
     _read_csv_robust,
+    _signature_to_jsonable,
     clean_dataset,
     unresolved_issues_for_record,
 )
@@ -523,6 +524,96 @@ def invalidate_cached_decisions_for_table(conn, table_name: str) -> None:
     conn.commit()
 
 
+def ensure_cleaning_recipes_table(conn) -> None:
+    """Create _cleaning_recipes if it doesn't already exist, and grant SELECT
+    to app_reader (Spec 7: Cleaning Recipe Cache).
+
+    One row per (table_name, signature_hash) — a previously-approved fix for a
+    signature-eligible fail/warn issue group, keyed so the identical signature
+    on a DIFFERENT table can never reuse this table's recipe (same cross-table
+    mixup class of bug _issue_treatment_signature's own dtype-aware check
+    already exists to prevent elsewhere)."""
+    app_reader = os.environ.get("PG_APP_READER_USER", "app_reader")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _cleaning_recipes (
+                table_name     TEXT NOT NULL,
+                signature_hash TEXT NOT NULL,
+                signature      JSONB NOT NULL,
+                generated_code TEXT NOT NULL,
+                approved_at    TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (table_name, signature_hash)
+            );
+            """
+        )
+        cur.execute(f'GRANT SELECT ON _cleaning_recipes TO "{app_reader}";')
+    conn.commit()
+
+
+def write_cleaning_recipe(conn, table_name: str, signature_hash: str, signature, generated_code: str) -> None:
+    """Persist one approved fix as table_name's recipe for signature_hash.
+    generated_code has its real cloned_path already replaced by
+    utils.data_cleaning._RECIPE_PATH_PLACEHOLDER — see that module for why a
+    cached fix can't be stored with its original literal path baked in.
+
+    signature may contain a frozenset (e.g. a placeholder token set), which
+    isn't JSON-serializable on its own — converted via _signature_to_jsonable
+    first, same as cleaning_log.jsonl already does for the identical reason."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO _cleaning_recipes
+                (table_name, signature_hash, signature, generated_code, approved_at)
+            VALUES (%s, %s, %s, %s, now())
+            ON CONFLICT (table_name, signature_hash) DO UPDATE SET
+                signature = EXCLUDED.signature,
+                generated_code = EXCLUDED.generated_code,
+                approved_at = EXCLUDED.approved_at
+            """,
+            (
+                table_name, signature_hash,
+                psycopg2.extras.Json(_signature_to_jsonable(signature)), generated_code,
+            ),
+        )
+    conn.commit()
+
+
+def read_cleaning_recipe(conn, table_name: str, signature_hash: str) -> "dict | None":
+    """Return the cached recipe for (table_name, signature_hash), or None if
+    this exact table+signature has never had an approved fix recorded (or was
+    invalidated by a reload). generated_code still has the placeholder path —
+    substituting the real, current cloned_path is the caller's job
+    (utils.data_cleaning._clean_issue_group), not this read function's."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT generated_code, approved_at FROM _cleaning_recipes
+            WHERE table_name = %s AND signature_hash = %s
+            """,
+            (table_name, signature_hash),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    if not row:
+        return None
+    return {
+        "generated_code": row[0],
+        "approved_at": row[1].isoformat() if row[1] is not None else None,
+    }
+
+
+def invalidate_cleaning_recipes_for_table(conn, table_name: str) -> None:
+    """Clear every cached cleaning recipe for table_name. Called at the same
+    reload sites as invalidate_cached_decisions_for_table, same reasoning:
+    never guess whether an old recipe still applies to possibly-different
+    underlying data on a genuine reload — clear it and let the next issue of
+    that shape regenerate and re-approve a fresh fix."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM _cleaning_recipes WHERE table_name = %s", (table_name,))
+    conn.commit()
+
+
 def ensure_derived_columns_table(conn) -> None:
     """Create _derived_columns if it doesn't already exist, and grant SELECT
     to app_reader.
@@ -874,6 +965,7 @@ def main() -> None:
         ensure_transformation_candidates_table(conn)
         ensure_transformation_decisions_table(conn)
         ensure_derived_columns_table(conn)
+        ensure_cleaning_recipes_table(conn)
 
         # Source-checksum freshness check (architecture review point #20): before
         # this manual re-clean runs, compare each file's CURRENT raw bytes against the
@@ -894,7 +986,7 @@ def main() -> None:
                 )
 
         print(f"Checking {folder} against the cleaning rubric before loading...")
-        cleaning_result = clean_dataset(folder)
+        cleaning_result = clean_dataset(folder, recipe_conn=conn)
         print(cleaning_result.summary())
 
         # Every file loads regardless of cleaning outcome now — see module docstring.
@@ -952,6 +1044,7 @@ def main() -> None:
             candidates = detect_transformation_candidates(loaded_df, table_name)
             write_transformation_candidates(conn, table_name, candidates)
             invalidate_cached_decisions_for_table(conn, table_name)
+            invalidate_cleaning_recipes_for_table(conn, table_name)
             print(f"  -> {len(candidates)} transformation candidate(s) detected for '{table_name}'")
     finally:
         conn.close()

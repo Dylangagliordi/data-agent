@@ -56,6 +56,7 @@ structure to check against pre-load.
 """
 
 import csv
+import hashlib
 import json
 import re
 import shutil
@@ -1995,6 +1996,34 @@ def _signature_to_jsonable(signature: "tuple | None"):
     return [kind, payload_jsonable, *rest]
 
 
+# Spec 7: Cleaning Recipe Cache. Generated cleaning code hardcodes the exact
+# absolute cloned_path it was written against (the code-gen prompt tells the
+# model "read and overwrite this exact path", and it does). A cached fix can't
+# be replayed byte-for-byte on a LATER run — the path will be wrong — so the
+# real path is swapped for this fixed placeholder before a recipe is stored,
+# and swapped back for the current run's real path immediately before replay.
+# A mechanical string substitution, never a semantic rewrite of the fix itself.
+_RECIPE_PATH_PLACEHOLDER = "__CLEANING_RECIPE_FILE_PATH__"
+
+
+def compute_recipe_id(table_name: str, signature: tuple) -> str:
+    """Deterministic, stable across process restarts: sha256 over
+    (table_name, signature) — same reasoning as
+    utils.transformation_options.compute_candidate_id for why sha256 and not
+    Python's built-in hash() (salted per-process for strings, so it would
+    break the exact "same id across sessions" property this cache depends on).
+
+    Scoped by table_name, never by signature alone — the same identical
+    signature on a DIFFERENT table must never reuse this table's recipe (the
+    same cross-table mixup class of bug _issue_treatment_signature's own
+    dtype-aware check already exists to prevent elsewhere)."""
+    payload = json.dumps(
+        {"table": table_name, "signature": _signature_to_jsonable(signature)},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass
 class FileCleaningRecord:
     """One file's outcome from clean_dataset(): either cleaned, or skipped.
@@ -2689,7 +2718,8 @@ def _composite_split_shape_ok(original_columns: list, current_columns: list, fla
 
 
 def _clean_issue_group(
-    cloned_path: Path, target_issues: list, llm, pattern_lookup: "dict | None" = None
+    cloned_path: Path, target_issues: list, llm, pattern_lookup: "dict | None" = None,
+    recipe_conn=None, table_name: "str | None" = None, signature: "tuple | None" = None,
 ) -> tuple:
     """Shared generate -> approve -> execute -> immediate re-check -> retry cycle for
     ONE group of issues against one already-cloned file, capped at MAX_CLEAN_ATTEMPTS
@@ -2716,6 +2746,21 @@ def _clean_issue_group(
     check that check_rubric()'s generic re-check cannot provide for this issue
     type (see _composite_split_shape_ok). Every other issue category is
     completely unaffected by this parameter.
+
+    recipe_conn / table_name / signature (Spec 7, all optional, default None):
+    when all three are given and signature is not None (one of the six defined
+    treatment-signature categories — see _issue_treatment_signature; composite-
+    field issues never have one, so this never interacts with the composite
+    branch below), the FIRST attempt tries a previously-approved recipe for this
+    exact (table_name, signature) before ever calling the LLM or _request_approval
+    — zero new LLM calls, zero new approval prompts, but the SAME post-execution
+    verification below still runs for real. If that replay doesn't actually
+    resolve the issue (execution error, or the issue is still detected
+    afterward), the cached attempt is discarded silently and the very next
+    attempt falls through to a completely fresh, real generate/approve cycle —
+    never treated as if the LLM itself had produced and failed that code. A
+    freshly-generated fix that resolves a signature-eligible group (never a
+    cache hit) is saved as the new recipe for next time.
 
     A composite-field fix-generation call can also legitimately decline (the
     NO_SPLIT sentinel, see _extract_no_split_reason) when it determines
@@ -2772,40 +2817,76 @@ def _clean_issue_group(
     while attempt < MAX_CLEAN_ATTEMPTS:
         attempt += 1
 
-        if is_composite_field_fix:
-            issue = target_issues[0]
-            verified_pattern = (pattern_lookup or {}).get(issue)
-            if verified_pattern is not None:
-                code = _generate_composite_split_code(
-                    cloned_path, issue, verified_pattern, llm, previous_code, previous_error
-                )
-                # Legitimate decline: the model itself determined discovery's
-                # pattern match was a false positive for this column. This is a
-                # terminal, successful outcome — NOT fed back into the retry
-                # loop as a failure (that pressure is exactly what could push a
-                # later attempt toward fabricating a shape-compliant-but-
-                # meaningless split just to satisfy _composite_split_shape_ok).
-                # No execution, no approval prompt: nothing was generated that's
-                # worth a human reviewing.
-                no_split_reason = _extract_no_split_reason(code)
-                if no_split_reason is not None:
-                    return "declined_false_positive", attempt, no_split_reason, [], ""
-            else:
-                print(
-                    f"[explore] No verified pattern found for composite-field issue "
-                    f"{issue!r} — falling back to the general-purpose cleaning generator.",
-                    file=sys.stderr,
-                )
-                code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
-        else:
-            code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
+        # Spec 7: try a previously-approved recipe exactly once, on the first
+        # attempt only, before ever calling the LLM or the approval gate.
+        # is_composite_field_fix and a real signature never co-occur (composite-
+        # field issues aren't one of the six signature-defined categories), so
+        # this and the composite branch below never both apply to the same group.
+        used_cached_recipe = False
+        if (
+            attempt == 1
+            and recipe_conn is not None
+            and table_name is not None
+            and signature is not None
+        ):
+            from utils.load_data import read_cleaning_recipe  # local import: see clean_dataset's pick_llm import for why
 
-        approved = _request_approval(code, cloned_path)
+            recipe_id = compute_recipe_id(table_name, signature)
+            cached = read_cleaning_recipe(recipe_conn, table_name, recipe_id)
+            if cached is not None:
+                code = cached["generated_code"].replace(_RECIPE_PATH_PLACEHOLDER, str(cloned_path))
+                used_cached_recipe = True
+                print(
+                    f"[recipe] Reusing a previously-approved fix for '{table_name}' "
+                    f"— no new AI call, no new approval needed: {cloned_path}",
+                )
+
+        if not used_cached_recipe:
+            if is_composite_field_fix:
+                issue = target_issues[0]
+                verified_pattern = (pattern_lookup or {}).get(issue)
+                if verified_pattern is not None:
+                    code = _generate_composite_split_code(
+                        cloned_path, issue, verified_pattern, llm, previous_code, previous_error
+                    )
+                    # Legitimate decline: the model itself determined discovery's
+                    # pattern match was a false positive for this column. This is a
+                    # terminal, successful outcome — NOT fed back into the retry
+                    # loop as a failure (that pressure is exactly what could push a
+                    # later attempt toward fabricating a shape-compliant-but-
+                    # meaningless split just to satisfy _composite_split_shape_ok).
+                    # No execution, no approval prompt: nothing was generated that's
+                    # worth a human reviewing.
+                    no_split_reason = _extract_no_split_reason(code)
+                    if no_split_reason is not None:
+                        return "declined_false_positive", attempt, no_split_reason, [], ""
+                else:
+                    print(
+                        f"[explore] No verified pattern found for composite-field issue "
+                        f"{issue!r} — falling back to the general-purpose cleaning generator.",
+                        file=sys.stderr,
+                    )
+                    code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
+            else:
+                code = _generate_cleaning_code(cloned_path, remaining_issues, llm, previous_code, previous_error)
+
+        approved = True if used_cached_recipe else _request_approval(code, cloned_path)
         if not approved:
             return "skipped_declined", attempt, "", [], ""
 
         success, error = _execute_cleaning_code(code, cloned_path)
         if not success:
+            if used_cached_recipe:
+                # The cached fix doesn't even run against this file anymore —
+                # discard it silently and let the next attempt generate a
+                # completely fresh fix, rather than feeding this stale code back
+                # into the LLM as if it had been THIS session's own failed try.
+                print(
+                    f"[recipe] cached recipe for '{table_name}' failed to execute — "
+                    f"falling back to fresh generation",
+                    file=sys.stderr,
+                )
+                continue
             previous_code, previous_error = code, error
             if attempt >= MAX_CLEAN_ATTEMPTS:
                 return "skipped_failed", attempt, error, [], last_executed_code
@@ -2863,7 +2944,39 @@ def _clean_issue_group(
                 )
 
         if not still_present and not row_count_changed and composite_shape_ok:
+            # Spec 7: a freshly-generated (never a cache hit) fix that just got
+            # approved and verified for a signature-eligible group is saved as
+            # the recipe for next time — never re-saved on a cache hit itself,
+            # since that would just be writing back the exact same thing.
+            if (
+                not used_cached_recipe
+                and recipe_conn is not None
+                and table_name is not None
+                and signature is not None
+            ):
+                from utils.load_data import write_cleaning_recipe  # local import: see clean_dataset's pick_llm import for why
+
+                placeholder_code = code.replace(str(cloned_path), _RECIPE_PATH_PLACEHOLDER)
+                write_cleaning_recipe(
+                    recipe_conn, table_name, compute_recipe_id(table_name, signature),
+                    signature, placeholder_code,
+                )
             return "resolved", attempt, "", [], last_executed_code
+
+        if used_cached_recipe:
+            # The cached fix ran without raising, but didn't actually resolve
+            # the issue against this file's real current data (still detected,
+            # or it corrupted the row count/shape). Discard it silently and
+            # retry as a completely fresh generation next attempt — never treat
+            # a stale recipe's own code as if it were this session's failed
+            # attempt (previous_code/previous_error must stay whatever they
+            # were before this replay, i.e. empty on this first attempt).
+            print(
+                f"[recipe] cached recipe for '{table_name}' did not resolve the "
+                f"issue on this file's real current data — falling back to fresh generation",
+                file=sys.stderr,
+            )
+            continue
 
         if row_count_changed:
             remaining_issues = list(target_issues)
@@ -3640,7 +3753,7 @@ def _append_cleaning_log(result: "CleaningResult", source_folder: str, trigger: 
         pass
 
 
-def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningResult:
+def clean_dataset(folder_path, llm=None, trigger: str = "manual", recipe_conn=None) -> CleaningResult:
     """Process every top-level CSV in folder_path SEPARATELY: run the rubric per file,
     split its issues into fail-level and warn-level (see FAIL_LEVEL_PREFIXES /
     WARN_LEVEL_PREFIXES), and for any file with real issues:
@@ -3685,6 +3798,14 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
     use — this is a dependency default, not a safety bypass: the approval gate always
     uses the real input() builtin regardless of what llm is passed, so no caller can
     construct a call that skips it.
+
+    recipe_conn (Spec 7, optional, default None): when given, a previously-approved
+    fix for a signature-eligible fail/warn group on this exact table is replayed
+    without a new LLM call or approval prompt (still fully re-verified — see
+    _clean_issue_group). None (the default) reproduces this function's exact
+    pre-Spec-7 behavior with zero database dependency, which is load-bearing:
+    clean_data.py's whole point is running with no database connection at all,
+    and must keep working exactly as before.
     """
     from utils.llm_pick import pick_llm  # local import: keeps this module usable without
 
@@ -3700,6 +3821,17 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
     for file_path in csv_files:
         static_issues = check_rubric(file_path)
         resolved_llm = llm if llm is not None else pick_llm("high")
+
+        # Spec 7: only computed when a recipe cache is actually in play — same
+        # local-import discipline as pick_llm above, and avoids sanitize_identifier
+        # needing to be a hard top-level dependency of this module (utils.load_data
+        # already imports FROM utils.data_cleaning; a top-level import the other way
+        # would risk a real circular import, not just an unused-dependency style issue).
+        recipe_table_name = None
+        if recipe_conn is not None:
+            from utils.load_data import sanitize_identifier
+
+            recipe_table_name = sanitize_identifier(file_path.stem)
 
         # Discovery phase (see explore_and_verify): runs even when the static
         # rubric found nothing for this file — that's exactly the case a closed
@@ -3739,8 +3871,10 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
         # as before — its own cycle, one at a time (-> IssueCleaningRecord), in the
         # order check_rubric() found them.
         for group in _group_issues_by_signature(fail_issues, df=exploration_df):
+            group_signature = _issue_treatment_signature(group[0], df=exploration_df)
             status, attempts, error, remaining, code = _clean_issue_group(
-                cloned_path, group, resolved_llm, pattern_lookup=pattern_lookup
+                cloned_path, group, resolved_llm, pattern_lookup=pattern_lookup,
+                recipe_conn=recipe_conn, table_name=recipe_table_name, signature=group_signature,
             )
             total_attempts += attempts
             if len(group) == 1:
@@ -3753,7 +3887,7 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
                 fail_batch_records.append(
                     FailBatchRecord(
                         issues=group,
-                        signature=_issue_treatment_signature(group[0], df=exploration_df),
+                        signature=group_signature,
                         status=status,
                         attempts=attempts,
                         error=error,
@@ -3778,8 +3912,10 @@ def clean_dataset(folder_path, llm=None, trigger: str = "manual") -> CleaningRes
             warn_groups = _partition_warn_groups(warn_issues, df=exploration_df)
             if warn_groups:
                 for group in warn_groups:
+                    group_signature = _issue_treatment_signature(group[0], df=exploration_df)
                     status, attempts, error, remaining, code = _clean_issue_group(
-                        cloned_path, group, resolved_llm
+                        cloned_path, group, resolved_llm,
+                        recipe_conn=recipe_conn, table_name=recipe_table_name, signature=group_signature,
                     )
                     total_attempts += attempts
                     warn_batches.append(
