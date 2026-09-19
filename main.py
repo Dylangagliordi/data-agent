@@ -233,6 +233,16 @@ def main() -> None:
             print(f'Open with: open "{path}"')
         return
 
+    # freshness — proactively check every tracked table's real source file
+    # for drift since it was last processed (Spec 5), instead of only ever
+    # checking reactively, per-question, one table at a time.
+    if raw.strip().lower() == "freshness":
+        from utils.freshness_briefing import render_freshness_briefing_html
+        path = render_freshness_briefing_html()
+        print(f"Freshness briefing: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
     # Normal question — run through the graph and print the answer.
     result = _run_question(raw)
     print(result["final_answer"])

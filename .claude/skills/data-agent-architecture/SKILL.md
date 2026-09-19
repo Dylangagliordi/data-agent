@@ -616,6 +616,21 @@ See `tests/test_run_comparison.py` (no DB, no LLM — pure file reads over a tem
 
 ---
 
+### `utils/freshness_briefing.py` — Freshness / drift briefing (Spec 5)
+
+A proactive, all-tables-at-once view of whether each table's real raw source file has changed since it was last processed — the same checksum `_data_quality_status.source_checksum` already records, just checked across every tracked table instead of only reactively, per-question, one table at a time. A detection/reporting signal only, exactly like `check_source_freshness` itself — nothing here triggers a re-clean automatically. Not schema-drift detection (column structure changing over time) — that's a distinct, unbuilt feature; this is specifically about the raw file's bytes.
+
+| Function | Role |
+|---|---|
+| `get_freshness_briefing()` | One entry per table with a recorded `source_folder` in `_data_quality_status` (a table with none is never included — there's nothing to compare it against). Reverse-maps each table back to its real CSV via `agents.sql_analyst._find_source_csv` (reused, same discipline as Spec 4's `_parse_sql_result` reuse) and compares current vs. stored checksum. Three honest outcomes, never fabricated: `changed=True` (real drift), `changed=False` (unchanged), or `source_file_found=False` with `changed=None` (file can't be located at all — genuinely unknown, never defaulted to "unchanged"). Ranked changed-first, then "can't tell", then unchanged. |
+| `render_freshness_briefing_html()` | Renders the briefing as a plain HTML page under `freshness_briefing/freshness_briefing_<timestamp>.html`. |
+
+**CLI trigger** (in `main.py`): `python main.py "freshness"`.
+
+See `tests/test_freshness_briefing.py` (live Postgres, no LLM): a real temporary folder/CSV file whose bytes are genuinely mutated mid-test (proving real drift detection, not just echoing a stored flag), a file that's never created at all (the "can't tell" case), and a table with no recorded `source_folder` (correctly excluded) — all seeded and restored via the admin connection.
+
+---
+
 ### `utils/sql_transform_extraction.py` — Question-specific SQL shaping (shared)
 
 Public API: `extract_question_transformations(sql_query: str) -> dict`, `has_any_transformation(transformations: dict) -> bool`.
