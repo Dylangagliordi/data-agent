@@ -1,16 +1,19 @@
-"""Compile the top-level data_agent (router) graph and render its mermaid diagram
-to a PNG.
+"""Regenerate data_agent_graph.png from the real, current graph.
 
 Usage:
     python tests/draw_data_agent_graph.py
 Produces: data_agent_graph.png in the project root.
 """
 
-from agents.data_agent import build_data_agent_graph
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils.system_map import generate_system_map
 
 if __name__ == "__main__":
-    graph = build_data_agent_graph()
-    png_bytes = graph.get_graph().draw_mermaid_png()
+    png_bytes = generate_system_map("data_agent")
     out_path = "data_agent_graph.png"
     with open(out_path, "wb") as f:
         f.write(png_bytes)

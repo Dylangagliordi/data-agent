@@ -189,6 +189,15 @@ def main() -> None:
             print(f'Open with: open "{pres_path}"')
         return
 
+    # map — regenerate all three graph PNGs from the real, currently-compiled
+    # graphs (Spec 1: Live System Self-Map), never from a stale cached image.
+    if raw.strip().lower() == "map":
+        from utils.system_map import generate_all_system_maps
+        written = generate_all_system_maps(str(PROJECT_ROOT))
+        for graph_name, path in written.items():
+            print(f"{graph_name}: {path}")
+        return
+
     # Normal question — run through the graph and print the answer.
     result = _run_question(raw)
     print(result["final_answer"])
