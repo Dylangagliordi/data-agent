@@ -179,8 +179,27 @@ def transform_load(folder_path: str) -> str:
     implementation clean_data.py and the enhanced load_data.py both use. The exact same
     approval gate and retry-on-failure logic applies here: no exceptions for this
     autonomous path. Returns clean_dataset()'s human-readable summary string.
+
+    Spec 7b: opens its own short-lived admin connection (same pattern
+    agents/sql_analyst.py:clean_and_reload and utils/load_data.py:main() already use)
+    so a signature-eligible fix approved once for a recurring dataset is replayed
+    instead of re-generated and re-approved on every ask — this tool was the one
+    real entry point Spec 7 itself left out. No reload-invalidation call is needed
+    here: transform_load only cleans a folder, it never reloads a table into
+    Postgres, so there's no genuine-reload event for this tool to hook — a real
+    reload elsewhere (load_data.py, clean_and_reload) still invalidates correctly
+    regardless of which path originally approved the cached fix. This grants the
+    ETL agent access to exactly one internal bookkeeping table — never user data,
+    never a live table, never _data_quality_status.
     """
-    result = clean_dataset(folder_path)
+    from utils.load_data import ensure_cleaning_recipes_table, get_admin_connection
+
+    conn = get_admin_connection()
+    try:
+        ensure_cleaning_recipes_table(conn)
+        result = clean_dataset(folder_path, recipe_conn=conn)
+    finally:
+        conn.close()
     return result.summary()
 
 
