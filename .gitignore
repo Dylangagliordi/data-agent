@@ -7,3 +7,22 @@ __pycache__/
 !etl_analyst_graph.png
 !data_agent_graph.png
 logs/
+
+# Generated output artifacts — reproducible by running the project, not
+# part of the source itself.
+outputs/
+reports/
+presentations/
+dq_backlog/
+data_dictionaries/
+run_comparisons/
+freshness_briefing/
+*.log
+
+# Claude Code local scratch/session state — machine-specific, not shared.
+.claude/scratch/
+.claude/settings.local.json
+
+# Miscellaneous local/dev artifacts.
+data/_test_etl/checksum_gate/
+data/_test_etl/reload_hardening/_scratch/
