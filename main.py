@@ -208,6 +208,15 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # dq backlog — every table with an outstanding fail/warn issue, ranked
+    # (Spec 3), read straight from _data_quality_status.
+    if raw.strip().lower() == "dq backlog":
+        from utils.dq_backlog import render_dq_backlog_html
+        path = render_dq_backlog_html()
+        print(f"DQ backlog: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
     # Normal question — run through the graph and print the answer.
     result = _run_question(raw)
     print(result["final_answer"])

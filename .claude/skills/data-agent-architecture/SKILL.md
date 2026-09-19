@@ -585,6 +585,21 @@ See `tests/test_data_dictionary.py` (requires live Postgres, no LLM): verified a
 
 ---
 
+### `utils/dq_backlog.py` — DQ backlog view (Spec 3)
+
+Every table with an outstanding fail- or warn-level data-quality issue, ranked, in one place — instead of only ever being surfaced reactively when a question happens to touch a flagged table. Reads `_data_quality_status` only; computes nothing new, detects nothing new.
+
+| Function | Role |
+|---|---|
+| `get_dq_backlog()` | Returns every `"fail"`/`"warn"`-status table (never `"pass"`), each as `{table_name, status, issues, issue_count, was_cleaned, last_loaded_at}`. Ranked fail-status tables first, then by `issue_count` descending within each tier. Returns `[]` — never an error — if `_data_quality_status` doesn't exist yet or nothing is currently flagged. |
+| `render_dq_backlog_html()` | Renders the backlog as a plain HTML page under `dq_backlog/dq_backlog_<timestamp>.html`. A genuinely empty backlog renders an honest "no outstanding issues" message, not a blank page. |
+
+**CLI trigger** (in `main.py`): `python main.py "dq backlog"`.
+
+See `tests/test_dq_backlog.py` (live Postgres, no LLM): seeds three temporary rows via the admin connection (fail/warn/pass) and restores them in a `finally` block, same discipline as `test_transformation_options_live_wiring.py`. The empty-backlog rendering path is tested via monkeypatching `get_dq_backlog` to return `[]`, deliberately never by asserting the whole shared live database has zero outstanding issues — that's real state this test has no business making claims about.
+
+---
+
 ### `utils/sql_transform_extraction.py` — Question-specific SQL shaping (shared)
 
 Public API: `extract_question_transformations(sql_query: str) -> dict`, `has_any_transformation(transformations: dict) -> bool`.
