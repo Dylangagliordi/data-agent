@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .env
+.DS_Store
 *.png
 !sql_analyst_graph.png
 !etl_analyst_graph.png
