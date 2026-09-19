@@ -198,6 +198,16 @@ def main() -> None:
             print(f"{graph_name}: {path}")
         return
 
+    # dictionary: <table_name> — build a data dictionary for one table
+    # (Spec 2), entirely from metadata this project already computes.
+    if raw.startswith("dictionary: "):
+        from utils.data_dictionary import render_data_dictionary_html
+        table_name = raw[len("dictionary: "):].strip()
+        path = render_data_dictionary_html(table_name)
+        print(f"Data dictionary: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
     # Normal question — run through the graph and print the answer.
     result = _run_question(raw)
     print(result["final_answer"])

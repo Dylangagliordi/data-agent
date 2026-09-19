@@ -544,6 +544,7 @@ See `tests/test_manual_mode.py` (10 tests, no DB/live LLM — a fake LLM for the
 | `ensure_data_quality_status_table(conn)` | Creates `_data_quality_status` if missing; runs `ADD COLUMN IF NOT EXISTS source_folder` and `ADD COLUMN IF NOT EXISTS source_checksum` migrations idempotently. |
 | `ensure_fanout_status_table(conn)` | Creates `_fanout_status` if missing; GRANTs SELECT to `app_reader`. Called by `main()` and `clean_and_reload`. |
 | `compute_and_write_fanout_status(conn, table_name)` | Computes fan-out metadata for all id-like columns in `table_name` (using declared PK/FK constraints first, cardinality heuristic as fallback) and writes rows to `_fanout_status`. DELETEs old rows first so a reload always reflects current data. Called after every `load_csv_to_table`. |
+| `read_fanout_status(conn, table_name)` (Spec 2) | Returns `{column_name: {"is_likely_fk", "has_fanout", "source"}}` for every id-like column of `table_name` recorded in `_fanout_status` — empty dict if none. Used by `utils/data_dictionary.py` to report a column's real key role honestly rather than guessing. |
 | `ensure_transformation_candidates_table(conn)` / `ensure_transformation_decisions_table(conn)` (Spec 1) | Create `_transformation_candidates`/`_transformation_decisions` if missing; GRANT SELECT to `app_reader`. Called by `main()` and `clean_and_reload`, same as the fan-out/DQ-status ensure functions. |
 | `write_transformation_candidates(conn, table_name, candidates)` / `read_transformation_candidates(conn, table_name)` (Spec 1) | Upsert/read the FULL candidate list (JSONB) for a table — `write` always replaces wholesale, never merges. `read` returns `list[TransformationCandidate]` via `TransformationCandidate.from_dict`. |
 | `write_transformation_decision(conn, table_name, candidate_id, decision)` / `read_transformation_decision(conn, table_name, candidate_id)` (Spec 1; Spec 2 adds `decided_at`) | Upsert/read one cached `present_transformation_options` answer, keyed by `(table_name, candidate_id)`. `read_transformation_decision`'s return dict is `{"chosen_option_id", "reasoning_shown", "decided_at"}` — `decided_at` (added for Spec 2) is the row's real timestamp, ISO-formatted, so a reused decision can be narrated honestly ("this had already been decided earlier ...") instead of presented as freshly asked. |
@@ -551,6 +552,7 @@ See `tests/test_manual_mode.py` (10 tests, no DB/live LLM — a fake LLM for the
 | `_is_id_like_column(col)` | Returns True for `'id'` or any column ending in `'_id'`. Used by `compute_and_write_fanout_status`. |
 | `compute_quality_status(unresolved_issues)` | Returns `(status, issues_found_payload)` using `_issue_severity` from `data_cleaning.py`. Status: `"fail"` > `"warn"` > `"pass"`. |
 | `write_data_quality_status(conn, table_name, status, issues_found, was_cleaned, source_folder=None, source_checksum=None)` | Upserts one row in `_data_quality_status`. `source_checksum` is the raw source file's SHA-256 at processing time (see below); `None` means "no baseline". |
+| `read_data_quality_status(conn, table_name)` (Spec 2) | Returns `{"status", "issues_found", "was_cleaned", "last_loaded_at"}` for `table_name`, or `None` if it's never been processed by the loader/cleaning pipeline at all. Used by `utils/data_dictionary.py`, which must never fabricate a "pass" default for a table with no recorded status. |
 | `compute_file_checksum(path)` | Real SHA-256 hex digest of `path`'s bytes, streamed in 1 MiB chunks. |
 | `get_stored_checksum(conn, table_name)` | Returns the `source_checksum` last recorded for `table_name`, or `None` if there's no row yet or the column is `NULL`. Commits immediately after the SELECT to release its lock (same pattern as `_fetch_status` in `tests/test_auto_clean_redirect.py`). |
 | `check_source_freshness(conn, table_name, csv_path)` | Returns `(source_changed, current_checksum)`. `source_changed` is `True` only when a prior checksum exists AND differs from the file's current bytes — a table with no baseline yet is never reported as "changed". Called by `add_context` (real gate for non-`"fail"`-status tables — architecture review point #22, see the `_data_quality_status` section above), `clean_and_reload` (per targeted table, informational only — those tables are already being reloaded regardless of this result), and `load_data.py:main()` (per file, informational only). All three log `[checksum] source changed, forcing fresh clean for '<table>' (...).` to stderr/stdout when a mismatch is detected — see architecture review points #20/#22. |
@@ -565,6 +567,21 @@ See `tests/test_manual_mode.py` (10 tests, no DB/live LLM — a fake LLM for the
 ### `utils/db.py` — Read-only connection helper
 
 `get_app_reader_connection()`: connects as `PG_APP_READER_USER` with `PG_APP_READER_PASSWORD`. Used by every graph node that reads data (`add_context`, `execute_sql`, `_detect_fanout_warnings`, and all report helpers). Env vars loaded from `~/.hermes/profiles/data-agent/.env`.
+
+---
+
+### `utils/data_dictionary.py` — Data dictionary (Spec 2)
+
+A browsable "what does this column mean, and can I trust it" view for one table, built entirely from metadata this project already computes — `information_schema`, `_data_quality_status`, `_fanout_status`, `_derived_columns`, `_transformation_candidates`. The only live query beyond those existing tables is a single `COUNT(*)` for row count; nothing here profiles or re-detects anything new. Absence is never fabricated into a default (see `read_data_quality_status`/`read_fanout_status` above).
+
+| Function | Role |
+|---|---|
+| `generate_data_dictionary(table_name)` | Reads real columns/types, row count, and whatever quality/fanout/derived/candidate metadata already exists for `table_name`, via `get_app_reader_connection()` only — no writes. A column's `role` is `"regular"` (no `_fanout_status` row), `"primary key"`, or `"foreign key"` (from the real `is_likely_fk` flag). `high_cardinality_candidate` is `True` when the column appears in a stored `categorical_consolidation`-kind candidate. |
+| `render_data_dictionary_html(table_name)` | Renders `generate_data_dictionary`'s result as a plain HTML page, written to `data_dictionaries/<table_name>_<timestamp>.html` — same output-directory convention as `outputs/visualizations/`, `reports/`, `presentations/`. |
+
+**CLI trigger** (in `main.py`): `python main.py "dictionary: <table_name>"` — same dispatch pattern as `"report: <question>"`.
+
+See `tests/test_data_dictionary.py` (requires live Postgres, no LLM): verified against the real `uncleaned_ds_jobs` table, plus a deterministic "honest absence" test against `_fanout_status` itself (a real table that exists but was never loaded through `load_csv_to_table`, so every one of its own metadata lookups comes back empty rather than fabricated).
 
 ---
 

@@ -213,6 +213,30 @@ def compute_and_write_fanout_status(conn, table_name: str) -> None:
     conn.commit()
 
 
+def read_fanout_status(conn, table_name: str) -> dict:
+    """Return {column_name: {"is_likely_fk", "has_fanout", "source"}} for every
+    id-like column of table_name recorded in _fanout_status (empty dict if this
+    table has never had fan-out computed for it — e.g. it predates
+    ensure_fanout_status_table, or was never loaded through load_csv_to_table).
+    Used by utils.data_dictionary to report a column's real key role honestly,
+    never guessed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, is_likely_fk, has_fanout, source
+            FROM _fanout_status
+            WHERE table_name = %s
+            """,
+            (table_name,),
+        )
+        rows = cur.fetchall()
+    conn.commit()
+    return {
+        column_name: {"is_likely_fk": is_likely_fk, "has_fanout": has_fanout, "source": source}
+        for column_name, is_likely_fk, has_fanout, source in rows
+    }
+
+
 def ensure_data_quality_status_table(conn) -> None:
     """Create _data_quality_status if it doesn't already exist, and add any columns
     that were introduced after the initial schema. Table/column identifiers here can't
@@ -319,6 +343,34 @@ def write_data_quality_status(
             ),
         )
     conn.commit()
+
+
+def read_data_quality_status(conn, table_name: str) -> "dict | None":
+    """Return table_name's real _data_quality_status row as
+    {"status", "issues_found", "was_cleaned", "last_loaded_at"}, or None if this
+    table has never been processed by the loader/cleaning pipeline at all —
+    used by utils.data_dictionary, which must never fabricate a "pass" default
+    for a table with no recorded status."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT status, issues_found, was_cleaned, last_loaded_at
+            FROM _data_quality_status
+            WHERE table_name = %s
+            """,
+            (table_name,),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    if not row:
+        return None
+    status, issues_found, was_cleaned, last_loaded_at = row
+    return {
+        "status": status,
+        "issues_found": issues_found,
+        "was_cleaned": was_cleaned,
+        "last_loaded_at": last_loaded_at.isoformat() if last_loaded_at is not None else None,
+    }
 
 
 def ensure_transformation_candidates_table(conn) -> None:
