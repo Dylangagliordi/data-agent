@@ -600,6 +600,22 @@ See `tests/test_dq_backlog.py` (live Postgres, no LLM): seeds three temporary ro
 
 ---
 
+### `utils/run_comparison.py` — Run comparison / diff (Spec 4)
+
+Compares the two most recent runs of the exact same question, read straight from `logs/query_log.jsonl` — no database, no LLM. Matching is on the raw, exact `user_question` string (not `curated_question`, which ETL-analyst entries don't even have). Deliberately does not attempt cell-level value diffing (e.g. "this category's value changed from X to Y") — that would require guessing which column is the meaningful key to match old rows to new ones, information a plain SQL Analyst log entry doesn't record.
+
+| Function | Role |
+|---|---|
+| `find_entries_for_question(user_question)` | Every past log entry with that exact raw `user_question`, oldest first. |
+| `compare_runs(user_question)` | `None` if fewer than 2 matches exist. Otherwise diffs the two most recent: `sql_changed`, `columns_changed`, `rows_identical` (via `agents.sql_analyst._parse_sql_result`, reused rather than re-parsing the same JSON shape a second way), `final_answer_changed`, plus both full results. When neither run has a SQL query at all (e.g. two ETL-analyst runs), `sql_changed`/`columns_changed`/`rows_identical` come back as `None` (not applicable) rather than a fabricated `False` — two absent things being "equal" would misleadingly imply there was something to compare. |
+| `render_run_comparison_html(user_question)` | Renders the diff as a plain HTML page under `run_comparisons/<slug>_<timestamp>.html`. Returns `None` — never a broken file — when there's nothing to compare yet. |
+
+**CLI trigger** (in `main.py`): `python main.py "compare: <question>"` — prints an honest "not enough history yet" message rather than a crash when fewer than 2 matching runs exist.
+
+See `tests/test_run_comparison.py` (no DB, no LLM — pure file reads over a temporary, hand-written `query_log.jsonl`, `LOG_PATH` monkeypatched for the run): a genuinely changed SQL query/result set, two identical runs, fewer than 2 matches, and two ETL-analyst runs correctly reporting SQL/row fields as not-applicable rather than `False`.
+
+---
+
 ### `utils/sql_transform_extraction.py` — Question-specific SQL shaping (shared)
 
 Public API: `extract_question_transformations(sql_query: str) -> dict`, `has_any_transformation(transformations: dict) -> bool`.

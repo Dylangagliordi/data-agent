@@ -217,6 +217,22 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # compare: <question> — diff the two most recent runs of the exact same
+    # question (Spec 4), reading straight from query_log.jsonl.
+    if raw.startswith("compare: "):
+        from utils.run_comparison import render_run_comparison_html
+        question = raw[len("compare: "):].strip()
+        path = render_run_comparison_html(question)
+        if path is None:
+            print(
+                f"Not enough history to compare — need at least 2 past runs of exactly: "
+                f"{question!r}"
+            )
+        else:
+            print(f"Run comparison: {path}")
+            print(f'Open with: open "{path}"')
+        return
+
     # Normal question — run through the graph and print the answer.
     result = _run_question(raw)
     print(result["final_answer"])
