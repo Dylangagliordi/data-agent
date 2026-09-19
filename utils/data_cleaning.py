@@ -2313,11 +2313,20 @@ def _categorical_fill_advice(df: pd.DataFrame, col: str) -> str:
 
     Returns a short sentence (no leading space) that is appended inside the per-column
     guidance note in the code-gen prompt.  Returns "" when the column is numeric or has
-    too-high cardinality to be categorical, so the caller can skip it cleanly."""
+    too-high cardinality to be categorical, so the caller can skip it cleanly.
+
+    Numeric exclusion uses _column_value_type_category rather than pandas' own dtype
+    (Spec 6 bugfix): every column in this project is loaded with dtype=str (see
+    _read_csv_robust), so `pd.api.types.is_numeric_dtype(series)` — this function's
+    original check — could never actually be True. A genuinely numeric column could
+    have been getting mode/'Unknown' categorical advice instead of being recognized
+    as numeric at all. _column_value_type_category was already built for this exact
+    dtype=str blind spot (see the dtype-aware issue-batching fix) and is reused here
+    rather than inventing a second numeric detector."""
     if col not in df.columns:
         return ""
     series = df[col].dropna()
-    if series.empty or pd.api.types.is_numeric_dtype(series):
+    if series.empty or _column_value_type_category(series) == "numeric":
         return ""
     n_unique = series.nunique()
     if n_unique == 0 or n_unique / len(series) > 0.5:
@@ -2336,13 +2345,43 @@ def _categorical_fill_advice(df: pd.DataFrame, col: str) -> str:
     )
 
 
+def _numeric_fill_advice(df: pd.DataFrame, col: str) -> str:
+    """Return a fill-value recommendation for one numeric column (Spec 6).
+
+    Mirrors _categorical_fill_advice's exact shape/contract: a short sentence (no
+    leading space) appended inside the per-column guidance note, or "" when the
+    column isn't real/numeric enough for the caller to skip cleanly. Numeric
+    detection is value-based (_column_value_type_category), not pandas' own dtype,
+    for the same reason _categorical_fill_advice's exclusion check needed the same
+    fix — every column here is loaded as dtype=str.
+
+    Recommends the column's real median, never the mean: a mean fill silently
+    absorbs skew (a handful of high outliers in a salary/revenue-shaped column
+    would pull every imputed value toward them), while the median is robust to
+    exactly that."""
+    if col not in df.columns:
+        return ""
+    series = df[col].dropna()
+    if series.empty or _column_value_type_category(series) != "numeric":
+        return ""
+    numeric_values = pd.to_numeric(series, errors="coerce").dropna()
+    if numeric_values.empty:
+        return ""
+    median = numeric_values.median()
+    return (
+        f" This is a numeric column — fill with its real median ({median:g}), "
+        f"not the mean, since a skewed distribution would pull a mean fill toward outliers."
+    )
+
+
 def _issue_guidance(issue: str, df=None) -> str:
     """Extra, deterministic guidance appended under one issue line in the code-gen prompt.
 
     Fires for "Missing values" issues: parses the real percentage from check_rubric's own
-    issue string so the LLM gets a concrete number.  When df is provided and the column is
-    categorical, also appends a fill-value recommendation (mode vs 'Unknown') based on the
-    actual value distribution."""
+    issue string so the LLM gets a concrete number. When df is provided, also appends a
+    fill-value recommendation based on the column's real value shape: mode vs 'Unknown'
+    for a categorical column (_categorical_fill_advice), or the real median for a numeric
+    one (_numeric_fill_advice, Spec 6) — never the mean, which would silently absorb skew."""
     if not issue.startswith("Missing values:"):
         return ""
     match = _MISSING_PCT_RE.search(issue)
@@ -2357,7 +2396,10 @@ def _issue_guidance(issue: str, df=None) -> str:
         if df is not None:
             col_match = _MISSING_COL_RE.search(issue)
             if col_match:
-                advice = _categorical_fill_advice(df, col_match.group(1))
+                col = col_match.group(1)
+                # Mutually exclusive by construction: each function returns ""
+                # for the column shape the other one handles.
+                advice = _categorical_fill_advice(df, col) or _numeric_fill_advice(df, col)
                 if advice:
                     note += advice
         note += ")"
