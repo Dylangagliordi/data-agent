@@ -279,6 +279,26 @@ One row per column ever added by a Transformation Options fix (feature derivatio
 
 ---
 
+### `_saved_metrics` Postgres Table (Spec 8, Part 1: Semantic Layer)
+
+```sql
+CREATE TABLE _saved_metrics (
+    metric_name  TEXT PRIMARY KEY,
+    sql_fragment TEXT NOT NULL,
+    description  TEXT NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL
+);
+```
+
+A small, explicit registry of human-named canonical metric definitions — one row per metric, populated ONLY via an explicit `python main.py "define metric: <name> = <sql_fragment>"` CLI call (`utils/semantic_layer.py:parse_define_metric_command`, `utils/load_data.py:write_saved_metric`), never inferred from a query someone happened to ask. `delete metric: <name>` removes one; `metrics` renders every defined metric as a browsable page (`utils/semantic_layer.py:render_semantic_layer_html`).
+
+**Excluded from `add_context`'s `information_schema` query** (the `table_name NOT IN (...)` tuple, now seven placeholders). Unlike every other internal table, `ensure_saved_metrics_table` is NOT called from `add_context` itself — `add_context` only ever holds an `app_reader` connection, and `app_reader` is read-only at the DB level (`REVOKE CREATE ON SCHEMA public`), so it can never create this table. It's only ever ensured from an admin connection, at the `define metric:` / `delete metric:` / `metrics` CLI handlers in `main.py`. Consequently `utils/load_data.py:read_saved_metrics(conn)` (called from `add_context` over its app_reader connection) must tolerate `_saved_metrics` not existing yet on a database where no metric has ever been defined — it catches `psycopg2.errors.UndefinedTable`, rolls back just that one failed statement, and returns `[]`, exactly equivalent to "no metrics defined."
+
+**Live wiring:** when any metric is defined, `add_context` appends one additional context block after the normal schema/warning text: `"Known canonical metric definitions (previously agreed upon — reuse one of these exactly ...)"` followed by `- <name>: <sql_fragment>  (<description>)` lines. This is purely additive, non-authoritative context — the same way fan-out/DQ warnings are already surfaced — `generate_sql` is told a canonical definition exists but nothing mechanically forces it to reuse one instead of writing fresh SQL. See `tests/test_semantic_layer.py` (parsing, empty/populated HTML rendering, and a live DB round trip: define → read → upsert-redefine → delete) plus a real `test_add_context.py` regression run confirming the exclusion-list bump doesn't produce a spurious warning.
+
+---
+
 ## 3. Code Organization
 
 ### `agents/sql_analyst.py` — SQL analyst graph nodes and helpers
@@ -286,7 +306,7 @@ One row per column ever added by a Transformation Options fix (feature derivatio
 | Function | Role |
 |---|---|
 | `curate_question` | Node 1: grammar/spelling fix only, no intent change. Uses `pick_llm("cheap")`. |
-| `add_context` | Node 2 (no LLM): builds schema context from `information_schema`, runs fan-out check and DQ status check (including a per-table checksum-freshness re-verification — architecture review point #22), sets `data_quality_action`. |
+| `add_context` | Node 2 (no LLM): builds schema context from `information_schema`, runs fan-out check and DQ status check (including a per-table checksum-freshness re-verification — architecture review point #22), sets `data_quality_action`. **Spec 8:** also appends any defined `_saved_metrics` (Semantic Layer) as an additive "Known canonical metric definitions" context block — see that table's section above. |
 | `determine_chart_type` | Node (visualization path only): classifies chart type via `ChartTypeSchema` with `pick_llm("cheap")`, using an ORDERED priority-list prompt (`DETERMINE_CHART_TYPE_SYSTEM_PROMPT`) — explicit type named > time/trend language > distribution language > part-to-whole language (pie only for ≤5 fixed categories) > two-numeric-measures language > nested-categorical language > default bar. `chart_type_reasoning` must name which numbered rule fired. This runs BEFORE the real SQL result exists, so some of its own rules (e.g. the ≤5-category pie constraint) are unenforceable at this point — see `validate_chart_shape` below, which re-checks against the real result after execute_sql. |
 | `generate_sql` | Node 3: writes one SQL query. Uses `pick_llm("high")`. Extended with chart-shaping instructions on visualization path. **Mechanical compliance retry (architecture review point #25):** after the first LLM call, `_min_sample_rule_violated(state.curated_question, sql_query)` checks whether the minimum-sample-size rule (HAVING COUNT(*) >= 5) should have applied but was silently skipped; if so, the LLM is called exactly once more with the concrete violation and the previous query appended to the prompt (same corrective pattern as a real execution-error retry), and the regenerated query is what's returned. A compliant first attempt makes only one LLM call. |
 | `is_safe` | Node 4: deterministic AST safety gate (`_ast_safety_check`, authoritative — architecture review point #23) run first; only if it passes does a `pick_llm("cheap")` / `JudgeSchema` call run as a secondary, non-authoritative sanity check whose comments are surfaced but never override an AST-cleared query back to unsafe. |
@@ -750,6 +770,90 @@ Renders the real, currently-compiled structure of any of this project's three La
 
 ---
 
+### `utils/semantic_layer.py` — Semantic Layer (Spec 8, Part 1)
+
+| Function | Role |
+|---|---|
+| `parse_define_metric_command(raw)` | Parses `"<name> = <sql_fragment>"`, with an optional trailing `"-- <description>"` (SQL's own comment syntax), into `{"metric_name", "sql_fragment", "description"}`. Raises `ValueError` with a clear message on a missing `=`, an invalid identifier, or an empty fragment — never silently guesses. |
+| `render_semantic_layer_html(metrics)` | Pure rendering (takes `read_saved_metrics`'s real return value, no DB access itself) of every defined metric as a browsable page under `semantic_layer/metrics.html`. |
+
+Table/CRUD functions (`ensure_saved_metrics_table`, `write_saved_metric`, `read_saved_metrics`, `delete_saved_metric`) live in `utils/load_data.py` — see the `_saved_metrics` table section above for the full read/write split and why `read_saved_metrics` must tolerate `UndefinedTable`.
+
+**CLI triggers** (in `main.py`): `"define metric: <name> = <sql_fragment>"`, `"delete metric: <name>"`, `"metrics"`.
+
+See `tests/test_semantic_layer.py`.
+
+---
+
+### `utils/taxonomy_governance.py` — Taxonomy Governance (Spec 8, Part 2)
+
+A pure READ over data Manual Mode already writes — `utils/manual_mode.py:save_reference_mapping_file`'s versioned files under `utils/reference_mappings/<base_name>_v<N>.json` ("never overwriting a prior version"). No new write path; this only makes that history browsable as a first-class library and shows what actually changed between versions.
+
+| Function | Role |
+|---|---|
+| `list_reference_mappings()` | Every saved reference-mapping file, grouped by `base_name`, each group's `versions` list oldest-first. Returns `[]` if the directory doesn't exist yet — a project that's never run Manual Mode, not an error. |
+| `diff_mapping_versions(older, newer)` | Compares two versions' real `mapping` dicts (`raw_value -> group`): `{"added": [...], "removed": [...], "changed": [(raw_value, old_group, new_group), ...]}`, all sorted for stable output. |
+| `render_taxonomy_governance_html()` | One page per tracked column: version badges, the diff against the version immediately before the latest (or an honest "nothing to diff against" for a first version), and the latest version's full mapping table. |
+
+**CLI trigger:** `python main.py "taxonomy"`.
+
+See `tests/test_taxonomy_governance.py` (monkeypatches `REFERENCE_MAPPINGS_DIR`/`OUTPUT_DIR` to isolated tmp dirs — never touches the project's real saved mappings).
+
+---
+
+### `utils/rubric_dashboard.py` — Rubric Rules Dashboard (Spec 8, Part 3)
+
+Counts how often each analyst-judgment rule has actually fired across every past run in `query_log.jsonl`, by matching the exact, non-LLM-varied phrasing `agents/sql_analyst.py`'s own disclosure functions (`_analyst_judgment_disclosure`, `_apply_causal_correction`) already write into `final_answer` when a rule fires — not a heuristic guess; `tests/test_rubric_dashboard.py` verifies each detector against those real functions' live output.
+
+Covers exactly 8 of the rubric's 14 rules — Rules 1, 2, 3, 4, 5, 6, 8, 12 — the ones `analyst-judgment-rubric.md` itself documents with a real "Disclosure trigger." The other 6 (Rules 7, 9, 10, 11, 13, 14) are documented there as "SQL-generation prompt rule (no post-execution extraction)": they shape generated SQL but leave no independent trace in a logged entry, so `render_rubric_dashboard_html` lists them separately as **not independently observable** rather than inventing a firing count. (This also corrects an inaccuracy in this doc's own "Analyst judgment rubric" line below — Rule 7 was previously miscounted alongside the disclosed rules; it isn't.)
+
+| Function | Role |
+|---|---|
+| `get_rubric_dashboard()` | `{"total_eligible_runs", "rules": [{"number", "name", "fire_count", "fire_rate"}, ...]}`. Eligible runs are `sql_analyst`/`visualize` log entries only — `etl_analyst` entries never touch the SQL rubric and are excluded so the denominator means something. `fire_rate` is `0.0` (never a division error) with zero eligible runs. |
+| `render_rubric_dashboard_html()` | Renders the counts table plus the separate "not independently observable" table. |
+
+**CLI trigger:** `python main.py "rubric dashboard"`.
+
+---
+
+### Standalone lineage / "explain this number" (Spec 8, Part 4)
+
+No new module — thin glue directly in `main.py`'s `"explain: <question>"` handler, over two things this project already tests independently: `utils.run_comparison.find_entries_for_question` (Spec 4) finds every past run of the exact question; `generate_report(entries[-1])` (Spec 2) builds a report from the MOST RECENT one, WITHOUT re-running it. This is the gap `"report:"` (always re-runs) and `"report last"` (only the log's literal last line, regardless of question) both left: explaining an older, specific past answer without re-execution or manual log archaeology. Prints an honest "no past run found" message and exits non-zero when there's no history for that exact question yet.
+
+See `tests/test_lineage_explain.py` — targets the one real new risk (picking the most recent run of the EXACT question, not simply the log's last line overall) against a temporary log with an interleaved unrelated question logged more recently.
+
+---
+
+### `utils/audit_export.py` — Full Audit Export (Spec 8, Part 5)
+
+One table's ENTIRE recorded history — every cleaning event (`logs/cleaning_log.jsonl`) and every transformation decision (`transformation_narrative_log` entries across ALL of `logs/query_log.jsonl`) — across every run ever logged, not the single-run slice the report/presentation/lineage tools each narrate. Pure log reads; no DB, no LLM, no new write path.
+
+| Function | Role |
+|---|---|
+| `get_table_audit_history(table_name)` | `{"table_name", "cleaning_events": [...], "transformation_decisions": [...]}`, both chronological (the source logs are already append-only in time order). Matches `table_name` **case-insensitively** — `cleaning_log.jsonl`'s `table_name` is the original CSV stem, `transformation_narrative_log`'s may carry whatever casing was live at decision time. Returns empty lists, never an error, for a table nothing has ever been logged about. |
+| `render_table_audit_html(table_name)` | Two chronological tables (cleaning events, transformation decisions) under `audit_exports/<sanitized_table_name>.html`. |
+
+**CLI trigger:** `python main.py "audit: <table_name>"`.
+
+See `tests/test_audit_export.py` (proves case-insensitive matching AND that a second table's events in the same log entries never leak in).
+
+---
+
+### `utils/notebook_export.py` — Notebook Export (Spec 8, Part 6)
+
+Renders the same real, deterministic facts `utils/generate_report.py`/`utils/generate_presentation.py` already render as HTML/slides — `utils.narrative.assemble_full_walkthrough` — as a Colab/Jupyter-style `.ipynb` file instead: one markdown cell per step's explanation (grouped under one `# Part A/B/C` heading per part, not repeated per step), a code cell holding the step's real `technical_detail` (verbatim SQL or generated fix code) when present, and a rendered `stats` block — a markdown result table for the `{"columns", "rows"}` shape (same shape `generate_report.py:_render_result_table` renders as HTML), or a generic key/value bullet list for any other shape. No cell is ever executed — this presents the historical record of what a run actually did, never a re-run.
+
+| Function | Role |
+|---|---|
+| `build_notebook_from_steps(entry, steps)` | PURE, deterministic assembly of a valid nbformat-v4 notebook dict — no LLM, no DB, no file I/O — mirroring `utils.narrative.build_narrative_walkthrough`'s own split from its LLM narration pass. Trivially testable with hand-built `NarrativeStep` objects. |
+| `render_notebook_export(entry)` | Gets the real (optionally LLM-narrated) steps via `assemble_full_walkthrough` (same try/except fallback to the deterministic walkthrough as `generate_report`), builds the notebook, writes it under `notebook_exports/<slug>_<timestamp>.ipynb`. |
+
+**CLI triggers:** `python main.py "notebook: <question>"` (runs fresh, then exports) / `python main.py "notebook last"` (exports the most recent logged run).
+
+See `tests/test_notebook_export.py` — pure-assembly tests against hand-built steps, plus a real integration test against a live logged entry proving `render_notebook_export` writes valid, round-trippable JSON.
+
+---
+
 ## 4. Database Structure
 
 **Two-role setup:**
@@ -764,7 +868,9 @@ Renders the real, currently-compiled structure of any of this project's three La
 - `presentations/` — HTML slideshows from `generate_presentation`. Same naming convention.
 - `logs/` — `query_log.jsonl` and `cleaning_log.jsonl`.
 
-**Analyst judgment rubric:** `analyst-judgment-rubric.md` at the project root documents all 14 rules enforced by `GENERATE_SQL_SYSTEM_PROMPT` and the disclosure helpers. Rules 1–8 and 12 have post-execution disclosure via `_analyst_judgment_disclosure`; Rules 9–11, 13, and 14 are prompt-only enforcement. Rule 14 (NULL-filter placement for per-category rankings — all `IS NOT NULL` filters feeding a ranking metric must live in one `WHERE` clause in the base CTE, before `GROUP BY`) is regression-tested live in `tests/test_null_filter_placement_consistency.py`.
+**Analyst judgment rubric:** `analyst-judgment-rubric.md` at the project root documents all 14 rules enforced by `GENERATE_SQL_SYSTEM_PROMPT` and the disclosure helpers. Rules 1, 2, 3, 4, 5, 6, 8, and 12 have post-execution disclosure via `_analyst_judgment_disclosure`/`_apply_causal_correction`; Rules 7, 9, 10, 11, 13, and 14 are prompt-only enforcement with no post-execution trace. Rule 14 (NULL-filter placement for per-category rankings — all `IS NOT NULL` filters feeding a ranking metric must live in one `WHERE` clause in the base CTE, before `GROUP BY`) is regression-tested live in `tests/test_null_filter_placement_consistency.py`. **Spec 8:** `utils/rubric_dashboard.py` (`"rubric dashboard"` CLI command) counts real historical firing rates for the 8 disclosed rules and lists the other 6 explicitly as not independently observable — see that module's section above.
+
+**Output directories (Spec 8):** `semantic_layer/` (`utils/semantic_layer.py`), `taxonomy_governance/` (`utils/taxonomy_governance.py`), `rubric_dashboard/` (`utils/rubric_dashboard.py`), `audit_exports/` (`utils/audit_export.py`), `notebook_exports/` (`utils/notebook_export.py`) — all gitignored generated artifacts, same convention as `reports/`/`presentations/`/`dq_backlog/`/`data_dictionaries/`/`run_comparisons/`/`freshness_briefing/` above.
 
 ---
 
@@ -812,5 +918,12 @@ Renders the real, currently-compiled structure of any of this project's three La
 - `test_manual_mode.py` (Spec 3): no DB, no live LLM (a fake LLM covers the option `[2]` sub-flow). `_REFERENCE_MAPPINGS_DIR` monkeypatched to a temp dir for the whole run. 10 tests: registry register/replace/clear; `_is_override_complete` across categorical_consolidation (needs full raw-value coverage) vs. other kinds (just `chosen_option_id`) vs. `"skip"` (needs neither); file versioning never overwriting a prior version; `resolve_manual_mode_candidate`'s all four interactive paths via monkeypatched `builtins.input` (option `[1]` from scratch, a partial override that only asks about the genuinely missing fields — proven by an input queue exactly long enough that any re-prompt would raise `EOFError`, options `[3]`/`[4]` returning `None` and saving no file, option `[2]`'s AI-propose-and-approve); an already-complete override short-circuiting with zero prompts; `build_step_checklist` against hand-built `NarrativeStep`s covering every outcome shape; and a full round trip (a session's saved file makes a real, separate second call resolve with zero prompts, proving the "silently with zero prompts" acceptance criterion end-to-end, not just at the file-format level).
 - `test_manual_mode_live_wiring.py` (Spec 3 acceptance tests, against the real `uncleaned_ds_jobs` table, `sys.stdin.isatty` monkeypatched `True`, same convention as `test_transformation_options_live_wiring.py`): detects candidates against the REAL CLEANED CSV (not the raw file — this dev environment's cleaned artifact already has sanitized lowercase column names, e.g. `industry` not `"Industry"`, from earlier composite-field-discovery sessions, and `_apply_chosen_transformation` actually mutates that file, so the candidate's column name must match what's really there). A complete `ManualModeOverride` for `categorical_consolidation(industry)` skips the live menu entirely and logs `reasoning_shown.source == "manual_mode"`; the independent `range_decomposition(size)` candidate (no override registered) is completely unaffected, still shows its live menu banner; the applied consolidation matches `supplied_data` exactly across 15 spot-checked real Industry rows (of the real 57 distinct values — the spec's own literal acceptance wording). Restores `_transformation_candidates`/`_transformation_decisions`, the cleaned CSV file, AND reloads the live DB table back to its original schema in `finally` (the categorical_consolidation apply path adds a real new column via `load_csv_to_table`, unlike the skip-only Spec 1 live-wiring test). Found and fixed a real, pre-existing bug while building this: `_apply_chosen_transformation` imported `write_transformation_candidates` from the wrong module — see its own entry above.
 - `test_manual_mode_narrative_rendering.py` (Spec 3, Part 4): confirms end-to-end, through the real `generate_report()`/`generate_presentation()` pipeline, that a manual-mode step's deterministic narration never uses the "no reason was recorded" framing, that the Part 4 checklist appears before the full prose/slides in both documents with the real `reference_source` visible in both, and that an entry with no Part B content produces no Part B heading/checklist/slide in either document.
+
+- `test_semantic_layer.py` (Spec 8, Part 1): `parse_define_metric_command` happy path / with-description / malformed-input rejection; `render_semantic_layer_html` empty vs. populated; a live-Postgres round trip through `_saved_metrics` (define → read → redefine/upsert → delete). A separate real `test_add_context.py` run confirms the exclusion-list bump (six placeholders → seven) produces no spurious warning.
+- `test_taxonomy_governance.py` (Spec 8, Part 2): no DB/LLM — `REFERENCE_MAPPINGS_DIR`/`OUTPUT_DIR` monkeypatched to isolated tmp dirs. Empty-directory case; grouping by `base_name` and a real `diff_mapping_versions` catching an added value and a regrouped value across two hand-written version files; HTML rendering for both a real single-version group and the fully-empty case.
+- `test_rubric_dashboard.py` (Spec 8, Part 3): each detector is checked against the REAL disclosure text produced by calling `agents.sql_analyst._analyst_judgment_disclosure`/`_apply_causal_correction` directly (never a hand-guessed substring, so a future wording change there would break this test rather than silently mis-count) across a SQL string that trips Rules 1/2/3/12 simultaneously, a time-framing SQL, and a causal-language answer; `get_rubric_dashboard` against a synthetic log confirms `etl_analyst` entries are excluded from the denominator and rates compute correctly; an empty/missing log produces all-zero rates with no division error.
+- `test_lineage_explain.py` (Spec 8, Part 4): a synthetic log with two runs of the same question and a third, unrelated question logged more recently confirms `find_entries_for_question(...)[-1]` resolves to the most recent run of the EXACT question, not simply the log's last line — the one real risk in `main.py`'s `"explain:"` glue; plus the "no history yet" empty-result path.
+- `test_audit_export.py` (Spec 8, Part 5): a table name matched case-insensitively across both `cleaning_log.jsonl` (mixed-case `table_name`) and `query_log.jsonl`'s `transformation_narrative_log` (lowercase `table_name`) in the same synthetic logs that also contain a second, unrelated table — confirms the second table's events never leak into the first's history; empty case; HTML rendering.
+- `test_notebook_export.py` (Spec 8, Part 6): `build_notebook_from_steps` tested directly against hand-built `NarrativeStep` objects — valid nbformat-v4 structure, one part heading per group (not per step), a code cell only for steps with a real `technical_detail`, both the result-table and generic-dict `stats` rendering shapes, and the honest zero-steps case. A real integration test calls `render_notebook_export` against the live `query_log.jsonl`'s most recent `sql_analyst`/`visualize` entry and confirms a valid, round-trippable `.ipynb` file is written (same "spot-check against a real logged run" pattern as `test_generate_report.py`).
 
 **`PYTHONPATH` requirement:** All tests must be run from the project root with `PYTHONPATH=/Users/dylangagliordi/data-agent` set (or equivalent), since `agents/`, `models/`, and `utils/` are not installed packages.
