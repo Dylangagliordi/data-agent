@@ -253,6 +253,15 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # joins — proactive, whole-schema relationship map (Spec 9: Join Advisory),
+    # instead of only ever getting a fan-out warning reactively, per query.
+    if raw.strip().lower() == "joins":
+        from utils.join_advisory import render_join_advisory_html
+        path = render_join_advisory_html()
+        print(f"Join advisory: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
     # define metric: <name> = <sql_fragment> [-- <description>] — register a
     # canonical, reusable metric definition (Spec 8: Semantic Layer). Explicit
     # only — never inferred from a question that happened to compute one.
