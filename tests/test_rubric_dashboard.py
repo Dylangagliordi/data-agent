@@ -52,6 +52,17 @@ def test_detectors_match_the_real_disclosure_functions_output():
     time_disclosure = _analyst_judgment_disclosure(time_sql, result_data=None)
     assert rd._detect_time_framing(time_disclosure)
 
+    # Rule 15 (Spec 9): significance test, requires result_data with the real
+    # mean/stddev/count ingredients.
+    sig_sql = "SELECT industry, AVG(rating) AS avg_rating, STDDEV(rating) AS stddev_rating, COUNT(*) AS n FROM jobs GROUP BY industry"
+    sig_result_data = [
+        {"industry": "Tech", "avg_rating": 4.5, "stddev_rating": 0.2, "n": 50},
+        {"industry": "Retail", "avg_rating": 3.0, "stddev_rating": 0.2, "n": 50},
+    ]
+    sig_disclosure = _analyst_judgment_disclosure(sig_sql, result_data=sig_result_data)
+    assert rd._detect_significance_test(sig_disclosure)
+    assert not rd._detect_significance_test(disclosure), "must not false-positive on an unrelated disclosure"
+
     causal_answer = _apply_causal_correction("Higher marketing spend drives higher revenue.", "")
     assert rd._detect_causal_correction(causal_answer)
     print("PASS: each detector matches the real, live-generated disclosure text for its rule")

@@ -190,6 +190,34 @@ question 3 times and asserts identical per-industry job_count/avg_salary across 
 
 ---
 
+### Rule 15 — Statistical significance for grouped comparisons
+
+Comparing bare averages across groups (Rules 5/6's outlier/imbalance heuristics) never
+answers whether an observed difference is real or could plausibly be due to normal
+variation. When a query ranks/compares groups by an averaged metric, it should also
+compute that metric's `STDDEV(...)` and `COUNT(...)` alongside its `AVG(...)` — the three
+real sufficient statistics a proper significance test needs per group — so a genuine
+one-way ANOVA can be run instead of eyeballing the averages alone.
+
+**Disclosure trigger:** the executed SQL's result already contains a matched
+`avg_<x>`/`mean_<x>`, `stddev_<x>`/`std_<x>`, and a count column for the same metric
+across 2+ groups (`_significance_test_note`). Never estimated or fabricated when any of
+the three ingredients is missing from the result — this is purely reactive to what the
+query actually returned, with a prompt-only reminder (like Rule 1's original form)
+encouraging `generate_sql` to include them, never a mechanical retry.
+
+**Enforcement:** SQL-generation prompt rule (`_rubric_applicable_instructions`'s existing
+ranking/comparison reminder) + post-execution disclosure via `_significance_test_note`,
+wired into `_analyst_judgment_disclosure` alongside Rules 5/6. The ANOVA F-statistic and
+p-value are computed analytically from each group's real (mean, stddev, n) — mathematically
+identical to running the test on the raw underlying rows, since ANOVA never needs more than
+those three numbers per group — with the p-value read from `scipy.stats.f`'s survival
+function. Unit-tested against hand-built result rows (clearly significant, clearly not,
+and every "ingredients missing" case) plus a live query against the real olist database in
+`tests/test_significance_testing.py`.
+
+---
+
 ## Out of scope
 
 The following are explicitly not handled by the SQL analyst and no rubric rule

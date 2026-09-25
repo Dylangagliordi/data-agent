@@ -1247,6 +1247,95 @@ def _group_size_imbalance_note(result_data: list) -> str:
     return ""
 
 
+_MEAN_COL_RE = re.compile(r"^(?:avg|mean)_(?P<base>\w+)$", re.IGNORECASE)
+
+
+def _significance_test_note(result_data: list) -> str:
+    """Rule 15 (Spec 9, Part 3): a real one-way ANOVA across the result's groups
+    — replaces "eyeball" heuristics (Rules 5/6) with an actual test statistic
+    and p-value for whether the compared groups genuinely differ.
+
+    Only fires when the result itself already contains a mean column
+    (avg_<x>/mean_<x>), a matching stddev column (stddev_<x>/std_<x> for the
+    SAME <x>), and a count column (_COUNT_COL_RE) — i.e. the three real
+    sufficient statistics (mean, sample stddev, n) an ANOVA needs per group.
+    No raw per-record data is available at this point (the SQL already
+    aggregated it), but ANOVA never needs more than these three numbers per
+    group — this produces exactly the same F-statistic a full raw-data ANOVA
+    would. Never estimated or guessed when the ingredients aren't present;
+    _rubric_applicable_instructions reminds generate_sql to include them for a
+    ranking/comparison question, but nothing here fabricates a result when
+    they're missing — it just returns "".
+    """
+    if not result_data or len(result_data) < 2 or not isinstance(result_data[0], dict):
+        return ""
+    cols = list(result_data[0].keys())
+
+    mean_col = base = None
+    for c in cols:
+        m = _MEAN_COL_RE.match(c)
+        if m:
+            mean_col, base = c, m.group("base")
+            break
+    if mean_col is None:
+        return ""
+
+    stddev_col = next(
+        (c for c in cols if re.match(rf"^(?:stddev|std)_{re.escape(base)}$", c, re.IGNORECASE)),
+        None,
+    )
+    count_col = next((c for c in cols if _COUNT_COL_RE.match(c)), None)
+    if stddev_col is None or count_col is None:
+        return ""
+
+    groups = []
+    for row in result_data:
+        mean_v = _to_float(row.get(mean_col))  # type: ignore[name-defined]
+        std_v = _to_float(row.get(stddev_col))  # type: ignore[name-defined]
+        n_v = _to_float(row.get(count_col))  # type: ignore[name-defined]
+        if mean_v is None or std_v is None or n_v is None or n_v < 1:
+            continue
+        groups.append((mean_v, std_v, int(n_v)))
+    if len(groups) < 2:
+        return ""
+
+    k = len(groups)
+    total_n = sum(n for _, _, n in groups)
+    df_between = k - 1
+    df_within = total_n - k
+    if df_within <= 0:
+        return ""
+
+    grand_mean = sum(mean_v * n for mean_v, _, n in groups) / total_n
+    ssb = sum(n * (mean_v - grand_mean) ** 2 for mean_v, _, n in groups)
+    ssw = sum((n - 1) * (std_v ** 2) for _, std_v, n in groups if n > 1)
+    if ssw <= 0:
+        return ""
+
+    msb = ssb / df_between
+    msw = ssw / df_within
+    if msw == 0:
+        return ""
+    f_stat = msb / msw
+
+    from scipy import stats as _scipy_stats
+
+    p_value = float(_scipy_stats.f.sf(f_stat, df_between, df_within))
+    label = _humanize_column(base)  # type: ignore[name-defined]
+
+    if p_value < 0.05:
+        return (
+            f"A one-way ANOVA on {label} across these {k} groups found a statistically "
+            f"significant difference (F={f_stat:.2f}, p={p_value:.4f}) — unlikely to be "
+            f"due to chance alone."
+        )
+    return (
+        f"A one-way ANOVA on {label} across these {k} groups found no statistically "
+        f"significant difference (F={f_stat:.2f}, p={p_value:.4f}) — the observed "
+        f"differences could plausibly be due to normal variation rather than a real effect."
+    )
+
+
 def _rubric_applicable_instructions(question: str) -> str:
     """Return extra prompt instructions for generate_sql based on keywords in the question.
 
@@ -1267,7 +1356,10 @@ def _rubric_applicable_instructions(question: str) -> str:
         notes.append(
             "RUBRIC NOTE: this question compares metrics across categories. Apply "
             "HAVING COUNT(*) >= 5 when ranking by an average or rate. Prefer per-unit "
-            "metrics (avg per entity) over raw totals when groups have different sizes."
+            "metrics (avg per entity) over raw totals when groups have different sizes. "
+            "Also SELECT STDDEV(...) and COUNT(...) for the compared metric alongside its "
+            "AVG(...) (e.g. avg_rating, stddev_rating, count) so a real significance test "
+            "can check whether the groups actually differ, not just compare bare averages."
         )
 
     if re.search(r"\b(since|between|from \d|in \d{4}|year|month|quarter|recent|last \d)\b", q):
@@ -1333,6 +1425,11 @@ def _analyst_judgment_disclosure(sql_query: str, result_data=None) -> str:
         imbalance_note = _group_size_imbalance_note(result_data)
         if imbalance_note:
             notes.append(imbalance_note)
+        # Rule 15 (Spec 9, Part 3): real ANOVA significance test, only when the
+        # result already carries the mean/stddev/count ingredients it needs.
+        significance_note = _significance_test_note(result_data)
+        if significance_note:
+            notes.append(significance_note)
 
     return " ".join(notes)
 

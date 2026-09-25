@@ -4,13 +4,14 @@ in logs/query_log.jsonl.
 
 Detection is a plain substring match against the real, already-computed text
 each rule mechanically writes into `final_answer` when it fires —
-agents/sql_analyst.py:_analyst_judgment_disclosure (Rules 1-6, 12) and
+agents/sql_analyst.py:_analyst_judgment_disclosure (Rules 1-6, 12, 15) and
 _apply_causal_correction's _ASSOCIATION_DISCLAIMER (Rule 8) both write fixed,
 non-LLM-varied phrasing every single time, so matching that phrasing verbatim
-is exact, not a heuristic guess.
+is exact, not a heuristic guess. (Rule 15's exact F/p numbers vary per run, so
+its detector matches the fixed surrounding phrasing, not the numbers.)
 
-Only 8 of the rubric's 14 rules are covered here — the other 6 (Rules 7, 9,
-10, 11, 13, 14) are explicitly documented in analyst-judgment-rubric.md as
+9 of the rubric's 15 rules are covered here — the other 6 (Rules 7, 9, 10,
+11, 13, 14) are explicitly documented in analyst-judgment-rubric.md as
 "SQL-generation prompt rule (no post-execution extraction)": they shape what
 SQL gets generated but leave no independent, mechanically-detectable trace in
 a logged entry, so a historical firing count for them would have to be
@@ -69,6 +70,10 @@ def _detect_deduplication(final_answer: str) -> bool:
     return "Duplicate rows were removed from this result (SELECT DISTINCT was used)" in final_answer
 
 
+def _detect_significance_test(final_answer: str) -> bool:
+    return "A one-way ANOVA on" in final_answer
+
+
 # Ordered exactly as numbered in analyst-judgment-rubric.md.
 RULE_CATALOG = [
     {"number": 1, "name": "Minimum sample size for per-category rankings", "detector": _detect_min_sample},
@@ -79,6 +84,7 @@ RULE_CATALOG = [
     {"number": 6, "name": "Group size imbalance", "detector": _detect_group_size_imbalance},
     {"number": 8, "name": "Association vs causation", "detector": _detect_causal_correction},
     {"number": 12, "name": "Duplicate-row transparency", "detector": _detect_deduplication},
+    {"number": 15, "name": "Statistical significance for grouped comparisons", "detector": _detect_significance_test},
 ]
 
 # From analyst-judgment-rubric.md's own "Enforcement: SQL-generation prompt
