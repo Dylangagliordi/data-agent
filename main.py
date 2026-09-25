@@ -243,6 +243,16 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # profile: <table_name> — real per-column statistics with no question
+    # asked at all (Spec 9: Auto-EDA), computed live via app_reader.
+    if raw.startswith("profile: "):
+        from utils.auto_eda import render_auto_eda_html
+        table_name = raw[len("profile: "):].strip()
+        path = render_auto_eda_html(table_name)
+        print(f"Auto-EDA profile: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
     # define metric: <name> = <sql_fragment> [-- <description>] — register a
     # canonical, reusable metric definition (Spec 8: Semantic Layer). Explicit
     # only — never inferred from a question that happened to compute one.
