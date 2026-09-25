@@ -614,6 +614,95 @@ def invalidate_cleaning_recipes_for_table(conn, table_name: str) -> None:
     conn.commit()
 
 
+def ensure_saved_metrics_table(conn) -> None:
+    """Create _saved_metrics if it doesn't already exist, and grant SELECT to
+    app_reader (Spec 8: Semantic Layer).
+
+    One row per human-named canonical metric — an explicitly authored,
+    reusable SQL fragment (e.g. a specific aggregate expression) plus a plain
+    description of what it means. This is a deliberately small, explicit
+    registry (populated only via `python main.py "define metric: ..."`, never
+    inferred from usage) — generate_sql is told these definitions exist as
+    extra context, the same additive, non-authoritative way fan-out/DQ
+    warnings are surfaced, but nothing forces it to use one.
+
+    Only ever called from an admin connection (the CLI's `define metric:`
+    handler) — app_reader is read-only and cannot CREATE, so add_context's
+    read of this table (over its own app_reader connection) must tolerate the
+    table not existing yet, on a database where no metric has ever been
+    defined."""
+    app_reader = os.environ.get("PG_APP_READER_USER", "app_reader")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _saved_metrics (
+                metric_name  TEXT PRIMARY KEY,
+                sql_fragment TEXT NOT NULL,
+                description  TEXT NOT NULL DEFAULT '',
+                created_at   TIMESTAMPTZ NOT NULL,
+                updated_at   TIMESTAMPTZ NOT NULL
+            );
+            """
+        )
+        cur.execute(f'GRANT SELECT ON _saved_metrics TO "{app_reader}";')
+    conn.commit()
+
+
+def write_saved_metric(conn, metric_name: str, sql_fragment: str, description: str = "") -> None:
+    """Define (or redefine) one named canonical metric. Requires an admin
+    connection — ensure_saved_metrics_table must already have been called."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO _saved_metrics (metric_name, sql_fragment, description, created_at, updated_at)
+            VALUES (%s, %s, %s, now(), now())
+            ON CONFLICT (metric_name) DO UPDATE SET
+                sql_fragment = EXCLUDED.sql_fragment,
+                description = EXCLUDED.description,
+                updated_at = now()
+            """,
+            (metric_name, sql_fragment, description),
+        )
+    conn.commit()
+
+
+def read_saved_metrics(conn) -> list:
+    """Every defined metric, alphabetical by name. Returns [] both when none
+    have ever been defined AND when _saved_metrics doesn't exist yet on this
+    database (UndefinedTable) — the two cases mean the same thing to a caller:
+    nothing to show."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT metric_name, sql_fragment, description, created_at, updated_at "
+                "FROM _saved_metrics ORDER BY metric_name"
+            )
+            rows = cur.fetchall()
+    except psycopg2.errors.UndefinedTable:
+        conn.rollback()
+        return []
+    conn.commit()
+    return [
+        {
+            "metric_name": r[0],
+            "sql_fragment": r[1],
+            "description": r[2],
+            "created_at": r[3].isoformat() if r[3] is not None else None,
+            "updated_at": r[4].isoformat() if r[4] is not None else None,
+        }
+        for r in rows
+    ]
+
+
+def delete_saved_metric(conn, metric_name: str) -> bool:
+    """Remove a defined metric. Returns True if a row was actually deleted."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM _saved_metrics WHERE metric_name = %s", (metric_name,))
+        deleted = cur.rowcount > 0
+    conn.commit()
+    return deleted
+
+
 def ensure_derived_columns_table(conn) -> None:
     """Create _derived_columns if it doesn't already exist, and grant SELECT
     to app_reader.

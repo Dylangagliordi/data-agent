@@ -243,6 +243,130 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # define metric: <name> = <sql_fragment> [-- <description>] — register a
+    # canonical, reusable metric definition (Spec 8: Semantic Layer). Explicit
+    # only — never inferred from a question that happened to compute one.
+    if raw.startswith("define metric: "):
+        from utils.load_data import ensure_saved_metrics_table, get_admin_connection, write_saved_metric
+        from utils.semantic_layer import parse_define_metric_command
+        try:
+            parsed = parse_define_metric_command(raw[len("define metric: "):])
+        except ValueError as e:
+            print(f"Could not define metric: {e}", file=sys.stderr)
+            sys.exit(1)
+        conn = get_admin_connection()
+        try:
+            ensure_saved_metrics_table(conn)
+            write_saved_metric(conn, parsed["metric_name"], parsed["sql_fragment"], parsed["description"])
+        finally:
+            conn.close()
+        print(f"Defined metric {parsed['metric_name']!r}: {parsed['sql_fragment']}")
+        return
+
+    # delete metric: <name> — remove a previously defined metric.
+    if raw.startswith("delete metric: "):
+        from utils.load_data import delete_saved_metric, ensure_saved_metrics_table, get_admin_connection
+        metric_name = raw[len("delete metric: "):].strip()
+        conn = get_admin_connection()
+        try:
+            ensure_saved_metrics_table(conn)
+            deleted = delete_saved_metric(conn, metric_name)
+        finally:
+            conn.close()
+        if deleted:
+            print(f"Deleted metric {metric_name!r}")
+        else:
+            print(f"No metric named {metric_name!r} was defined")
+        return
+
+    # metrics — browse every currently defined canonical metric (Spec 8).
+    if raw.strip().lower() == "metrics":
+        from utils.load_data import ensure_saved_metrics_table, get_admin_connection, read_saved_metrics
+        from utils.semantic_layer import render_semantic_layer_html
+        conn = get_admin_connection()
+        try:
+            ensure_saved_metrics_table(conn)
+            metrics = read_saved_metrics(conn)
+        finally:
+            conn.close()
+        path = render_semantic_layer_html(metrics)
+        print(f"Semantic layer: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
+    # taxonomy — browse every versioned reference-mapping file this project
+    # has ever saved via Manual Mode (Spec 8: Taxonomy Governance).
+    if raw.strip().lower() == "taxonomy":
+        from utils.taxonomy_governance import render_taxonomy_governance_html
+        path = render_taxonomy_governance_html()
+        print(f"Taxonomy governance: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
+    # rubric dashboard — how often each analyst-judgment rule has actually
+    # fired across every past run (Spec 8: Governance & Reporting Suite).
+    if raw.strip().lower() == "rubric dashboard":
+        from utils.rubric_dashboard import render_rubric_dashboard_html
+        path = render_rubric_dashboard_html()
+        print(f"Rubric dashboard: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
+    # explain: <question> — trace a past answer back to its real SQL/cleaning
+    # history WITHOUT re-running it, using the most recent past run of the
+    # exact same question (Spec 8: standalone lineage / "explain this number").
+    if raw.startswith("explain: "):
+        from utils.generate_report import generate_report
+        from utils.run_comparison import find_entries_for_question
+        question = raw[len("explain: "):].strip()
+        entries = find_entries_for_question(question)
+        if not entries:
+            print(
+                f"No past run found for exactly: {question!r} — explain: only looks up "
+                "history, it never runs a question fresh (use report: for that).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        report_path = generate_report(entries[-1])
+        print(f"Explanation: {report_path}")
+        print(f'Open with: open "{report_path}"')
+        return
+
+    # audit: <table_name> — every cleaning event and transformation decision
+    # ever logged for one table, across all runs (Spec 8: full audit export).
+    if raw.startswith("audit: "):
+        from utils.audit_export import render_table_audit_html
+        table_name = raw[len("audit: "):].strip()
+        path = render_table_audit_html(table_name)
+        print(f"Audit history: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
+    # notebook: <question> / notebook last — render a run's real narrative
+    # walkthrough as a Colab-style .ipynb file (Spec 8: notebook export).
+    if raw.startswith("notebook: "):
+        from utils.notebook_export import render_notebook_export
+        question = raw[len("notebook: "):].strip()
+        result = _run_question(question)
+        print(result["final_answer"])
+        from utils.generate_report import last_query_log_entry
+        entry = last_query_log_entry()
+        if entry is not None:
+            path = render_notebook_export(entry)
+            print(f"\nNotebook: {path}")
+        return
+
+    if raw.strip().lower() == "notebook last":
+        from utils.generate_report import last_query_log_entry
+        from utils.notebook_export import render_notebook_export
+        entry = last_query_log_entry()
+        if entry is None:
+            print("No entries found in logs/query_log.jsonl — run a query first.", file=sys.stderr)
+            sys.exit(1)
+        path = render_notebook_export(entry)
+        print(f"Notebook: {path}")
+        return
+
     # Normal question — run through the graph and print the answer.
     result = _run_question(raw)
     print(result["final_answer"])

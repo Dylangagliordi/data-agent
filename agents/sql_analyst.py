@@ -359,13 +359,13 @@ def add_context(state: SQLAnalystState) -> dict:
                 SELECT table_name, column_name, data_type
                 FROM information_schema.columns
                 WHERE table_schema = %s
-                  AND table_name NOT IN (%s, %s, %s, %s, %s, %s)
+                  AND table_name NOT IN (%s, %s, %s, %s, %s, %s, %s)
                 ORDER BY table_name, ordinal_position
                 """,
                 (
                     "public", "_data_quality_status", "_fanout_status",
                     "_transformation_candidates", "_transformation_decisions",
-                    "_derived_columns", "_cleaning_recipes",
+                    "_derived_columns", "_cleaning_recipes", "_saved_metrics",
                 ),
             )
             rows = cur.fetchall()
@@ -482,6 +482,27 @@ def add_context(state: SQLAnalystState) -> dict:
         warning_lines = fanout_warnings + [w["warning"] for w in data_quality_warnings]
         if warning_lines:
             context = "\n".join(warning_lines) + "\n\n" + context
+
+        # Spec 8: Semantic Layer. Purely additive context — never forces
+        # generate_sql to use a saved metric, just tells it one exists so an
+        # already-agreed-upon definition (e.g. how "active customer" is
+        # computed) doesn't get silently reinvented, differently, every time
+        # someone asks about it. read_saved_metrics tolerates the table not
+        # existing yet (returns []) since app_reader can never create it.
+        from utils.load_data import read_saved_metrics
+
+        saved_metrics = read_saved_metrics(conn)
+        if saved_metrics:
+            metric_lines = "\n".join(
+                f"  - {m['metric_name']}: {m['sql_fragment']}"
+                + (f"  ({m['description']})" if m["description"] else "")
+                for m in saved_metrics
+            )
+            context += (
+                "\n\nKnown canonical metric definitions (previously agreed upon — reuse "
+                "one of these exactly when the question asks for what it defines, instead "
+                f"of deriving it a new way):\n{metric_lines}"
+            )
     finally:
         conn.close()
 

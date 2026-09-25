@@ -18,6 +18,11 @@ dq_backlog/
 data_dictionaries/
 run_comparisons/
 freshness_briefing/
+semantic_layer/
+taxonomy_governance/
+rubric_dashboard/
+audit_exports/
+notebook_exports/
 *.log
 
 # Claude Code local scratch/session state — machine-specific, not shared.
