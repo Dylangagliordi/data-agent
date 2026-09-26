@@ -25,6 +25,7 @@ audit_exports/
 notebook_exports/
 auto_eda/
 join_advisory/
+ingestion_sources/
 *.log
 
 # Claude Code local scratch/session state — machine-specific, not shared.

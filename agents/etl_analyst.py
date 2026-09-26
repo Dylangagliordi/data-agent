@@ -174,7 +174,17 @@ def extract_load(url: str, output_folder: str, format: str) -> str:
     endpoint (e.g. 169.254.169.254). This is checked here rather than trusted to the
     caller because this tool is invoked by an LLM deciding what URL to pass, with no
     allowlist of its own.
+
+    Spec 10, Part 3: records this attempt (success or failure) in _ingestion_sources
+    — a durable memory of every URL this tool has ever been asked to fetch, purely a
+    registry/audit trail, never a gate on whether the fetch is allowed to happen.
     """
+    result = _do_extract_load(url, output_folder, format)
+    _record_ingestion(url, output_folder, "download", result)
+    return result
+
+
+def _do_extract_load(url: str, output_folder: str, format: str) -> str:
     response, error = _fetch_with_ssrf_protection(url)
     if response is None:
         return f"ERROR: {error}"
@@ -192,6 +202,25 @@ def extract_load(url: str, output_folder: str, format: str) -> str:
     dest_path.write_bytes(response.content)
 
     return f"Downloaded {url} -> {dest_path} ({len(response.content)} bytes)"
+
+
+def _record_ingestion(url: str, output_folder: str, source_kind: str, result: str) -> None:
+    """Shared by extract_load and scrape_load: records one fetch attempt into
+    _ingestion_sources, regardless of whether it succeeded — a source that's
+    been failing repeatedly is exactly the kind of thing this registry exists
+    to make visible. Grants the ETL agent access to exactly one more internal
+    bookkeeping table (like transform_load's use of _cleaning_recipes) — never
+    user data, never a live table."""
+    from utils.load_data import ensure_ingestion_sources_table, get_admin_connection, record_ingestion_attempt
+
+    status = "error" if result.startswith("ERROR:") else "ok"
+    last_error = result if status == "error" else ""
+    conn = get_admin_connection()
+    try:
+        ensure_ingestion_sources_table(conn)
+        record_ingestion_attempt(conn, url, output_folder, source_kind, status, last_error)
+    finally:
+        conn.close()
 
 
 @tool
@@ -224,7 +253,16 @@ def scrape_load(url: str, output_folder: str) -> str:
     _fetch_with_ssrf_protection / AGENTS.md's SSRF Protection section) — this
     tool is invoked by an LLM deciding what URL to pass, with no allowlist of
     its own, so the same permanent safety boundary applies here unchanged.
+
+    Spec 10, Part 3: records this attempt (success or failure) in
+    _ingestion_sources — see extract_load's own docstring for why.
     """
+    result = _do_scrape_load(url, output_folder)
+    _record_ingestion(url, output_folder, "scrape", result)
+    return result
+
+
+def _do_scrape_load(url: str, output_folder: str) -> str:
     response, error = _fetch_with_ssrf_protection(url)
     if response is None:
         return f"ERROR: {error}"

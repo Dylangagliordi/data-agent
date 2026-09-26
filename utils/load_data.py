@@ -703,6 +703,95 @@ def delete_saved_metric(conn, metric_name: str) -> bool:
     return deleted
 
 
+def ensure_ingestion_sources_table(conn) -> None:
+    """Create _ingestion_sources if it doesn't already exist, and grant SELECT
+    to app_reader (Spec 10, Part 3: Ingestion Source Registry).
+
+    A durable memory of every URL agents/etl_analyst.py's extract_load/
+    scrape_load have ever been asked to fetch — one row per URL, updated (not
+    replaced) on every subsequent attempt against the same URL. This is
+    purely a REGISTRY/audit trail, never a gate: nothing here blocks or
+    approves a fetch (that's Spec 13's deliberately separate, not-yet-built
+    "named-connector allowlist" job) — it only remembers what's already
+    happened, so a recurring source's real reliability history is visible
+    instead of every fetch being treated as a one-off with no memory of
+    where data has come from before.
+    """
+    app_reader = os.environ.get("PG_APP_READER_USER", "app_reader")
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _ingestion_sources (
+                url              TEXT PRIMARY KEY,
+                output_folder    TEXT NOT NULL,
+                source_kind      TEXT NOT NULL,
+                first_fetched_at TIMESTAMPTZ NOT NULL,
+                last_fetched_at  TIMESTAMPTZ NOT NULL,
+                fetch_count      INTEGER NOT NULL DEFAULT 1,
+                status           TEXT NOT NULL,
+                last_error       TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        cur.execute(f'GRANT SELECT ON _ingestion_sources TO "{app_reader}";')
+    conn.commit()
+
+
+def record_ingestion_attempt(
+    conn, url: str, output_folder: str, source_kind: str, status: str, last_error: str = ""
+) -> None:
+    """Upsert one fetch attempt for url: first_fetched_at is set only on the
+    very first insert (never overwritten); last_fetched_at/fetch_count/
+    status/last_error are always updated to reflect the most recent attempt,
+    whether it succeeded or failed — a source that's been failing repeatedly
+    is exactly the kind of thing this registry exists to make visible."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO _ingestion_sources
+                (url, output_folder, source_kind, first_fetched_at, last_fetched_at,
+                 fetch_count, status, last_error)
+            VALUES (%s, %s, %s, now(), now(), 1, %s, %s)
+            ON CONFLICT (url) DO UPDATE SET
+                output_folder = EXCLUDED.output_folder,
+                source_kind = EXCLUDED.source_kind,
+                last_fetched_at = now(),
+                fetch_count = _ingestion_sources.fetch_count + 1,
+                status = EXCLUDED.status,
+                last_error = EXCLUDED.last_error
+            """,
+            (url, output_folder, source_kind, status, last_error),
+        )
+    conn.commit()
+
+
+def read_ingestion_sources(conn) -> list:
+    """Every tracked source, most recently fetched first."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT url, output_folder, source_kind, first_fetched_at, last_fetched_at,
+                   fetch_count, status, last_error
+            FROM _ingestion_sources
+            ORDER BY last_fetched_at DESC
+            """
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "url": r[0],
+            "output_folder": r[1],
+            "source_kind": r[2],
+            "first_fetched_at": r[3].isoformat() if r[3] is not None else None,
+            "last_fetched_at": r[4].isoformat() if r[4] is not None else None,
+            "fetch_count": r[5],
+            "status": r[6],
+            "last_error": r[7],
+        }
+        for r in rows
+    ]
+
+
 def ensure_derived_columns_table(conn) -> None:
     """Create _derived_columns if it doesn't already exist, and grant SELECT
     to app_reader.

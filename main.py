@@ -262,6 +262,15 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # sources — browse every URL extract_load/scrape_load have ever fetched
+    # (Spec 10: Ingestion Source Registry). A memory, not an allowlist.
+    if raw.strip().lower() == "sources":
+        from utils.ingestion_registry import render_ingestion_sources_html
+        path = render_ingestion_sources_html()
+        print(f"Ingestion sources: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
     # define metric: <name> = <sql_fragment> [-- <description>] — register a
     # canonical, reusable metric definition (Spec 8: Semantic Layer). Explicit
     # only — never inferred from a question that happened to compute one.

@@ -359,13 +359,14 @@ def add_context(state: SQLAnalystState) -> dict:
                 SELECT table_name, column_name, data_type
                 FROM information_schema.columns
                 WHERE table_schema = %s
-                  AND table_name NOT IN (%s, %s, %s, %s, %s, %s, %s)
+                  AND table_name NOT IN (%s, %s, %s, %s, %s, %s, %s, %s)
                 ORDER BY table_name, ordinal_position
                 """,
                 (
                     "public", "_data_quality_status", "_fanout_status",
                     "_transformation_candidates", "_transformation_decisions",
                     "_derived_columns", "_cleaning_recipes", "_saved_metrics",
+                    "_ingestion_sources",
                 ),
             )
             rows = cur.fetchall()
