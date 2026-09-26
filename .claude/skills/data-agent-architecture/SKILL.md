@@ -1017,6 +1017,27 @@ See `tests/test_hitl.py` (the shared primitive directly, including the acceptanc
 
 ---
 
+### `utils/cli_modes.py` — Mode-Infrastructure Formalization (Spec 15, Part 1)
+
+Before this, `main.py`'s dispatch was 23 hand-written `if` branches — one per spec, each copy-pasted from the last, with its own local imports/parsing/prints. `utils/cli_modes.py` replaces that with a real, structured registry: `MODES`, a `list[Mode]` where each `Mode(name, trigger, handler)` pairs a trigger function (`raw input -> parsed args dict, or None`) with a handler (`runs the mode given those parsed args`). `main.py`'s `main()` shrinks to `if dispatch(raw): return` followed by the plain-question fallback (`run_question`) — adding a future mode means adding one entry to `MODES`, never touching that loop.
+
+| Symbol | Role |
+|---|---|
+| `Mode` | Dataclass: `name: str`, `trigger: Callable[[str], dict \| None]`, `handler: Callable[[dict], None]`. |
+| `exact_match(command)` | Trigger builder for the `raw.strip().lower() == "..."` shape — 12 of the 23 real commands. Matches with `{}` (no arguments). |
+| `prefixed(prefix, arg_name="arg")` | Trigger builder for the `raw.startswith("...")` + slice-and-strip shape — 10 of the 23. Matches with `{arg_name: <real, stripped remainder>}`. |
+| `_prepare_trigger(raw)` | The one genuinely different shape: `"prepare: <table> for <goal>"` needs a second split on `" for "` beyond a simple prefix — its own function rather than a forced generalization of `prefixed()`. |
+| `dispatch(raw)` | Tries every `Mode` in order; the first matching trigger has its handler called, returns `True`. Returns `False` when nothing matches (never runs the plain-question fallback itself — that stays `main.py`'s own single responsibility). |
+| `run_question(question)` / `log_run(user_question, result)` | Moved here from `main.py` unchanged (`_run_question`/`log_run`) — needed by several handlers (`report:`, `present:`, `notebook:`) and by `main.py`'s own fallback branch; living here avoids a circular import (`main.py` imports FROM this module, never the other way). |
+
+**`Mode.name` is deliberately the exact short trigger string** (e.g. `"profile: "`, not `"profile: <table_name>"`) — matching what `utils/doc_drift.py`'s inventory already reported pre-refactor and what its own test asserts exact membership against. A more descriptive per-mode display string would be a real, separate improvement, not this spec's job.
+
+**Real bug caught while building this:** `utils/doc_drift.py`'s old regex-based `_real_cli_commands()` (Spec 13) silently missed `"prepare: "` entirely — `raw.startswith("prepare: ")` was there in `main.py`'s source, but the prior extraction undercounted real commands as 22 when there were always 23. `_real_cli_commands()` now reads `utils.cli_modes.MODES` directly (`sorted(mode.name for mode in MODES)`) instead of parsing source text — eliminating the entire class of bug, not just this one instance of it. `test_doc_drift.py` passes unmodified against the now-correct count.
+
+See `tests/test_cli_modes.py`: all three trigger shapes tested directly (including `prepare:`'s two-part split matching the original `split(" for ", 1)` exactly); `dispatch()`'s match/no-match behavior; a test-only mode inserted into `MODES` and correctly dispatched with zero changes to `dispatch()` itself (proof this is a genuine registry, not a cosmetic rename); every registered mode name is unique. Plus real, live end-to-end smoke tests across all three shapes (`map`, `profile: <table>`, `prepare: <table> for <goal>`, the usage-error path, and the plain-question fallback) confirming zero behavior change from the prior 23 inline branches.
+
+---
+
 ## 4. Database Structure
 
 **Two-role setup:**
@@ -1106,6 +1127,7 @@ See `tests/test_hitl.py` (the shared primitive directly, including the acceptanc
 - `test_scratch_mode_live_wiring.py` (Spec 12): fake-LLM tests for `check_needs_scratch_mode` (false for an ordinary chart, true for a genuine computed-highlight request, skips the LLM call entirely on an empty result) and `run_scratch_mode` (a compliant first attempt makes exactly one LLM call and produces a real chart; two unsafe generations in a row give up honestly with no file; a declined approval produces no file). Plus a real, live end-to-end run with genuine model calls at every step — proving the whole wired-up path (judgment call → generation → safety gate → approval → execution) works, not just against fakes.
 
 - `test_doc_drift.py` (Spec 13, Part 1a): asserts `get_real_inventory()` reflects real, current graph nodes/modules/CLI commands via live introspection — checked against Spec 12's actual additions (`check_needs_scratch_mode`, `scratch_mode.py`) without those names ever being hardcoded as an expected list, which would just be a second place for the same staleness bug to hide.
+- `test_cli_modes.py` (Spec 15, Part 1): the three trigger shapes (`exact_match`, `prefixed`, `prepare:`'s two-part split) tested directly; `dispatch()`'s match/no-match behavior; a test-only mode inserted into `MODES` and dispatched correctly with zero changes to `dispatch()` itself; every registered mode name is unique.
 - `test_goal_based_planner.py` (Spec 14): a fake structured-output LLM proves an invented candidate id is filtered out, never trusted; a real-table live-wiring test (same `uncleaned_ds_jobs` seeding as the Spec 1 acceptance tests) proves a stated goal surfaces exactly the fake-LLM-marked-relevant candidates, decisions land in the real shared `_transformation_decisions` cache, and a later call reuses them silently.
 - `test_hitl.py` (Spec 13, Part 2): `request_code_approval`'s yes/decline/typo-never-reprompts behavior and logging; `request_option_choice`'s valid-first-try and retry-past-invalid-answers behavior and logging; the `banner=` override preserving exact pre-existing printed text (the real regression this parameter exists to fix); the acceptance-criterion proof that two different decision types in one run produce two real entries in one unified `logs/hitl_log.jsonl`.
 
