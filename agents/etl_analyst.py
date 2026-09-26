@@ -1,21 +1,28 @@
 """
 ETL analyst sub-agent: LangGraph tool definitions + node definitions.
 
-Two tools, used by a standard ReAct loop (see build_etl_analyst_graph below):
+Three tools, used by a standard ReAct loop (see build_etl_analyst_graph below):
 - extract_load: plain function, no LLM — downloads a URL to a local folder.
+- scrape_load (Spec 10): plain function, no LLM — fetches a webpage and extracts the
+  real data table embedded in its HTML, saving it as a CSV. Shares
+  _fetch_with_ssrf_protection with extract_load so the SSRF safety boundary lives in
+  exactly one place.
 - transform_load: thin @tool wrapper around utils.data_cleaning.clean_dataset(), the
   same shared cleaning core clean_data.py and the enhanced load_data.py both use.
 
 Step 0 (download the dataset zip, unzip into data/NAME/) stays a human step per the
-spec — no tool here logs into or scrapes an authenticated source. extract_load only
-does a plain, unauthenticated HTTP GET against a URL it's given.
+spec — no tool here logs into or scrapes anything requiring authentication.
+extract_load/scrape_load only ever do a plain, unauthenticated HTTP GET against a URL
+they're given.
 """
 
+import io
 import ipaddress
 import socket
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import pandas as pd
 import requests
 from langchain.tools import tool
 from langgraph.graph import END, START, StateGraph
@@ -23,6 +30,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from models.etl_schema import ETLAnalystState
 from utils.data_cleaning import clean_dataset
+from utils.format_normalization import largest_table
 from utils.llm_pick import pick_llm
 
 DOWNLOAD_TIMEOUT_SECONDS = 30
@@ -94,6 +102,50 @@ def _validate_fetch_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _fetch_with_ssrf_protection(url: str):
+    """Shared SSRF-safe fetch used by both extract_load and scrape_load:
+    validates the URL and every redirect hop before following it (see
+    _validate_fetch_url), resolving DNS fresh each time — the same
+    permanent safety boundary (see AGENTS.md), now living in exactly one
+    place rather than duplicated across two tools with their own fetch
+    logic. Returns (response, "") on success, or (None, error_message) on
+    any failure; the caller decides the exact "ERROR: ..." string to
+    return to the LLM, since extract_load and scrape_load phrase a
+    download failure and a scrape failure slightly differently.
+    """
+    is_safe, reason = _validate_fetch_url(url)
+    if not is_safe:
+        return None, f"refused to fetch URL — {reason}"
+
+    current_url = url
+    try:
+        for _ in range(_MAX_REDIRECTS + 1):
+            response = requests.get(
+                current_url, timeout=DOWNLOAD_TIMEOUT_SECONDS, allow_redirects=False
+            )
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    break
+                next_url = urljoin(current_url, location)
+                is_safe, reason = _validate_fetch_url(next_url)
+                if not is_safe:
+                    return None, f"refused to follow redirect — {reason}"
+                current_url = next_url
+                continue
+            response.raise_for_status()
+            return response, ""
+        return None, f"too many redirects (> {_MAX_REDIRECTS}) while fetching URL: {url}"
+    except requests.exceptions.Timeout:
+        return None, f"download timed out after {DOWNLOAD_TIMEOUT_SECONDS}s for URL: {url}"
+    except requests.exceptions.ConnectionError as e:
+        return None, f"could not connect to URL {url}: {e}"
+    except requests.exceptions.HTTPError as e:
+        return None, f"server returned an error status for URL {url}: {e}"
+    except requests.exceptions.RequestException as e:
+        return None, f"request to {url} failed: {e}"
+
+
 @tool
 def extract_load(url: str, output_folder: str, format: str) -> str:
     """Download a file from a URL and save it into a local folder.
@@ -112,6 +164,10 @@ def extract_load(url: str, output_folder: str, format: str) -> str:
     blocked target, timeout, non-200 response) — this function never raises for a real
     network/HTTP failure, it always returns a string either way.
 
+    Use this when the data is available at a direct, downloadable URL (a link that
+    itself IS the file). If the data is only embedded in a webpage's HTML (a table
+    rendered on a page, with no direct file link), use scrape_load instead.
+
     SSRF protection (permanent safety boundary — see AGENTS.md): before fetching, and
     again before following any redirect, the target URL's hostname is resolved and
     rejected if it points at a private/internal IP range or a known cloud-metadata
@@ -119,43 +175,14 @@ def extract_load(url: str, output_folder: str, format: str) -> str:
     caller because this tool is invoked by an LLM deciding what URL to pass, with no
     allowlist of its own.
     """
-    is_safe, reason = _validate_fetch_url(url)
-    if not is_safe:
-        return f"ERROR: refused to fetch URL — {reason}"
-
-    current_url = url
-    try:
-        for _ in range(_MAX_REDIRECTS + 1):
-            response = requests.get(
-                current_url, timeout=DOWNLOAD_TIMEOUT_SECONDS, allow_redirects=False
-            )
-            if response.is_redirect or response.is_permanent_redirect:
-                location = response.headers.get("Location")
-                if not location:
-                    break
-                next_url = urljoin(current_url, location)
-                is_safe, reason = _validate_fetch_url(next_url)
-                if not is_safe:
-                    return f"ERROR: refused to follow redirect — {reason}"
-                current_url = next_url
-                continue
-            response.raise_for_status()
-            break
-        else:
-            return f"ERROR: too many redirects (> {_MAX_REDIRECTS}) while fetching URL: {url}"
-    except requests.exceptions.Timeout:
-        return f"ERROR: download timed out after {DOWNLOAD_TIMEOUT_SECONDS}s for URL: {url}"
-    except requests.exceptions.ConnectionError as e:
-        return f"ERROR: could not connect to URL {url}: {e}"
-    except requests.exceptions.HTTPError as e:
-        return f"ERROR: server returned an error status for URL {url}: {e}"
-    except requests.exceptions.RequestException as e:
-        return f"ERROR: request to {url} failed: {e}"
+    response, error = _fetch_with_ssrf_protection(url)
+    if response is None:
+        return f"ERROR: {error}"
 
     out_dir = Path(output_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    url_name = Path(current_url.split("?")[0]).name
+    url_name = Path(response.url.split("?")[0]).name
     if url_name and "." in url_name:
         file_name = url_name
     else:
@@ -165,6 +192,65 @@ def extract_load(url: str, output_folder: str, format: str) -> str:
     dest_path.write_bytes(response.content)
 
     return f"Downloaded {url} -> {dest_path} ({len(response.content)} bytes)"
+
+
+@tool
+def scrape_load(url: str, output_folder: str) -> str:
+    """Fetch a webpage and extract the real data table embedded in its HTML,
+    saving it as a CSV — for a source that has no direct downloadable file,
+    only a table rendered on a page.
+
+    Args:
+        url: the page URL to scrape (must be a plain, unauthenticated HTTP(S) page
+            — same restriction as extract_load; this tool never logs into or
+            scrapes anything requiring authentication).
+        output_folder: local folder to save the extracted table into (created if
+            it does not exist).
+
+    Unlike extract_load (which saves whatever bytes a URL returns, unexamined),
+    this actually parses the response as HTML and looks for <table> elements. A
+    real page often has more than one (navigation, footer, ads) — the LARGEST
+    table by cell count (rows x columns) is taken as the real data table
+    (utils.format_normalization.largest_table, the same explicit, stated rule
+    used when normalizing an already-downloaded HTML file), never "whichever
+    table happens to appear first." Never invents columns or rows beyond what
+    pandas' own HTML table parser actually extracts from the real page content.
+
+    Returns a clear "ERROR: ..." string on any failure (fetch blocked/failed, no
+    table found) rather than raising — this tool never raises for a real
+    network/parsing failure, it always returns a string either way.
+
+    SSRF protection: uses the exact same SSRF-safe fetch as extract_load (see
+    _fetch_with_ssrf_protection / AGENTS.md's SSRF Protection section) — this
+    tool is invoked by an LLM deciding what URL to pass, with no allowlist of
+    its own, so the same permanent safety boundary applies here unchanged.
+    """
+    response, error = _fetch_with_ssrf_protection(url)
+    if response is None:
+        return f"ERROR: {error}"
+
+    try:
+        tables = pd.read_html(io.StringIO(response.text), flavor="lxml")
+    except ValueError as e:
+        return f"ERROR: no table found on page {url}: {e}"
+
+    if not tables:
+        return f"ERROR: no table found on page {url}"
+
+    df = largest_table(tables)
+
+    out_dir = Path(output_folder)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    url_name = Path(response.url.split("?")[0]).name
+    base_stem = Path(url_name).stem if url_name else "scraped_table"
+    dest_path = out_dir / f"{base_stem or 'scraped_table'}.csv"
+    df.to_csv(dest_path, index=False)
+
+    return (
+        f"Scraped {url} -> {dest_path} "
+        f"({df.shape[0]} rows, {df.shape[1]} columns; largest of {len(tables)} table(s) found on the page)"
+    )
 
 
 @tool
@@ -219,20 +305,27 @@ def transform_load(folder_path: str) -> str:
     return summary
 
 
-ETL_SYSTEM_PROMPT = """You are an ETL analyst. You have two tools:
+ETL_SYSTEM_PROMPT = """You are an ETL analyst. You have three tools:
 
 - extract_load(url, output_folder, format): downloads a file from a URL into a local \
-folder. Use this when asked to fetch/download data from a URL.
+folder. Use this when the data is available at a direct, downloadable link (the URL \
+itself points straight at a file).
+- scrape_load(url, output_folder): fetches a webpage and extracts the real data table \
+embedded in its HTML, saving it as a CSV. Use this when the data is only rendered on a \
+page (a table on a webpage) with no direct downloadable file link.
 - transform_load(folder_path): checks CSV files in a folder for data-quality issues and \
-cleans any that need it (with a human approval step before any cleaning code runs). Use \
-this when asked to clean, transform, or prepare a folder of data.
+cleans any that need it (with a human approval step before any cleaning code runs). Also \
+converts any JSON/Excel/HTML file in the folder to CSV first, so a file saved by \
+extract_load in a non-CSV format is still picked up. Use this when asked to clean, \
+transform, or prepare a folder of data.
 
 Reason step by step about what the user's request actually requires. Call tools one at a \
 time and look at each result before deciding the next step. If a request asks for both a \
-download and cleaning, do the download first, then clean the folder it landed in. Once \
-you've completed everything the request asked for, respond with a plain-English summary \
-of what was actually done — do not call more tools than the request requires, and do not \
-claim a step happened that a tool result didn't actually confirm."""
+download/scrape and cleaning, do the download/scrape first, then clean the folder it \
+landed in. Once you've completed everything the request asked for, respond with a \
+plain-English summary of what was actually done — do not call more tools than the \
+request requires, and do not claim a step happened that a tool result didn't actually \
+confirm."""
 
 
 def call_model(state: ETLAnalystState) -> dict:
@@ -244,7 +337,7 @@ def call_model(state: ETLAnalystState) -> dict:
     simplest way to guarantee it's always present without tracking "is this the first
     call" separately.
     """
-    llm = pick_llm("high").bind_tools([extract_load, transform_load])
+    llm = pick_llm("high").bind_tools([extract_load, scrape_load, transform_load])
     response = llm.invoke([("system", ETL_SYSTEM_PROMPT), *state.messages])
     return {"messages": [response]}
 
@@ -267,7 +360,7 @@ def build_etl_analyst_graph():
     graph = StateGraph(ETLAnalystState)
 
     graph.add_node("agent", call_model)
-    graph.add_node("tools", ToolNode([extract_load, transform_load]))
+    graph.add_node("tools", ToolNode([extract_load, scrape_load, transform_load]))
 
     graph.add_edge(START, "agent")
     graph.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})

@@ -56,7 +56,7 @@ def normalize_to_csv(file_path) -> Path:
     elif suffix in (".xlsx", ".xls"):
         df = pd.read_excel(path)
     elif suffix in (".html", ".htm"):
-        tables = pd.read_html(path)
+        tables = pd.read_html(path, flavor="lxml")
         if not tables:
             raise ValueError(f"no <table> elements found in {path}")
         df = largest_table(tables)
