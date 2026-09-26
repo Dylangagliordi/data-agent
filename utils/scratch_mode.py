@@ -78,11 +78,29 @@ def check_scratch_code_safety(code: str) -> tuple:
     return True, ""
 
 
+def _strip_code_formatting(text: str) -> str:
+    """Strip markdown code fences around generated code, if the model added
+    them anyway (same pattern as utils/data_cleaning.py's own
+    _strip_code_formatting / agents/sql_analyst.py's _strip_sql_formatting —
+    kept as its own small local copy here for the same reason those two are:
+    this module shouldn't gain a cross-module dependency just for a five-line
+    string helper)."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
 _SCRATCH_MODE_SYSTEM_PROMPT = """You write bespoke Python code for a one-off data \
 visualization/analysis need that a fixed chart-type renderer cannot express — a \
 computed threshold, a conditional highlight, a derived split, or similar.
 
 Rules, no exceptions:
+- Output ONLY raw Python code. No explanation, no commentary, no markdown fences, no backticks.
 - The real result data is already loaded for you as a pandas DataFrame named `df`. \
 Never fetch, query, or read any other data source — operate only on `df`.
 - You may only import from: pandas, numpy, matplotlib, matplotlib.pyplot, statistics, math.
@@ -94,16 +112,29 @@ is the only output that matters.
 - Write plain, real code only — no placeholders, no TODO comments, no pseudocode."""
 
 
-def generate_scratch_code(question: str, result_data: list, output_path: str, llm) -> str:
+def generate_scratch_code(
+    question: str, result_data: list, output_path: str, llm, rejection_reason: str = ""
+) -> str:
     """One LLM call producing the real code text for this question's bespoke
     visualization, given the real result data and the exact path it must save
-    to. Returns the raw code string (never executed here)."""
+    to. Returns the raw code string (never executed here).
+
+    rejection_reason, when non-empty, is the real reason a PREVIOUS attempt
+    was rejected (by check_scratch_code_safety, or a real execution failure)
+    — included so a retry has a concrete, specific reason to actually change
+    its approach rather than plausibly regenerating the same rejected code.
+    """
     human_content = (
         f"Question: {question}\n\n"
         f"Real result data (as a list of row dicts — this is exactly what `df` "
         f"will contain, via pd.DataFrame(data)):\n{result_data}\n\n"
         f"Save the finished chart to this exact path: {output_path!r}\n"
     )
+    if rejection_reason:
+        human_content += (
+            f"\nA previous attempt was rejected for this exact reason: {rejection_reason}\n"
+            f"Write different code that genuinely avoids this — do not repeat the same approach."
+        )
     response = llm.invoke(
         [
             ("system", _SCRATCH_MODE_SYSTEM_PROMPT),
@@ -115,7 +146,7 @@ def generate_scratch_code(question: str, result_data: list, output_path: str, ll
         content = "".join(
             block.get("text", "") if isinstance(block, dict) else str(block) for block in content
         )
-    return content.strip()
+    return _strip_code_formatting(content)
 
 
 def execute_scratch_code(code: str, df: pd.DataFrame, output_path: str) -> tuple:

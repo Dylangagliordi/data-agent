@@ -99,6 +99,17 @@ class SQLAnalystState(BaseModel):
     # needed. Appended to final_answer by build_visualization.
     chart_type_override_note: str = ""
 
+    # Spec 12 (Scratch Mode): set by check_needs_scratch_mode (LLM judgment,
+    # runs after validate_chart_shape) when the question's real intent needs a
+    # computed/conditional visual element no fixed chart type can express (a
+    # derived threshold, a quadrant split, a conditional highlight) — routes
+    # to run_scratch_mode instead of build_visualization. False for every
+    # ordinary chart request; the fixed 8-type renderer already handles plain
+    # data plots (including basic per-point annotations) without this ever
+    # needing to fire.
+    needs_scratch_mode: bool = False
+    scratch_mode_reasoning: str = ""
+
     # Populated by surface_transformations (Spec 2, Part B narration source):
     # one entry per real TransformationCandidate that was actually surfaced
     # and decided for THIS question via surface_relevant_transformations /
@@ -145,6 +156,24 @@ class ChartTypeSchema(BaseModel):
     chart_type: str
     chart_type_source: Literal["explicit", "reasoned"]
     chart_type_reasoning: str
+
+
+class ScratchModeSchema(BaseModel):
+    """Structured output schema for the check_needs_scratch_mode node only
+    (Spec 12). Used via with_structured_output — never exposed to the main
+    state directly until its fields are copied into
+    needs_scratch_mode/scratch_mode_reasoning.
+
+    Deliberately conservative: needs_scratch_mode should be True only when
+    satisfying the question requires computing something and then
+    conditionally acting on it (a derived threshold, a quadrant split, a
+    conditional highlight, combining more than one piece of information
+    visually) — never merely because the question asks for a label,
+    annotation, or styling the fixed 8-type renderer already handles.
+    """
+
+    needs_scratch_mode: bool
+    reasoning: str
 
 
 class ExplorationHypothesis(BaseModel):

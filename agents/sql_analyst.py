@@ -17,7 +17,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import create_model
 
-from models.schema import ChartTypeSchema, JudgeSchema, SQLAnalystState
+from models.schema import ChartTypeSchema, JudgeSchema, SQLAnalystState, ScratchModeSchema
 from utils.db import get_app_reader_connection
 from utils.llm_pick import pick_llm
 
@@ -2659,6 +2659,142 @@ def validate_chart_shape(state: SQLAnalystState) -> dict:
     }
 
 
+_SCRATCH_MODE_CHECK_SYSTEM_PROMPT = """You decide whether a data-visualization question needs \
+BESPOKE, custom-written code instead of a standard chart.
+
+Say needs_scratch_mode=True ONLY when producing a correct chart requires COMPUTING something \
+and then CONDITIONALLY acting on it — a derived threshold or median split, a quadrant/zone \
+highlight, coloring points differently based on a computed condition, or combining more than \
+one piece of derived information visually. Be conservative.
+
+Say needs_scratch_mode=False for anything a plain chart of the data can already show — this \
+includes ordinary per-point labels/annotations, since the standard renderer already supports \
+those. A request just asking for "labels" or "annotations" on an otherwise normal chart is \
+NOT scratch mode — only a request that needs computed/conditional visual logic is."""
+
+
+def check_needs_scratch_mode(state: SQLAnalystState) -> dict:
+    """Node (Spec 12): LLM judgment call, runs after validate_chart_shape. Decides
+    whether the question's real intent needs a computed/conditional visual element
+    no fixed chart type can express — see _SCRATCH_MODE_CHECK_SYSTEM_PROMPT for the
+    exact, deliberately conservative bar. Uses pick_llm("cheap") — this is a
+    classification decision, same cost class as determine_chart_type/is_safe, not
+    complex generation.
+
+    Skipped (returns {}, leaving needs_scratch_mode at its default False) when the
+    result is empty/unparseable — nothing to judge against.
+    """
+    result_data, _was_truncated = _parse_sql_result(state.sql_query_execution_result)
+    if not result_data or not isinstance(result_data[0], dict):
+        return {}
+
+    llm = pick_llm("cheap").with_structured_output(ScratchModeSchema)
+    human_content = (
+        f"Question: {state.user_question}\n"
+        f"Chart type that would otherwise be rendered: {state.chart_type}\n"
+        f"Real result data (up to 10 rows): {result_data[:10]}"
+    )
+    result = llm.invoke(
+        [
+            ("system", _SCRATCH_MODE_CHECK_SYSTEM_PROMPT),
+            ("human", human_content),
+        ]
+    )
+    dumped = result.model_dump()
+    return {
+        "needs_scratch_mode": dumped["needs_scratch_mode"],
+        "scratch_mode_reasoning": dumped["reasoning"],
+    }
+
+
+_MAX_SCRATCH_MODE_ATTEMPTS = 2
+
+
+def run_scratch_mode(state: SQLAnalystState) -> dict:
+    """Node (Spec 12): generates bespoke code for a visualization need the fixed
+    chart types can't express, gated by the deterministic AST safety check
+    (utils.scratch_mode.check_scratch_code_safety) BEFORE a human ever sees an
+    approval prompt, then the exact same human approval gate
+    utils.data_cleaning._request_approval already implements, then executes only
+    on approval. Never reaches build_visualization on this path — produces its
+    own final_answer/output_file_path/chart_image_path directly, same pattern
+    cancel_sql already uses to bypass represent_final_answer.
+
+    Up to _MAX_SCRATCH_MODE_ATTEMPTS total generation attempts: a safety
+    rejection or a real execution failure feeds its exact reason into the next
+    attempt's prompt (generate_scratch_code's rejection_reason) rather than
+    blindly retrying the same thing. Giving up after that is disclosed
+    honestly — no file, no fabricated success.
+    """
+    import pandas as pd
+
+    from utils.data_cleaning import _request_approval
+    from utils.scratch_mode import check_scratch_code_safety, execute_scratch_code, generate_scratch_code
+
+    result_data, _was_truncated = _parse_sql_result(state.sql_query_execution_result)
+
+    viz_dir = _PROJECT_ROOT / "outputs" / "visualizations"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    question_slug = re.sub(r"[^a-z0-9]+", "_", state.curated_question.lower())[:40].strip("_")
+    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = viz_dir / f"{question_slug}_{timestamp}_scratch.png"
+
+    llm = pick_llm("high")
+    rejection_reason = ""
+    code = ""
+    for _attempt in range(_MAX_SCRATCH_MODE_ATTEMPTS):
+        code = generate_scratch_code(
+            state.user_question, result_data, str(output_path), llm, rejection_reason=rejection_reason
+        )
+        is_code_safe, safety_reason = check_scratch_code_safety(code)
+        if is_code_safe:
+            break
+        rejection_reason = safety_reason
+    else:
+        final_answer = (
+            f"Could not produce safe custom code for this visualization after "
+            f"{_MAX_SCRATCH_MODE_ATTEMPTS} attempts — the last attempt was rejected because: "
+            f"{rejection_reason}. No chart was produced."
+        )
+        return {"final_answer": final_answer, "messages": [AIMessage(content=final_answer)]}
+
+    approved = _request_approval(code, output_path)
+    if not approved:
+        final_answer = (
+            "This visualization needed custom-written code, which was generated but "
+            "declined at the approval step — no chart was produced."
+        )
+        return {"final_answer": final_answer, "messages": [AIMessage(content=final_answer)]}
+
+    df = pd.DataFrame(result_data)
+    success, error = execute_scratch_code(code, df, str(output_path))
+    if not success:
+        final_answer = (
+            f"The approved custom code failed to run: {error.splitlines()[-1] if error else 'unknown error'}. "
+            f"No chart was produced."
+        )
+        return {"final_answer": final_answer, "messages": [AIMessage(content=final_answer)]}
+
+    chart_exists = output_path.exists()
+    final_answer = (
+        f"Chart type: custom (scratch mode) — {state.scratch_mode_reasoning}\n\n"
+        + (f"Chart: {output_path}" if chart_exists else "Note: the code ran without error but produced no file at the expected path.")
+    )
+    return {
+        "output_file_path": str(output_path) if chart_exists else "",
+        "chart_image_path": str(output_path) if chart_exists else "",
+        "final_answer": final_answer,
+        "messages": [AIMessage(content=final_answer)],
+    }
+
+
+def route_after_scratch_check(state: SQLAnalystState) -> str:
+    """Conditional edge after check_needs_scratch_mode: run_scratch_mode only
+    when it actually decided this question needs it; every ordinary chart
+    request proceeds to build_visualization completely unaffected."""
+    return "run_scratch_mode" if state.needs_scratch_mode else "build_visualization"
+
+
 def build_visualization(state: SQLAnalystState) -> dict:
     """Node: write output file(s) from the SQL result and produce an interpretive summary.
 
@@ -3459,8 +3595,14 @@ def build_sql_analyst_graph():
         surface_transformations --(route_after_add_context)--> determine_chart_type
         determine_chart_type -> generate_sql  (same generate_sql, extended prompt)
         execute_sql --(route_after_execute_sql)--> resolve_chart_columns
-        resolve_chart_columns -> validate_chart_shape -> build_visualization
+        resolve_chart_columns -> validate_chart_shape -> check_needs_scratch_mode
+        check_needs_scratch_mode --(route_after_scratch_check)--> build_visualization | run_scratch_mode
+            (Spec 12: Scratch Mode — fires only when the question's real intent
+            needs a computed/conditional visual element no fixed chart type can
+            express; every ordinary chart request is completely unaffected.)
         build_visualization -> END
+        run_scratch_mode -> END (bypasses build_visualization entirely, same
+            pattern cancel_sql already uses to bypass represent_final_answer)
     """
     graph = StateGraph(SQLAnalystState)
 
@@ -3476,6 +3618,8 @@ def build_sql_analyst_graph():
     graph.add_node("represent_final_answer", represent_final_answer)
     graph.add_node("resolve_chart_columns", resolve_chart_columns)
     graph.add_node("validate_chart_shape", validate_chart_shape)
+    graph.add_node("check_needs_scratch_mode", check_needs_scratch_mode)
+    graph.add_node("run_scratch_mode", run_scratch_mode)
     graph.add_node("build_visualization", build_visualization)
 
     graph.add_edge(START, "curate_question")
@@ -3513,10 +3657,16 @@ def build_sql_analyst_graph():
         },
     )
     graph.add_edge("resolve_chart_columns", "validate_chart_shape")
-    graph.add_edge("validate_chart_shape", "build_visualization")
+    graph.add_edge("validate_chart_shape", "check_needs_scratch_mode")
+    graph.add_conditional_edges(
+        "check_needs_scratch_mode",
+        route_after_scratch_check,
+        {"build_visualization": "build_visualization", "run_scratch_mode": "run_scratch_mode"},
+    )
 
     graph.add_edge("cancel_sql", END)
     graph.add_edge("represent_final_answer", END)
     graph.add_edge("build_visualization", END)
+    graph.add_edge("run_scratch_mode", END)
 
     return graph.compile()
