@@ -243,6 +243,16 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # inventory — the real, live ground truth (graph nodes, utils/ modules, CLI
+    # commands) for cross-checking a rebuild of the architecture artifact
+    # against reality before publishing it (Spec 13, Part 1a).
+    if raw.strip().lower() == "inventory":
+        from utils.doc_drift import render_inventory_html
+        path = render_inventory_html()
+        print(f"Code inventory: {path}")
+        print(f'Open with: open "{path}"')
+        return
+
     # profile: <table_name> — real per-column statistics with no question
     # asked at all (Spec 9: Auto-EDA), computed live via app_reader.
     if raw.startswith("profile: "):
