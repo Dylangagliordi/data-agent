@@ -88,6 +88,16 @@ Minimal ReAct state — only a message list. No named intermediate fields.
 
 ---
 
+### `ConductorState` — `models/conductor_schema.py` (Spec 16)
+
+Identical shape to `ETLAnalystState` — same standard ReAct pattern, just for `agents/conductor.py`'s much larger toolbox.
+
+| Field | Type | What it holds |
+|---|---|---|
+| `messages` | `list` (add_messages) | Growing conversation for the Conductor's ReAct loop |
+
+---
+
 ## 2. Log File Formats
 
 ### `logs/query_log.jsonl`
@@ -448,6 +458,49 @@ Three tools now (Spec 10 added `scrape_load`), bound together in `call_model`'s 
 
 ---
 
+### `agents/conductor.py` — Fully Agentic Conductor (Spec 16)
+
+A top-level ReAct loop — the exact same LangGraph shape as `agents/etl_analyst.py` (`ToolNode` + `tools_condition`), just with a much larger toolbox (14 tools) bound to the model call instead of 3. Given a goal, `call_model` (`pick_llm("high")`) reasons step by step about which tool to call next based on each tool's real result, until it has enough to answer.
+
+**Deliberately conservative starting toolset — 13 genuinely read-only, no-side-effect tools, plus one that can actually read/analyze data:**
+
+| Tool | Wraps |
+|---|---|
+| `ask_question(question)` | `utils.cli_modes.run_question` — the EXACT same function every other entry point already uses. Covers reading data AND requesting a chart (the router already detects chart-shaped wording — no separate visualization tool exists or is needed). Any redirect this triggers (`clean_and_reload`, Scratch Mode) still goes through its own real, unchanged approval gate — this tool has no bypass of its own. |
+| `profile_table(table_name)` | `utils.auto_eda.render_auto_eda_html` |
+| `check_joins()` | `utils.join_advisory.render_join_advisory_html` |
+| `check_ingestion_sources()` | `utils.ingestion_registry.render_ingestion_sources_html` |
+| `check_dq_backlog()` | `utils.dq_backlog.render_dq_backlog_html` |
+| `check_freshness()` | `utils.freshness_briefing.render_freshness_briefing_html` |
+| `check_inventory()` | `utils.doc_drift.render_inventory_html` |
+| `check_taxonomy()` | `utils.taxonomy_governance.render_taxonomy_governance_html` |
+| `check_rubric_dashboard()` | `utils.rubric_dashboard.render_rubric_dashboard_html` |
+| `check_table_audit(table_name)` | `utils.audit_export.render_table_audit_html` |
+| `explain_past_answer(question)` | `utils.run_comparison.find_entries_for_question` + `utils.generate_report.generate_report` |
+| `compare_recent_runs(question)` | `utils.run_comparison.render_run_comparison_html` |
+| `get_data_dictionary(table_name)` | `utils.data_dictionary.render_data_dictionary_html` |
+| `list_saved_metrics()` | `utils.load_data.read_saved_metrics` + `utils.semantic_layer.render_semantic_layer_html` |
+
+**Explicitly excluded from v1's toolset, on purpose (see the module's own docstring):** `define metric:`/`delete metric:` (write to `_saved_metrics` with no approval gate of their own — typing the command IS the confirmation today; an autonomous loop triggering that write without a human explicitly typing it would be a genuinely new, ungated path) and `prepare: <table> for <goal>` (each decision it makes IS gated, but it's itself an orchestration-shaped tool — stacking two layers of autonomous sequencing in v1 adds risk for no proven need; a natural v2 candidate once this is proven safe standalone).
+
+| Function | Role |
+|---|---|
+| `call_model` | ReAct node: `pick_llm("high")` (real reasoning about what to investigate next, same tier as `generate_sql`) with `CONDUCTOR_TOOLS` bound. |
+| `build_conductor_graph` | Returns compiled ReAct graph, identical shape to `build_etl_analyst_graph`. |
+| `run_conductor(goal, max_steps=MAX_CONDUCTOR_STEPS=12)` | Same `GraphRecursionError`-catches-into-a-clear-message discipline as `run_etl_analyst`. Returns `{"final_answer": str, "tool_calls": [{"tool", "input", "output"}, ...]}` — the real, ordered trace of every tool actually called, reconstructed by matching each `AIMessage`'s real `tool_calls` to its real `ToolMessage` response via LangChain's own `tool_call_id` (never guessed by position). A run that calls zero tools returns an empty trace, never a fabricated one. |
+
+See `tests/test_conductor.py`: fake-tool-calling-LLM tests (same convention as `test_etl_recursion_limit.py`) for the simple single-tool case, a real 3-tool ordered trace matching the scripted call order exactly, and the step-cap bailout; plus a real, live end-to-end run against the actual `olist_sellers_dataset` table producing a correct, well-reasoned multi-step answer.
+
+**Reporting integration (Spec 16, Part 2) — closes a real gap identified before this was built:** the existing report/presentation/notebook pipeline only knew how to represent a single SQL-analyst-style run (one `query_log.jsonl` entry), not a Conductor's real multi-tool-call journey.
+
+- `utils/narrative.py:build_conductor_narrative(goal, tool_calls)` — pure, deterministic (no LLM), parallel to `build_narrative_walkthrough` but for this shape: turns a real, ordered tool-call trace into the same `NarrativeStep` list the existing renderers already consume. Every step gets `part="conductor"` (a new value) — `generate_report.py`'s `_PART_TITLES.get(part, part.title())` and `generate_presentation.py`'s `_PART_LABELS.get(part, part.title())` already fall back gracefully for any part they have no special-cased label for, rendering a plain "Conductor" section header with **zero changes needed** to either renderer's section-header logic (confirmed live). An empty trace (goal answered with no investigation) produces one honest "No investigation needed" step, never a fabricated one.
+- `generate_report`/`generate_presentation`/`utils/notebook_export.py:render_notebook_export` each gained an optional `precomputed_steps: "list | None" = None` parameter — when given, skips the internal `assemble_full_walkthrough`/`build_narrative_walkthrough` derivation and renders the given steps directly. `None` (the default) reproduces each function's EXACT prior behavior — verified via the full existing report/presentation/notebook test suites passing unmodified.
+- CLI wiring (`utils/cli_modes.py`): `"conduct: "` — runs the conductor, prints its real final answer, then builds a real report from its real trace via `build_conductor_narrative` + `generate_report(entry, precomputed_steps=steps)`.
+
+See `tests/test_conductor_narrative.py`: `build_conductor_narrative` against a real hand-built trace (never fabricates) and an empty trace (honest, not invented); each of the three renderers tested directly with a real conductor trace; a full, real, live end-to-end run (conductor → narrative → report) against the actual `olist_sellers_dataset` table producing a real, coherent report naming every tool actually called.
+
+---
+
 ### `utils/data_cleaning.py` — Cleaning core
 
 | Symbol | Role |
@@ -754,7 +807,7 @@ Returns a dict with:
 
 ### `utils/narrative.py` — Shared narrative walkthrough (Spec 2, Final)
 
-Public API: `NarrativeStep` (dataclass: `step_number`, `part` — `"cleaning"`|`"transformation"`|`"analysis"` — `title`, `explanation`, `technical_detail=""`, `stats={}`), `build_narrative_walkthrough(entry: dict) -> list[NarrativeStep]`, `narrate_steps(steps, llm) -> list[NarrativeStep]`, `assemble_full_walkthrough(entry: dict, llm) -> list[NarrativeStep]`.
+Public API: `NarrativeStep` (dataclass: `step_number`, `part` — `"cleaning"`|`"transformation"`|`"analysis"`|`"conductor"` (Spec 16) — `title`, `explanation`, `technical_detail=""`, `stats={}`), `build_narrative_walkthrough(entry: dict) -> list[NarrativeStep]`, `narrate_steps(steps, llm) -> list[NarrativeStep]`, `assemble_full_walkthrough(entry: dict, llm) -> list[NarrativeStep]`, `build_conductor_narrative(goal: str, tool_calls: list) -> list[NarrativeStep]` (Spec 16, Part 2 — see `agents/conductor.py`'s own section above for the full writeup).
 
 **The single source of truth both `utils/generate_report.py` and `utils/generate_presentation.py` render from** — replaced each document's previously-independent section/slide assembly, so the two always agree in sequence and content and differ only in HTML-vs-slide formatting.
 
@@ -1127,6 +1180,8 @@ See `tests/test_cli_modes.py`: all three trigger shapes tested directly (includi
 - `test_scratch_mode_live_wiring.py` (Spec 12): fake-LLM tests for `check_needs_scratch_mode` (false for an ordinary chart, true for a genuine computed-highlight request, skips the LLM call entirely on an empty result) and `run_scratch_mode` (a compliant first attempt makes exactly one LLM call and produces a real chart; two unsafe generations in a row give up honestly with no file; a declined approval produces no file). Plus a real, live end-to-end run with genuine model calls at every step — proving the whole wired-up path (judgment call → generation → safety gate → approval → execution) works, not just against fakes.
 
 - `test_doc_drift.py` (Spec 13, Part 1a): asserts `get_real_inventory()` reflects real, current graph nodes/modules/CLI commands via live introspection — checked against Spec 12's actual additions (`check_needs_scratch_mode`, `scratch_mode.py`) without those names ever being hardcoded as an expected list, which would just be a second place for the same staleness bug to hide.
+- `test_conductor.py` (Spec 16a): fake-tool-calling-LLM tests (same convention as `test_etl_recursion_limit.py`) proving `ask_question` has no bypass of its own (calls the real, unchanged `run_question`), a simple one-tool-call case, a real 3-tool ordered trace matching the scripted call order and real inputs/outputs exactly, and the step-cap bailout stopping an infinite tool-calling pattern cleanly. Plus a real, live end-to-end run against the actual `olist_sellers_dataset` table.
+- `test_conductor_narrative.py` (Spec 16b): `build_conductor_narrative` against a real hand-built trace (never fabricates what a tool call "meant") and an honest empty-trace case; each of `generate_report`/`generate_presentation`/`render_notebook_export`'s new `precomputed_steps` parameter tested directly; a full, real, live end-to-end pipeline (conductor → narrative → report) proving the whole gap this closes actually works.
 - `test_cli_modes.py` (Spec 15, Part 1): the three trigger shapes (`exact_match`, `prefixed`, `prepare:`'s two-part split) tested directly; `dispatch()`'s match/no-match behavior; a test-only mode inserted into `MODES` and dispatched correctly with zero changes to `dispatch()` itself; every registered mode name is unique.
 - `test_goal_based_planner.py` (Spec 14): a fake structured-output LLM proves an invented candidate id is filtered out, never trusted; a real-table live-wiring test (same `uncleaned_ds_jobs` seeding as the Spec 1 acceptance tests) proves a stated goal surfaces exactly the fake-LLM-marked-relevant candidates, decisions land in the real shared `_transformation_decisions` cache, and a later call reuses them silently.
 - `test_hitl.py` (Spec 13, Part 2): `request_code_approval`'s yes/decline/typo-never-reprompts behavior and logging; `request_option_choice`'s valid-first-try and retry-past-invalid-answers behavior and logging; the `banner=` override preserving exact pre-existing printed text (the real regression this parameter exists to fix); the acceptance-criterion proof that two different decision types in one run produce two real entries in one unified `logs/hitl_log.jsonl`.
