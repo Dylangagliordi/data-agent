@@ -971,6 +971,40 @@ See `tests/test_scratch_mode.py` (real adversarial-style code samples for every 
 
 ---
 
+### `utils/doc_drift.py` — Documentation Drift Detector (Spec 13, Part 1a)
+
+The real, live ground truth this project's code actually contains right now — for cross-checking a rebuild of the published architecture blueprint artifact against reality before publishing it (that artifact predated Specs 1 through 12 entirely, with nothing having flagged the drift; this makes the ground truth impossible to miss going forward). Deliberately does NOT auto-rewrite or auto-publish the artifact itself — publishing is a session-level action (the `Artifact` tool), outside this codebase, and the artifact's writing quality is a real editorial concern this tool has no business overriding.
+
+| Function | Role |
+|---|---|
+| `get_real_inventory()` | `{"graph_nodes": {graph_name: [node, ...]}, "utils_modules": [...], "cli_commands": [...]}`. Graph nodes via direct introspection of all three real compiled graphs (`.get_graph().nodes.keys()`, filtering LangGraph's own `__start__`/`__end__` sentinels) — never a hand-typed list. `utils_modules` from a real directory listing. `cli_commands` parsed straight from `main.py`'s own dispatch conditions (`raw.strip().lower() == "..."` / `raw.startswith("...")`) via regex — not a second, maintainable list that could itself drift from `main.py`. |
+| `render_inventory_html()` | Renders the inventory as a reference page under `inventory/`, parallel to Spec 1's own `"map"` command. |
+
+**CLI trigger:** `python main.py "inventory"`.
+
+See `tests/test_doc_drift.py` — asserts against Spec 12's actual new nodes/module (`check_needs_scratch_mode`, `run_scratch_mode`, `scratch_mode.py`) without ever hardcoding those names as "the expected list," which would just be a second place for the same staleness bug to hide.
+
+**Companion standard:** `.claude/skills/data-agent-architecture/ARTIFACT_STANDARD.md` (Spec 13, Part 1b) — a fixed, written content standard for every future rebuild of the artifact, separate from this `SKILL.md` (that one is for me, mid-task; the artifact standard is for whoever rebuilds a document whose reader is a total non-technical beginner). Fixes a required Foundations sheet teaching core concepts before anything assumes them, a non-negotiable ground-up pedagogical bar, one diagram per sub-concept rather than one per whole sheet, explicit preservation of the artifact's existing visual design system, and a mandatory pre-publish cross-check against `get_real_inventory()`.
+
+---
+
+### `utils/hitl.py` — Unified HITL Interaction Layer (Spec 13, Part 2)
+
+Before this, four separate human-in-the-loop mechanisms existed with no shared shape and no unified record: cleaning-code approval (`utils.data_cleaning._request_approval`), Transformation Options' numbered menu (`present_transformation_options`), Manual Mode's 4-option menu (`resolve_manual_mode_candidate`), and Scratch Mode's approval (incidentally reusing `_request_approval`, not by design). Cleaning approvals weren't logged anywhere beyond stdout; Transformation decisions were logged in a completely different shape/location (`_transformation_decisions`).
+
+| Function | Role |
+|---|---|
+| `log_hitl_decision(decision_type, title, context, response)` | Appends one line to `logs/hitl_log.jsonl` — the first unified transcript of every human decision across cleaning, transforming, and visualizing. Never raises (same "never let bookkeeping break the real operation" discipline `agents/etl_analyst.py:_record_ingestion` already uses). |
+| `request_decision(decision_type, title, context, prompt, valid_responses=None, retry_until_valid=False, banner=None)` | The one shared primitive. `retry_until_valid=False` (default): reads exactly once, returns whatever was typed valid or not (the `_request_approval` discipline — a typo IS a decline, never a re-prompt). `retry_until_valid=True`: loops until the answer is in `valid_responses` (the menu discipline). `banner`, kept deliberately separate from `decision_type` (the machine-readable log category), lets a caller preserve an EXACT pre-existing printed banner — a real regression this design fixes: `test_transformation_options_live_wiring.py` parses stdout for the literal substring `"TRANSFORMATION OPTION:"`, which a mechanically-derived `decision_type.upper()` banner broke before this parameter was added. |
+| `request_code_approval(code, file_path, decision_type="code_approval")` | Drop-in behavioral replacement for `_request_approval`'s print/input logic — identical printed format, identical single-read-no-reprompt discipline, identical "yes"-only-approves semantics. `_request_approval` is now a thin wrapper around this (same name, same signature — every existing caller: `clean_data.py`, `load_data.py`, `feature_derivation.py`, `run_scratch_mode`, needs zero changes). `run_scratch_mode` (Spec 12) calls this directly with its own `decision_type="scratch_mode_code_approval"`, distinct from cleaning's `"cleaning_code_approval"`. |
+| `request_option_choice(options, title, context="", decision_type="option_choice", banner=None)` | Shared "choose one of N options" prompt — loops until a valid option id is chosen. `present_transformation_options` now calls this with `banner="TRANSFORMATION OPTION"` (preserving its exact original banner text); Manual Mode's initial 1-4 menu choice also now calls this (with its own `decision_type="manual_mode_menu_choice"`) — Manual Mode's genuinely different nested follow-up prompts (citation entry, JSON-paste, an approve/edit sub-flow) are deliberately left as their own bespoke `input()` calls, not force-fit into a primitive that doesn't match their shape. |
+
+See `tests/test_hitl.py` (the shared primitive directly, including the acceptance-criterion proof that two different decision types in one run land as two real, correctly-shaped entries in one unified log) plus every existing HITL-related test suite passing unmodified (composite field split/decline, feature derivation, range decomposition, transform_load recipe cache, scratch mode live wiring, transformation options unit + live wiring, manual mode unit + live wiring + narrative rendering) — proof this was a pure refactor, zero observable behavior change.
+
+**Explicitly out of scope for Spec 13, Part 2:** the free-text "yes, but change X" feedback loop (a natural next step once one shared primitive exists to attach it to) — deliberately deferred to keep this pass's blast radius contained to four already-heavily-tested code paths.
+
+---
+
 ## 4. Database Structure
 
 **Two-role setup:**
@@ -1058,5 +1092,8 @@ See `tests/test_scratch_mode.py` (real adversarial-style code samples for every 
 
 - `test_scratch_mode.py` (Spec 12): `check_scratch_code_safety` against real adversarial-style code samples — every disallowed import, every dangerous zero-import builtin call, the classic dunder-attribute escape chain, a syntax error — each checked against the real AST walk, never hand-waved. `generate_scratch_code`'s prompt content; `execute_scratch_code`'s real success (a real chart file gets written) and real failure (disclosed via `(False, traceback)`, never crashes the caller) paths.
 - `test_scratch_mode_live_wiring.py` (Spec 12): fake-LLM tests for `check_needs_scratch_mode` (false for an ordinary chart, true for a genuine computed-highlight request, skips the LLM call entirely on an empty result) and `run_scratch_mode` (a compliant first attempt makes exactly one LLM call and produces a real chart; two unsafe generations in a row give up honestly with no file; a declined approval produces no file). Plus a real, live end-to-end run with genuine model calls at every step — proving the whole wired-up path (judgment call → generation → safety gate → approval → execution) works, not just against fakes.
+
+- `test_doc_drift.py` (Spec 13, Part 1a): asserts `get_real_inventory()` reflects real, current graph nodes/modules/CLI commands via live introspection — checked against Spec 12's actual additions (`check_needs_scratch_mode`, `scratch_mode.py`) without those names ever being hardcoded as an expected list, which would just be a second place for the same staleness bug to hide.
+- `test_hitl.py` (Spec 13, Part 2): `request_code_approval`'s yes/decline/typo-never-reprompts behavior and logging; `request_option_choice`'s valid-first-try and retry-past-invalid-answers behavior and logging; the `banner=` override preserving exact pre-existing printed text (the real regression this parameter exists to fix); the acceptance-criterion proof that two different decision types in one run produce two real entries in one unified `logs/hitl_log.jsonl`.
 
 **`PYTHONPATH` requirement:** All tests must be run from the project root with `PYTHONPATH=/Users/dylangagliordi/data-agent` set (or equivalent), since `agents/`, `models/`, and `utils/` are not installed packages.
