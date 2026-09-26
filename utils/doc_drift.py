@@ -19,18 +19,13 @@ CLI: `python main.py "inventory"`.
 """
 
 import html
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MAIN_PY_PATH = PROJECT_ROOT / "main.py"
 OUTPUT_DIR = "inventory"
 
 _UTILS_DIR = PROJECT_ROOT / "utils"
-
-_EXACT_COMMAND_RE = re.compile(r'raw\.strip\(\)\.lower\(\)\s*==\s*"([^"]+)"')
-_PREFIX_COMMAND_RE = re.compile(r'raw\.startswith\("([^"]+)"\)')
 
 
 def _real_graph_nodes() -> dict:
@@ -66,16 +61,15 @@ def _real_utils_modules() -> list:
 
 
 def _real_cli_commands() -> list:
-    """Every real CLI command main.py actually dispatches, parsed straight
-    from its own dispatch conditions (raw.strip().lower() == "..." /
-    raw.startswith("...")) — not a hand-maintained list living in a second
-    place that could drift from main.py itself."""
-    if not MAIN_PY_PATH.exists():
-        return []
-    text = MAIN_PY_PATH.read_text(encoding="utf-8")
-    exact = _EXACT_COMMAND_RE.findall(text)
-    prefixes = _PREFIX_COMMAND_RE.findall(text)
-    return sorted(set(exact) | set(prefixes))
+    """Every real CLI command main.py actually dispatches — read directly
+    from utils.cli_modes.MODES (Spec 15, Part 1's real, structured mode
+    registry). Before Spec 15 this regex-parsed main.py's own source text to
+    reconstruct what should just be structured data — a fragile indirection
+    this now eliminates entirely: MODES *is* the real, live ground truth,
+    nothing here re-derives it from anything else."""
+    from utils.cli_modes import MODES
+
+    return sorted(mode.name for mode in MODES)
 
 
 def get_real_inventory() -> dict:
