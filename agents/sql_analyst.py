@@ -2714,9 +2714,10 @@ def run_scratch_mode(state: SQLAnalystState) -> dict:
     """Node (Spec 12): generates bespoke code for a visualization need the fixed
     chart types can't express, gated by the deterministic AST safety check
     (utils.scratch_mode.check_scratch_code_safety) BEFORE a human ever sees an
-    approval prompt, then the exact same human approval gate
-    utils.data_cleaning._request_approval already implements, then executes only
-    on approval. Never reaches build_visualization on this path — produces its
+    approval prompt, then the shared human approval gate
+    utils.hitl.request_code_approval (Spec 13, Part 2 — the same primitive
+    cleaning-fix code approval now goes through too), then executes only on
+    approval. Never reaches build_visualization on this path — produces its
     own final_answer/output_file_path/chart_image_path directly, same pattern
     cancel_sql already uses to bypass represent_final_answer.
 
@@ -2728,7 +2729,7 @@ def run_scratch_mode(state: SQLAnalystState) -> dict:
     """
     import pandas as pd
 
-    from utils.data_cleaning import _request_approval
+    from utils.hitl import request_code_approval
     from utils.scratch_mode import check_scratch_code_safety, execute_scratch_code, generate_scratch_code
 
     result_data, _was_truncated = _parse_sql_result(state.sql_query_execution_result)
@@ -2758,7 +2759,7 @@ def run_scratch_mode(state: SQLAnalystState) -> dict:
         )
         return {"final_answer": final_answer, "messages": [AIMessage(content=final_answer)]}
 
-    approved = _request_approval(code, output_path)
+    approved = request_code_approval(code, output_path, decision_type="scratch_mode_code_approval")
     if not approved:
         final_answer = (
             "This visualization needed custom-written code, which was generated but "

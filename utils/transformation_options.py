@@ -423,25 +423,27 @@ def present_transformation_options(
     """
     all_options = list(options) + [_SKIP_OPTION]
 
-    print("=" * 70)
-    print(f"TRANSFORMATION OPTION: {context.get('title', '')}")
-    print("=" * 70)
-    if context.get("what_was_found"):
-        print(f"What was found: {context['what_was_found']}")
-    if context.get("why_optional"):
-        print(f"Why this is optional: {context['why_optional']}")
-    print()
-    for opt in all_options:
-        print(f"  [{opt['id']}] {opt['label']} — {opt.get('description', '')}")
-    valid_ids = {opt["id"] for opt in all_options}
+    # Spec 13, Part 2: routed through the shared HITL primitive
+    # (utils.hitl.request_option_choice) — same "choose one of N options,
+    # loop until valid" shape Manual Mode's initial menu also uses, now with
+    # the unified logs/hitl_log.jsonl transcript as a side effect. The
+    # what_was_found/why_optional labeling is preserved as real, readable
+    # context text rather than flattened away.
+    from utils.hitl import request_option_choice
 
-    chosen_option_id = None
-    while chosen_option_id is None:
-        answer = input(f"Choose an option ({'/'.join(sorted(valid_ids))}): ").strip()
-        if answer in valid_ids:
-            chosen_option_id = answer
-        else:
-            print(f"'{answer}' is not one of the listed option ids — try again.")
+    context_lines = []
+    if context.get("what_was_found"):
+        context_lines.append(f"What was found: {context['what_was_found']}")
+    if context.get("why_optional"):
+        context_lines.append(f"Why this is optional: {context['why_optional']}")
+
+    chosen_option_id = request_option_choice(
+        options=all_options,
+        title=context.get("title", ""),
+        context="\n".join(context_lines),
+        decision_type="transformation_option_choice",
+        banner="TRANSFORMATION OPTION",
+    )
 
     reasoning_shown = {"context": dict(context), "options": all_options}
     decision = {"chosen_option_id": chosen_option_id, "reasoning_shown": reasoning_shown}

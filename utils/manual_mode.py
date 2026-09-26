@@ -222,24 +222,38 @@ def resolve_manual_mode_candidate(
     col_label = ", ".join(candidate.columns)
     already_have = bool(override.reference_source or override.supplied_data or override.chosen_option_id)
 
-    print(f'Manual mode is on for "{col_label}" ({len(distinct_values)} distinct values found).')
+    intro_lines = [f'Manual mode is on for "{col_label}" ({len(distinct_values)} distinct values found).']
     if already_have:
-        missing_count = len(set(distinct_values) - set(override.supplied_data.keys())) if distinct_values else 0
-        print(
+        intro_lines.append(
             f"I already have a partial reference for this ({len(override.supplied_data)} of "
             f"{len(distinct_values)} values covered) — I only need to fill in the rest."
         )
     else:
-        print("I don't have a reference mapping for this yet. How do you want to proceed?")
-    print()
-    print("  [1] I have a reference — describe it or point me to it now")
-    print("  [2] Let me propose a grouping and you approve/edit it")
-    print("  [3] Use the normal AI-driven grouping (exits manual mode for this candidate)")
-    print("  [4] Keep raw categories, no consolidation")
+        intro_lines.append("I don't have a reference mapping for this yet. How do you want to proceed?")
 
-    answer = None
-    while answer not in ("1", "2", "3", "4"):
-        answer = input("Choose an option (1/2/3/4): ").strip()
+    # Spec 13, Part 2: this initial menu choice is structurally identical to
+    # Transformation Options' "choose one of N options" shape, so it's routed
+    # through the same shared utils.hitl.request_option_choice primitive —
+    # same behavior (loop until 1/2/3/4), now also logged to the unified
+    # transcript. The rest of this function's nested follow-up prompts
+    # (citation entry, JSON paste, approve/edit) are a genuinely different,
+    # multi-step interaction shape and are deliberately left as their own
+    # input() calls rather than force-fit into a primitive that doesn't
+    # actually match them — see utils/hitl.py's own module docstring.
+    from utils.hitl import request_option_choice
+
+    menu_options = [
+        {"id": "1", "label": "I have a reference", "description": "describe it or point me to it now"},
+        {"id": "2", "label": "Let me propose a grouping", "description": "you approve/edit it"},
+        {"id": "3", "label": "Use the normal AI-driven grouping", "description": "exits manual mode for this candidate"},
+        {"id": "4", "label": "Keep raw categories", "description": "no consolidation"},
+    ]
+    answer = request_option_choice(
+        options=menu_options,
+        title=f'Manual mode for "{col_label}"',
+        context="\n".join(intro_lines),
+        decision_type="manual_mode_menu_choice",
+    )
 
     if answer in ("3", "4"):
         print(

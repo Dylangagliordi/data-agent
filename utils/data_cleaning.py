@@ -2641,28 +2641,33 @@ def _generate_composite_split_code(
 
 
 def _request_approval(code: str, file_path: Path) -> bool:
-    """The approval gate. Prints the full generated code and blocks on a real input()
-    call — not a log line, not a config flag, not Hermes's own tool-approval system
-    (which cannot see inside a script's own exec() call). This is the one and only
-    place a cleaning script gets a chance to run, for every caller, every time.
+    """The approval gate. Blocks on a real input() call — not a log line, not a
+    config flag, not Hermes's own tool-approval system (which cannot see inside
+    a script's own exec() call). This is the one and only place a cleaning
+    script gets a chance to run, for every caller, every time.
+
+    Spec 13, Part 2: thin wrapper around utils.hitl.request_code_approval — the
+    one shared, logged HITL primitive every code-approval gate in this project
+    now goes through (cleaning fixes here, and Scratch Mode's generated
+    visualization code via agents/sql_analyst.py:run_scratch_mode, which calls
+    request_code_approval directly with its own decision_type). Kept as its own
+    named function, unchanged signature, so every existing caller — clean_data.py,
+    utils/load_data.py, this project's own test suite — needs zero changes.
 
     No interactivity check here: this function is shared by every caller of
-    clean_dataset(), including manual CLI usage (clean_data.py, utils/load_data.py)
-    and this project's own test suite, both of which deliberately pipe 'yes\\n'
-    answers to a non-tty stdin and rely on input() reading them successfully — see
-    the data-agent-architecture skill's testing conventions. The non-interactive
-    fail-closed gate (architecture review point #24) belongs specifically to the
-    SQL analyst graph's auto-clean redirect (agents/sql_analyst.py:clean_and_reload),
-    since that is the one path a plain, read-only question can trigger automatically
-    with no explicit cleaning request from the user — see its docstring.
+    clean_dataset(), including manual CLI usage and this project's own test
+    suite, both of which deliberately pipe 'yes\\n' answers to a non-tty stdin
+    and rely on input() reading them successfully — see the data-agent-
+    architecture skill's testing conventions. The non-interactive fail-closed
+    gate (architecture review point #24) belongs specifically to the SQL
+    analyst graph's auto-clean redirect (agents/sql_analyst.py:clean_and_reload),
+    since that is the one path a plain, read-only question can trigger
+    automatically with no explicit cleaning request from the user — see its
+    docstring.
     """
-    print("\n" + "=" * 70)
-    print(f"GENERATED CLEANING CODE for: {file_path}")
-    print("=" * 70)
-    print(code)
-    print("=" * 70)
-    answer = input(f"Run this code against {file_path}? Type 'yes' to approve, anything else to decline: ")
-    return answer.strip().lower() == "yes"
+    from utils.hitl import request_code_approval
+
+    return request_code_approval(code, file_path, decision_type="cleaning_code_approval")
 
 
 def _execute_cleaning_code(code: str, file_path: Path):
