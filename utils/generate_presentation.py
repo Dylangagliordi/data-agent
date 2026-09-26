@@ -297,13 +297,17 @@ def _assemble_html(slides: list, title: str) -> str:
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
-def generate_presentation(entry: dict) -> str:
+def generate_presentation(entry: dict, precomputed_steps: "list | None" = None) -> str:
     """Build an HTML slideshow from a query_log.jsonl entry dict.
     Returns the path to the written HTML file.
+
+    precomputed_steps (Spec 16, Part 2): see generate_report's own docstring
+    for the identical parameter — used by the Conductor's real multi-tool-call
+    trace, which doesn't fit the single-question entry shape
+    assemble_full_walkthrough/build_narrative_walkthrough expect. None (the
+    default) reproduces this function's exact prior behavior.
     """
-    from utils.llm_pick import pick_llm
     from utils.manual_mode import build_step_checklist
-    from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
 
     question = entry.get("user_question") or entry.get("curated_question") or "presentation"
     sql = entry.get("generated_sql_query", "")
@@ -315,10 +319,16 @@ def generate_presentation(entry: dict) -> str:
     except Exception:
         touched_tables = []
 
-    try:
-        steps = assemble_full_walkthrough(entry, pick_llm("cheap"))
-    except Exception:
-        steps = build_narrative_walkthrough(entry)  # deterministic fallback, never fully fails
+    if precomputed_steps is not None:
+        steps = precomputed_steps
+    else:
+        from utils.llm_pick import pick_llm
+        from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
+
+        try:
+            steps = assemble_full_walkthrough(entry, pick_llm("cheap"))
+        except Exception:
+            steps = build_narrative_walkthrough(entry)  # deterministic fallback, never fully fails
 
     checklist = build_step_checklist(steps)
 

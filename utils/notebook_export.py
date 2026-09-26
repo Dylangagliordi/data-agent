@@ -135,18 +135,28 @@ def build_notebook_from_steps(entry: dict, steps: list) -> dict:
     }
 
 
-def render_notebook_export(entry: dict) -> str:
+def render_notebook_export(entry: dict, precomputed_steps: "list | None" = None) -> str:
     """Builds the real (optionally LLM-narrated) walkthrough for entry and
     writes it as a .ipynb file under notebook_exports/. Returns the written
     path. Falls back to the deterministic walkthrough if narration fails,
-    exactly like utils.generate_report.generate_report does."""
-    from utils.llm_pick import pick_llm
-    from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
+    exactly like utils.generate_report.generate_report does.
 
-    try:
-        steps = assemble_full_walkthrough(entry, pick_llm("cheap"))
-    except Exception:
-        steps = build_narrative_walkthrough(entry)
+    precomputed_steps (Spec 16, Part 2): see generate_report's identical
+    parameter — used by the Conductor's real multi-tool-call trace, which
+    doesn't fit the single-question entry shape assemble_full_walkthrough/
+    build_narrative_walkthrough expect. None (the default) reproduces this
+    function's exact prior behavior.
+    """
+    if precomputed_steps is not None:
+        steps = precomputed_steps
+    else:
+        from utils.llm_pick import pick_llm
+        from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
+
+        try:
+            steps = assemble_full_walkthrough(entry, pick_llm("cheap"))
+        except Exception:
+            steps = build_narrative_walkthrough(entry)
 
     notebook = build_notebook_from_steps(entry, steps)
 

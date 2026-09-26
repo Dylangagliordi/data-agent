@@ -191,9 +191,17 @@ def _step_html(step) -> str:
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
-def generate_report(entry: dict) -> str:
+def generate_report(entry: dict, precomputed_steps: "list | None" = None) -> str:
     """Build an HTML report from a query_log.jsonl entry dict.
     Returns the path to the written HTML file.
+
+    precomputed_steps (Spec 16, Part 2): when given, these NarrativeStep
+    objects are rendered directly instead of deriving them from `entry` via
+    assemble_full_walkthrough/build_narrative_walkthrough — used by the
+    Conductor (agents/conductor.py), whose real multi-tool-call trace doesn't
+    fit the single-question query_log.jsonl entry shape those two functions
+    expect. None (the default) reproduces this function's exact prior
+    behavior for every existing caller.
     """
     question = entry.get("user_question") or entry.get("curated_question") or "report"
     # Prefer the cleaned-up question for the human-facing title — user_question
@@ -203,14 +211,18 @@ def generate_report(entry: dict) -> str:
     title_question = entry.get("curated_question") or question
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    from utils.llm_pick import pick_llm
-    from utils.manual_mode import build_step_checklist
-    from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
+    if precomputed_steps is not None:
+        steps = precomputed_steps
+    else:
+        from utils.llm_pick import pick_llm
+        from utils.narrative import assemble_full_walkthrough, build_narrative_walkthrough
 
-    try:
-        steps = assemble_full_walkthrough(entry, pick_llm("cheap"))
-    except Exception:
-        steps = build_narrative_walkthrough(entry)  # deterministic fallback, never fully fails
+        try:
+            steps = assemble_full_walkthrough(entry, pick_llm("cheap"))
+        except Exception:
+            steps = build_narrative_walkthrough(entry)  # deterministic fallback, never fully fails
+
+    from utils.manual_mode import build_step_checklist
 
     checklist = build_step_checklist(steps)
 

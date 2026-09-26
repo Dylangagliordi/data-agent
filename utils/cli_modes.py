@@ -299,6 +299,22 @@ def _handle_profile(args: dict) -> None:
     print(f'Open with: open "{path}"')
 
 
+def _handle_conduct(args: dict) -> None:
+    from agents.conductor import run_conductor
+    from utils.generate_report import generate_report
+    from utils.narrative import build_conductor_narrative
+
+    goal = args["arg"]
+    result = run_conductor(goal)
+    print(result["final_answer"])
+
+    steps = build_conductor_narrative(goal, result["tool_calls"])
+    entry = {"user_question": goal, "curated_question": goal}
+    report_path = generate_report(entry, precomputed_steps=steps)
+    print(f"\nConductor report: {report_path}")
+    print(f'Open with: open "{report_path}"')
+
+
 def _handle_joins(args: dict) -> None:
     from utils.join_advisory import render_join_advisory_html
 
@@ -448,6 +464,7 @@ MODES: list = [
     Mode("compare: ", prefixed("compare: "), _handle_compare),
     Mode("freshness", exact_match("freshness"), _handle_freshness),
     Mode("prepare: ", _prepare_trigger, _handle_prepare),
+    Mode("conduct: ", prefixed("conduct: "), _handle_conduct),
     Mode("inventory", exact_match("inventory"), _handle_inventory),
     Mode("profile: ", prefixed("profile: "), _handle_profile),
     Mode("joins", exact_match("joins"), _handle_joins),

@@ -48,11 +48,67 @@ _DUP_COUNT_RE = re.compile(r"Duplicate rows: (\d+) fully duplicate rows found")
 @dataclass
 class NarrativeStep:
     step_number: int
-    part: str                  # "cleaning" | "transformation" | "analysis"
+    part: str                  # "cleaning" | "transformation" | "analysis" | "conductor" (Spec 16)
     title: str                 # short, e.g. "Split Headquarters into city and country"
     explanation: str           # plain-English, first-person-explainable prose
     technical_detail: str = "" # optional: real formula/regex/threshold, verbatim
     stats: dict = field(default_factory=dict)  # real before/after numbers, if any
+
+
+def build_conductor_narrative(goal: str, tool_calls: list) -> list:
+    """Spec 16, Part 2: pure, deterministic assembly (no LLM — same discipline
+    as build_narrative_walkthrough) turning a real Conductor run
+    (agents.conductor.run_conductor's own real, ordered "tool_calls" —
+    [{"tool", "input", "output"}, ...]) into the SAME NarrativeStep shape
+    generate_report/generate_presentation/notebook_export already render
+    unchanged.
+
+    Every step gets part="conductor" — a new part value. The existing
+    renderers already fall back gracefully for any part they have no
+    special-cased label for (_PART_TITLES.get(part, part.title()) in
+    generate_report.py, _PART_LABELS.get(part, part.title()) in
+    generate_presentation.py), rendering a plain "Conductor" section header —
+    no changes needed to either renderer for this to work.
+
+    Never invents what a tool call "meant" — explanation states only the
+    real tool name, the real input it was given, and the real output it
+    returned, verbatim. A run with zero tool calls (the goal was answered
+    with no investigation at all) produces a single honest step saying so,
+    never a fabricated investigation.
+    """
+    steps = [
+        NarrativeStep(
+            step_number=1,
+            part="conductor",
+            title="Goal",
+            explanation=f"The stated goal was: {goal}",
+        )
+    ]
+    if not tool_calls:
+        steps.append(
+            NarrativeStep(
+                step_number=2,
+                part="conductor",
+                title="No investigation needed",
+                explanation="The goal was answered directly, with no tool calls made.",
+            )
+        )
+        return steps
+
+    for i, call in enumerate(tool_calls, start=2):
+        steps.append(
+            NarrativeStep(
+                step_number=i,
+                part="conductor",
+                title=f"Called {call['tool']}",
+                explanation=(
+                    f"Called the real `{call['tool']}` tool with input {call['input']!r}. "
+                    f"Real result: {call['output']}"
+                ),
+                technical_detail=f"Input: {call['input']}\n\nOutput: {call['output']}",
+            )
+        )
+    return steps
 
 
 # ── DB / table lookups (own copy — same convention already used independently
