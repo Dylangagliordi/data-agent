@@ -293,9 +293,36 @@ CREATE TABLE _saved_metrics (
 
 A small, explicit registry of human-named canonical metric definitions — one row per metric, populated ONLY via an explicit `python main.py "define metric: <name> = <sql_fragment>"` CLI call (`utils/semantic_layer.py:parse_define_metric_command`, `utils/load_data.py:write_saved_metric`), never inferred from a query someone happened to ask. `delete metric: <name>` removes one; `metrics` renders every defined metric as a browsable page (`utils/semantic_layer.py:render_semantic_layer_html`).
 
-**Excluded from `add_context`'s `information_schema` query** (the `table_name NOT IN (...)` tuple, now seven placeholders). Unlike every other internal table, `ensure_saved_metrics_table` is NOT called from `add_context` itself — `add_context` only ever holds an `app_reader` connection, and `app_reader` is read-only at the DB level (`REVOKE CREATE ON SCHEMA public`), so it can never create this table. It's only ever ensured from an admin connection, at the `define metric:` / `delete metric:` / `metrics` CLI handlers in `main.py`. Consequently `utils/load_data.py:read_saved_metrics(conn)` (called from `add_context` over its app_reader connection) must tolerate `_saved_metrics` not existing yet on a database where no metric has ever been defined — it catches `psycopg2.errors.UndefinedTable`, rolls back just that one failed statement, and returns `[]`, exactly equivalent to "no metrics defined."
+**Excluded from `add_context`'s `information_schema` query** (the `table_name NOT IN (...)` tuple, now eight placeholders — Spec 10 added `_ingestion_sources`, see below). Unlike every other internal table, `ensure_saved_metrics_table` is NOT called from `add_context` itself — `add_context` only ever holds an `app_reader` connection, and `app_reader` is read-only at the DB level (`REVOKE CREATE ON SCHEMA public`), so it can never create this table. It's only ever ensured from an admin connection, at the `define metric:` / `delete metric:` / `metrics` CLI handlers in `main.py`. Consequently `utils/load_data.py:read_saved_metrics(conn)` (called from `add_context` over its app_reader connection) must tolerate `_saved_metrics` not existing yet on a database where no metric has ever been defined — it catches `psycopg2.errors.UndefinedTable`, rolls back just that one failed statement, and returns `[]`, exactly equivalent to "no metrics defined."
 
 **Live wiring:** when any metric is defined, `add_context` appends one additional context block after the normal schema/warning text: `"Known canonical metric definitions (previously agreed upon — reuse one of these exactly ...)"` followed by `- <name>: <sql_fragment>  (<description>)` lines. This is purely additive, non-authoritative context — the same way fan-out/DQ warnings are already surfaced — `generate_sql` is told a canonical definition exists but nothing mechanically forces it to reuse one instead of writing fresh SQL. See `tests/test_semantic_layer.py` (parsing, empty/populated HTML rendering, and a live DB round trip: define → read → upsert-redefine → delete) plus a real `test_add_context.py` regression run confirming the exclusion-list bump doesn't produce a spurious warning.
+
+---
+
+### `_ingestion_sources` Postgres Table (Spec 10, Part 3: Ingestion Source Registry)
+
+```sql
+CREATE TABLE _ingestion_sources (
+    url              TEXT PRIMARY KEY,
+    output_folder    TEXT NOT NULL,
+    source_kind      TEXT NOT NULL,   -- 'download' | 'scrape'
+    first_fetched_at TIMESTAMPTZ NOT NULL,
+    last_fetched_at  TIMESTAMPTZ NOT NULL,
+    fetch_count      INTEGER NOT NULL DEFAULT 1,
+    status           TEXT NOT NULL,   -- 'ok' | 'error'
+    last_error       TEXT NOT NULL DEFAULT ''
+);
+```
+
+A durable memory of every URL `agents/etl_analyst.py`'s `extract_load`/`scrape_load` have ever been asked to fetch — one row per URL, upserted (never a second row for the same URL) on every attempt, success or failure. `first_fetched_at` is set only on the very first insert; `last_fetched_at`/`fetch_count`/`status`/`last_error` always reflect the most recent attempt. Deliberately a REGISTRY/audit trail only, never a gate — nothing here blocks or approves a fetch (that named-connector allowlist model is Spec 13's separate, not-yet-built job); it only makes a recurring source's real reliability history visible instead of every fetch being a one-off with no memory.
+
+Written via `utils/load_data.py:ensure_ingestion_sources_table`/`record_ingestion_attempt`, read via `read_ingestion_sources`. Both `extract_load` and `scrape_load` call a shared `agents/etl_analyst.py:_record_ingestion` helper at the end of their real work (own admin connection, `status="error"` iff the tool's own result string starts with `"ERROR:"`) — grants the ETL agent access to one more internal bookkeeping table, same discipline as `transform_load`'s `_cleaning_recipes` access.
+
+**Excluded from `add_context`'s `information_schema` query**, same list/reasoning as every other internal table above (now eight placeholders).
+
+**CLI trigger:** `python main.py "sources"` (`utils/ingestion_registry.py:render_ingestion_sources_html`) — pure read, writes nothing itself.
+
+See `tests/test_ingestion_registry.py`: real upsert semantics against a live table (`fetch_count` increments, `first_fetched_at` preserved, `status`/`last_error` reflect the latest attempt, one row per URL never two), plus real `extract_load`/`scrape_load` calls recording both a genuine success and a genuine SSRF-refused failure.
 
 ---
 
@@ -399,13 +426,18 @@ build_visualization → END
 
 ### `agents/etl_analyst.py` — ETL ReAct agent
 
+Three tools now (Spec 10 added `scrape_load`), bound together in `call_model`'s single `pick_llm("high")` call (this loop makes real decisions about which tool to use next, not clean-up work — not `"cheap"`).
+
 | Symbol | Role |
 |---|---|
-| `extract_load` | `@tool`: HTTP GET download to a local folder. Never authenticates. **SSRF-protected (architecture review point #28, permanent safety boundary — see AGENTS.md):** calls `_validate_fetch_url` before the initial fetch AND before following any redirect (redirects are followed manually via `allow_redirects=False`, not automatically, capped at `_MAX_REDIRECTS = 5`), so a URL that passes validation but redirects to an internal address is still blocked. |
+| `_fetch_with_ssrf_protection(url)` (Spec 10) | Shared SSRF-safe fetch — the redirect-following/validation logic `extract_load` used to have inline, extracted so `scrape_load` reuses it with zero new fetch logic of its own. Returns `(response, "")` on success or `(None, error_message)` on any failure. |
+| `extract_load` | `@tool`: HTTP GET download to a local folder, via `_fetch_with_ssrf_protection`. Never authenticates. **SSRF-protected (architecture review point #28, permanent safety boundary — see AGENTS.md):** calls `_validate_fetch_url` before the initial fetch AND before following any redirect (redirects are followed manually via `allow_redirects=False`, not automatically, capped at `_MAX_REDIRECTS = 5`), so a URL that passes validation but redirects to an internal address is still blocked. **Spec 10:** records every attempt (success or failure) into `_ingestion_sources` via `_record_ingestion`. |
+| `scrape_load` (Spec 10, Part 2) | `@tool`: fetches a webpage via the same `_fetch_with_ssrf_protection`, parses the response as HTML (`pd.read_html(..., flavor="lxml")` — `flavor` pinned after finding pandas' default fallback chain reaches for the undeclared `html5lib` when a page has no tables), and extracts the LARGEST `<table>` by cell count (`utils.format_normalization.largest_table`, shared with that module's own HTML-file path) as a CSV. Closes the real gap `extract_load` always had: it can only save bytes a URL already returns as a file, never parse structured data out of a page's markup. Also records every attempt into `_ingestion_sources`. |
 | `_validate_fetch_url(url)` | Resolves the URL's hostname to its real, current IP address(es) (`socket.getaddrinfo`) and rejects if any is private/loopback/link-local/reserved/multicast/unspecified (`ipaddress.ip_address(...).is_private` etc. — this is what blocks `169.254.169.254`, the AWS/GCP/Azure metadata endpoint, since it's link-local) or the hostname is a known metadata name (`metadata.google.internal`, `metadata.goog`). Only `http`/`https` schemes allowed. Returns `(is_safe, reason)`. |
-| `transform_load` | `@tool`: thin wrapper around `utils/data_cleaning.clean_dataset()`. **Spec 7b:** opens its own short-lived admin connection (same pattern `clean_and_reload`/`load_data.py:main()` already use) to pass `recipe_conn` through — the one real Spec 7 (Cleaning Recipe Cache) entry point that spec itself left out, since `transform_load` is the actual live-conversation path to recurring-dataset cleaning. No reload-invalidation call needed here: this tool only cleans, it never reloads a table into Postgres. Grants the ETL agent access to exactly one internal bookkeeping table (`_cleaning_recipes`) — never user data, never a live table. |
-| `call_model` | ReAct node: single `pick_llm("cheap")` call with tools bound. |
-| `build_etl_analyst_graph` | Returns compiled ReAct graph (ToolNode + tools_condition). |
+| `_record_ingestion(url, output_folder, source_kind, result)` (Spec 10, Part 3) | Shared by `extract_load`/`scrape_load`: upserts one attempt into `_ingestion_sources` (own admin connection) — `status="error"` iff `result` starts with `"ERROR:"`. Grants the ETL agent access to one more internal bookkeeping table, same discipline as `transform_load`'s `_cleaning_recipes` access — never user data, never a live table. |
+| `transform_load` | `@tool`: thin wrapper around `utils/data_cleaning.clean_dataset()`. **Spec 7b:** opens its own short-lived admin connection (same pattern `clean_and_reload`/`load_data.py:main()` already use) to pass `recipe_conn` through — the one real Spec 7 (Cleaning Recipe Cache) entry point that spec itself left out, since `transform_load` is the actual live-conversation path to recurring-dataset cleaning. No reload-invalidation call needed here: this tool only cleans, it never reloads a table into Postgres. **Spec 10, Part 1:** before cleaning, calls `utils.format_normalization.normalize_folder_to_csv` to convert any JSON/Excel/HTML file at the top level of the folder into a sibling CSV — `clean_dataset()` only ever globs for `*.csv`, so a non-CSV file (e.g. one `extract_load` just saved) would otherwise be invisible to it; never touches `clean_dataset()` itself. Grants the ETL agent access to `_cleaning_recipes` — never user data, never a live table. |
+| `call_model` | ReAct node: single `pick_llm("high")` call with all three tools bound. |
+| `build_etl_analyst_graph` | Returns compiled ReAct graph (ToolNode + tools_condition) over `[extract_load, scrape_load, transform_load]`. |
 
 ---
 
@@ -883,6 +915,37 @@ See `tests/test_join_advisory.py` — real, hand-seeded temp tables proving a ge
 
 ---
 
+### `utils/format_normalization.py` — Format Normalization (Spec 10, Part 1)
+
+`clean_dataset()` only ever globs a folder for `*.csv` — a JSON, Excel, or HTML file sitting in the same folder is completely invisible to the cleaning pipeline no matter how it got there. This is a pre-pass that runs BEFORE `clean_dataset()` is ever called, never a change to `clean_dataset()` itself.
+
+| Function | Role |
+|---|---|
+| `largest_table(tables)` | Picks the largest of `pd.read_html`'s returned tables by cell count (rows × columns) — a real page (or an already-downloaded HTML file) often has several `<table>` elements (nav, footer, ads) alongside the one real data table; this is a stated, explicit rule, not a silent default to "whichever appears first." Shared with `agents/etl_analyst.py:scrape_load`. |
+| `normalize_to_csv(file_path)` | Converts one file (`.json`/`.xlsx`/`.xls`/`.html`/`.htm`) into a sibling `.csv` and returns its path. A `.csv` file passes through completely unchanged (true no-op — never rewritten), so callers can call this unconditionally. Raises `ValueError` for an unsupported extension; lets a real pandas parse failure propagate — never silently writes a garbage CSV. |
+| `normalize_folder_to_csv(folder_path)` | Converts every supported file at the top level of a folder, skipping any whose `.csv` counterpart already exists (never overwrites). Returns `{"written": [...], "errors": [...]}` — one bad file's error is recorded, never aborts the rest of the folder. |
+
+Wired into `transform_load` (called before `clean_dataset()`); `pd.read_html`/`pd.read_excel` need `lxml`/`openpyxl`, added via `uv add`.
+
+See `tests/test_format_normalization.py` — real JSON/Excel/HTML files (including a page with a small nav table alongside the real data table, proving the "largest table" rule actually matters) plus the folder-level skip/error-isolation behavior.
+
+---
+
+### `utils/ingestion_registry.py` — Ingestion Source Registry viewer (Spec 10, Part 3)
+
+Pure read over `_ingestion_sources` (see that table's section above for the full read/write design) — this module writes nothing itself.
+
+| Function | Role |
+|---|---|
+| `get_ingestion_sources()` | `ensure_ingestion_sources_table` + `read_ingestion_sources` over one admin connection (ensure needs write access on a fresh DB; the read itself is a plain SELECT `app_reader` already has too). |
+| `render_ingestion_sources_html()` | Renders every tracked source — URL, kind, fetch count, first/last fetched, latest status/error — under `ingestion_sources/`, most recently fetched first. |
+
+**CLI trigger:** `python main.py "sources"`.
+
+See `tests/test_ingestion_registry.py`.
+
+---
+
 ## 4. Database Structure
 
 **Two-role setup:**
@@ -899,9 +962,11 @@ See `tests/test_join_advisory.py` — real, hand-seeded temp tables proving a ge
 
 **Analyst judgment rubric:** `analyst-judgment-rubric.md` at the project root documents all 15 rules (Spec 9 added Rule 15) enforced by `GENERATE_SQL_SYSTEM_PROMPT` and the disclosure helpers. Rules 1, 2, 3, 4, 5, 6, 8, 12, and 15 have post-execution disclosure via `_analyst_judgment_disclosure`/`_apply_causal_correction`; Rules 7, 9, 10, 11, 13, and 14 are prompt-only enforcement with no post-execution trace. Rule 14 (NULL-filter placement for per-category rankings — all `IS NOT NULL` filters feeding a ranking metric must live in one `WHERE` clause in the base CTE, before `GROUP BY`) is regression-tested live in `tests/test_null_filter_placement_consistency.py`. **Spec 8:** `utils/rubric_dashboard.py` (`"rubric dashboard"` CLI command) counts real historical firing rates for the 9 disclosed rules and lists the other 6 explicitly as not independently observable — see that module's section above.
 
-**Output directories:** `semantic_layer/` (`utils/semantic_layer.py`), `taxonomy_governance/` (`utils/taxonomy_governance.py`), `rubric_dashboard/` (`utils/rubric_dashboard.py`), `audit_exports/` (`utils/audit_export.py`), `notebook_exports/` (`utils/notebook_export.py`) — Spec 8; `auto_eda/` (`utils/auto_eda.py`), `join_advisory/` (`utils/join_advisory.py`) — Spec 9. All gitignored generated artifacts, same convention as `reports/`/`presentations/`/`dq_backlog/`/`data_dictionaries/`/`run_comparisons/`/`freshness_briefing/` above.
+**Output directories:** `semantic_layer/` (`utils/semantic_layer.py`), `taxonomy_governance/` (`utils/taxonomy_governance.py`), `rubric_dashboard/` (`utils/rubric_dashboard.py`), `audit_exports/` (`utils/audit_export.py`), `notebook_exports/` (`utils/notebook_export.py`) — Spec 8; `auto_eda/` (`utils/auto_eda.py`), `join_advisory/` (`utils/join_advisory.py`) — Spec 9; `ingestion_sources/` (`utils/ingestion_registry.py`) — Spec 10. All gitignored generated artifacts, same convention as `reports/`/`presentations/`/`dq_backlog/`/`data_dictionaries/`/`run_comparisons/`/`freshness_briefing/` above.
 
 **scipy dependency (Spec 9):** added via `uv add scipy` specifically for `_significance_test_note`'s p-value (`scipy.stats.f.sf`) — the first and only place in this project that needs a statistical-distribution function beyond what `statistics`/`numpy` already provide.
+
+**openpyxl/lxml dependencies (Spec 10):** added via `uv add openpyxl lxml` for `utils/format_normalization.py`'s Excel/HTML parsing (`pd.read_excel`/`pd.read_html`) and `agents/etl_analyst.py:scrape_load`'s HTML parsing. `pd.read_html` calls pin `flavor="lxml"` explicitly — pandas' default flavor-fallback chain reaches for the undeclared `html5lib` package when a document has zero tables, which would otherwise raise a confusing `ImportError` instead of the expected "no tables found" `ValueError`.
 
 ---
 
@@ -960,5 +1025,10 @@ See `tests/test_join_advisory.py` — real, hand-seeded temp tables proving a ge
 - `test_auto_eda.py` (Spec 9, Part 1): a real, hand-seeded temporary table (known values, one deliberate NULL) proves every computed statistic — null count/rate, distinct count, numeric min/max/avg, categorical top-5 values — against a value worked out by hand, read back through `profile_table`'s own real `app_reader` connection; a second temp table with 20 distinct labels across 40 rows confirms the high-cardinality flag fires using the real, shared `categorical_consolidation` thresholds.
 - `test_join_advisory.py` (Spec 9, Part 2): real, hand-seeded temp tables — a genuine declared `FOREIGN KEY` (with real fan-out, confirmed enriched onto the declared relationship too) and a genuine name-matched inferred relationship (no declared constraint, built from the same cardinality-heuristic detection `test_fanout_status.py` already proves out) — confirm both are surfaced correctly and neither is double-counted.
 - `test_significance_testing.py` (Spec 9, Part 3, Rule 15): hand-built result rows for a clearly significant case, a clearly non-significant (noisy, near-identical) case, and every "missing ingredient" case (no stddev, no count, single group, empty result) — each checked against `_significance_test_note`'s real output, never just "did it run." Confirms wiring into `_analyst_judgment_disclosure` end to end, plus a live query against real olist payment data across 27 states producing a genuine ANOVA result.
+
+- `test_format_normalization.py` (Spec 10, Part 1): real JSON/Excel/HTML files converted and checked against known content, including a page with a small nav table alongside a larger real data table (proves the "largest table" rule isn't a no-op); a `.csv` file passes through byte-for-byte unchanged; an unsupported extension raises cleanly; folder-level conversion skips an existing `.csv` and records a real parse error without blocking the rest of the folder.
+- `test_transform_load_format_normalization.py` (Spec 10, Part 1): live integration test — a real JSON file placed in a folder is normalized to CSV before `transform_load`'s call to `clean_dataset()` (same `pick_llm` monkeypatch technique as `test_transform_load_recipe_cache.py`, since `transform_load` has no `llm=` injection point).
+- `test_scrape_load.py` (Spec 10, Part 2): SSRF refusal reuses `extract_load`'s already-regression-tested behavior via the shared `_fetch_with_ssrf_protection` (confirmed unaffected by the refactor); real HTML-table extraction and the no-table-found error path tested with the real SSRF validation still running against a real hostname — only `requests.get`'s response body is mocked, never `_validate_fetch_url`.
+- `test_ingestion_registry.py` (Spec 10, Part 3): real upsert semantics against a live `_ingestion_sources` table (`fetch_count` increments, `first_fetched_at` preserved, `status`/`last_error` reflect the latest attempt, one row per URL never two); real `extract_load` calls recording both a genuine successful fetch and a genuine SSRF-refused failure; `scrape_load` recording `source_kind="scrape"`; HTML rendering.
 
 **`PYTHONPATH` requirement:** All tests must be run from the project root with `PYTHONPATH=/Users/dylangagliordi/data-agent` set (or equivalent), since `agents/`, `models/`, and `utils/` are not installed packages.
