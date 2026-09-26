@@ -176,6 +176,23 @@ class ScratchModeSchema(BaseModel):
     reasoning: str
 
 
+class GoalRelevanceSchema(BaseModel):
+    """Structured output schema for utils.transformation_options._rank_candidates_for_goal
+    only (Spec 14: Goal-Based Transformation Planner). Used via with_structured_output.
+
+    relevant_candidate_ids is deliberately plain list[str], not a dynamic
+    Literal-constrained schema the way _build_chart_column_schema constrains
+    chart columns — a variable-length list of candidate ids doesn't map as
+    cleanly onto a handful of fixed-purpose fields. The caller filters the
+    returned ids against the real, known candidate id set before trusting
+    any of them, which gives the same "never accept an invented id" guarantee
+    without the dynamic-schema machinery.
+    """
+
+    relevant_candidate_ids: list[str]
+    reasoning: str
+
+
 class ExplorationHypothesis(BaseModel):
     """Structured output schema for utils/data_cleaning.py's explore_column
     (open-ended, per-column "glance and notice" pass) and _explore_column_pairs

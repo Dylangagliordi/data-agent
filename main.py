@@ -243,6 +243,33 @@ def main() -> None:
         print(f'Open with: open "{path}"')
         return
 
+    # prepare: <table> for <goal> — proactively sequence relevant Transformation
+    # Options candidates for a stated goal, in one sitting, instead of only
+    # ever surfacing them reactively as separate questions happen to touch
+    # them (Spec 14: Goal-Based Transformation Planner). Reuses the exact same
+    # decision mechanism/cache surface_transformations already uses — no new
+    # approval UI, no new candidate kinds.
+    if raw.startswith("prepare: ") and " for " in raw:
+        from utils.transformation_options import plan_transformations_for_goal
+        body = raw[len("prepare: "):]
+        table_name, goal = body.split(" for ", 1)
+        table_name, goal = table_name.strip(), goal.strip()
+        if not table_name or not goal:
+            print("Usage: prepare: <table> for <goal>", file=sys.stderr)
+            sys.exit(1)
+        result = plan_transformations_for_goal(table_name, goal)
+        print(f"Prepared {result['table_name']!r} for: {result['goal']}")
+        if result["already_decided"]:
+            print(f"  Already decided (reused silently): {len(result['already_decided'])}")
+        if result["not_relevant"]:
+            print(f"  Not relevant to this goal: {len(result['not_relevant'])}")
+        for d in result["decided_this_run"]:
+            status = "applied" if d["applied"] else "chosen, not applied (e.g. skipped)"
+            print(f"  {d['kind']} ({d['candidate_id']}): {d['chosen_option_id']} — {status}")
+        if not result["decided_this_run"] and not result["already_decided"]:
+            print("  No stored candidates found for this table.")
+        return
+
     # inventory — the real, live ground truth (graph nodes, utils/ modules, CLI
     # commands) for cross-checking a rebuild of the architecture artifact
     # against reality before publishing it (Spec 13, Part 1a).

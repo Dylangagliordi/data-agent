@@ -462,3 +462,128 @@ def present_transformation_options(
             conn.close()
 
     return decision
+
+
+_GOAL_RELEVANCE_SYSTEM_PROMPT = """You decide which already-detected, optional table \
+transformations are actually relevant to a stated goal.
+
+Be conservative: include a candidate only when it's genuinely useful for achieving the \
+stated goal, not just generically interesting or "nice to have." A candidate that has \
+nothing to do with the goal must be left out, even if applying it would be harmless."""
+
+
+def _rank_candidates_for_goal(goal: str, candidates: list, llm) -> set:
+    """One structured-output LLM call (Spec 14): which of these real,
+    already-detected candidates are relevant to the stated goal. Filters the
+    response against the real candidate id set before returning anything —
+    an invented id the LLM might return is silently dropped, never trusted.
+    """
+    from models.schema import GoalRelevanceSchema
+
+    candidate_lines = "\n".join(
+        f"- id={c.candidate_id} kind={c.kind} columns={c.columns} — {c.description}"
+        for c in candidates
+    )
+    human_content = f"Goal: {goal}\n\nReal, already-detected candidates for this table:\n{candidate_lines}"
+
+    structured_llm = llm.with_structured_output(GoalRelevanceSchema)
+    result = structured_llm.invoke(
+        [("system", _GOAL_RELEVANCE_SYSTEM_PROMPT), ("human", human_content)]
+    )
+
+    real_ids = {c.candidate_id for c in candidates}
+    return {cid for cid in result.relevant_candidate_ids if cid in real_ids}
+
+
+def plan_transformations_for_goal(table_name: str, goal: str, llm=None, conn=None) -> dict:
+    """Spec 14: Goal-Based Transformation Planner. Reads every stored
+    candidate for table_name, skips ones already decided, ranks the
+    remainder for relevance to `goal` via one LLM call
+    (_rank_candidates_for_goal), then presents and applies each relevant one
+    through the EXACT SAME mechanism surface_transformations already uses
+    for a live question (_transformation_menu_for, present_transformation_options,
+    _apply_chosen_transformation, imported from agents.sql_analyst rather than
+    reimplemented) — just triggered by a stated goal instead of a question,
+    and covering several candidates in one sitting instead of one per
+    unrelated question over time.
+
+    Deliberately reuses, never reimplements, the decision mechanism: no new
+    approval UI, no new candidate kinds. A decision made here lands in the
+    exact same _transformation_decisions cache a reactive question would also
+    read from and write to — surface_transformations' own reactive path is
+    completely unaffected by this function existing.
+
+    conn: an already-open ADMIN connection; when None (the CLI's normal
+    case), opens and closes one internally.
+
+    Returns {"table_name", "goal", "already_decided": [candidate_id, ...],
+    "not_relevant": [candidate_id, ...], "decided_this_run": [{"candidate_id",
+    "kind", "chosen_option_id", "applied"}, ...]}.
+    """
+    from agents.sql_analyst import _apply_chosen_transformation, _fetch_data_quality_status, _transformation_menu_for
+    from utils.llm_pick import pick_llm
+    from utils.load_data import get_admin_connection, read_transformation_candidates, read_transformation_decision
+
+    owns_conn = conn is None
+    if owns_conn:
+        conn = get_admin_connection()
+    try:
+        status_entry = _fetch_data_quality_status(conn, [table_name]).get(table_name)
+        source_folder = status_entry[2] if status_entry else None
+
+        candidates = read_transformation_candidates(conn, table_name)
+
+        already_decided = []
+        undecided = []
+        for c in candidates:
+            if read_transformation_decision(conn, table_name, c.candidate_id) is not None:
+                already_decided.append(c.candidate_id)
+            else:
+                undecided.append(c)
+
+        if not undecided:
+            return {
+                "table_name": table_name,
+                "goal": goal,
+                "already_decided": already_decided,
+                "not_relevant": [],
+                "decided_this_run": [],
+            }
+
+        resolved_llm = llm if llm is not None else pick_llm("cheap")
+        relevant_ids = _rank_candidates_for_goal(goal, undecided, resolved_llm)
+        not_relevant = [c.candidate_id for c in undecided if c.candidate_id not in relevant_ids]
+
+        decided_this_run = []
+        for c in undecided:
+            if c.candidate_id not in relevant_ids:
+                continue
+            context, options = _transformation_menu_for(c)
+            decision = present_transformation_options(
+                table_name=table_name, candidate_id=c.candidate_id,
+                context=context, options=options, conn=conn,
+            )
+            applied = False
+            if source_folder is not None:
+                applied = _apply_chosen_transformation(
+                    conn, table_name, source_folder, c, decision["chosen_option_id"]
+                )
+            decided_this_run.append(
+                {
+                    "candidate_id": c.candidate_id,
+                    "kind": c.kind,
+                    "chosen_option_id": decision["chosen_option_id"],
+                    "applied": applied,
+                }
+            )
+
+        return {
+            "table_name": table_name,
+            "goal": goal,
+            "already_decided": already_decided,
+            "not_relevant": not_relevant,
+            "decided_this_run": decided_this_run,
+        }
+    finally:
+        if owns_conn:
+            conn.close()
