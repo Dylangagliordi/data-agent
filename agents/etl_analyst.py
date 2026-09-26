@@ -191,8 +191,17 @@ def transform_load(folder_path: str) -> str:
     regardless of which path originally approved the cached fix. This grants the
     ETL agent access to exactly one internal bookkeeping table — never user data,
     never a live table, never _data_quality_status.
+
+    Spec 10: before cleaning, converts any JSON/Excel/HTML file at the top level
+    of folder_path into a sibling CSV (utils.format_normalization) — clean_dataset()
+    only ever globs for *.csv, so a non-CSV file (e.g. one scrape_load or
+    extract_load just saved) would otherwise be invisible to it. Never overwrites
+    an existing .csv, and never touches clean_dataset() itself.
     """
+    from utils.format_normalization import normalize_folder_to_csv
     from utils.load_data import ensure_cleaning_recipes_table, get_admin_connection
+
+    normalization = normalize_folder_to_csv(folder_path)
 
     conn = get_admin_connection()
     try:
@@ -200,7 +209,14 @@ def transform_load(folder_path: str) -> str:
         result = clean_dataset(folder_path, recipe_conn=conn)
     finally:
         conn.close()
-    return result.summary()
+
+    summary = result.summary()
+    if normalization["written"]:
+        names = ", ".join(p.name for p in normalization["written"])
+        summary += f"\n\nAlso converted to CSV before cleaning: {names}."
+    if normalization["errors"]:
+        summary += f"\n\nCould not convert to CSV: {'; '.join(normalization['errors'])}."
+    return summary
 
 
 ETL_SYSTEM_PROMPT = """You are an ETL analyst. You have two tools:
